@@ -45,14 +45,13 @@ def init(name: str):
 
     typer.echo(f"Experiment '{name}' created successfully.")
 
-@app.command()
-def validate(name: str):
-    """Validate a molecular experiment."""
+def _load_experiment_or_exit(name: str):
+    """Load and validate an experiment, exiting with a friendly error on failure."""
 
     experiment_file = Path(name) / "experiment.yaml"
 
     try:
-        config = load_experiment(experiment_file)
+        return load_experiment(experiment_file)
 
     except FileNotFoundError:
         typer.echo("INPUT ERROR")
@@ -74,7 +73,29 @@ def validate(name: str):
 
         raise typer.Exit(code=1)
 
+
+@app.command()
+def validate(name: str):
+    """Validate a molecular experiment."""
+
+    config = _load_experiment_or_exit(name)
+
     typer.echo(
         f"Experiment '{config.experiment_id}' is valid "
         f"(schema {config.schema_version})."
     )
+
+
+@app.command()
+def plan(name: str):
+    """Show the execution plan for a molecular experiment."""
+
+    config = _load_experiment_or_exit(name)
+
+    typer.echo("EXPERIMENT PLAN")
+    typer.echo()
+    typer.echo(f"Experiment: {config.experiment_id}")
+    typer.echo(f"Schema: {config.schema_version}")
+    typer.echo("Status: VALID")
+    typer.echo()
+    typer.echo("No execution steps are defined yet.")
