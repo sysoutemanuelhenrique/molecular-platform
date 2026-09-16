@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import typer
+import yaml
 
 from pydantic import ValidationError
 
@@ -56,6 +57,11 @@ def validate(name: str):
     except FileNotFoundError:
         typer.echo("INPUT ERROR")
         typer.echo(f"Experiment '{name}' was not found.")
+        raise typer.Exit(code=1)
+
+    except yaml.YAMLError:
+        typer.echo("CONFIGURATION ERROR")
+        typer.echo(f"Experiment '{name}' has malformed YAML.")
         raise typer.Exit(code=1)
 
     except ValidationError as error:

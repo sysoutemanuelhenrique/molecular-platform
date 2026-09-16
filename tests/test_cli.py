@@ -71,3 +71,22 @@ def test_validate_rejects_missing_experiment(tmp_path, monkeypatch):
     assert result.exit_code != 0
     assert "INPUT ERROR" in result.output
     assert "Experiment 'nao_existe' was not found." in result.output
+
+
+def test_validate_rejects_malformed_yaml(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    project = tmp_path / "exp001"
+    project.mkdir()
+
+    experiment_file = project / "experiment.yaml"
+    experiment_file.write_text(
+        "experiment_id: [unclosed\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["validate", "exp001"])
+
+    assert result.exit_code != 0
+    assert "CONFIGURATION ERROR" in result.output
+    assert "Experiment 'exp001' has malformed YAML." in result.output
