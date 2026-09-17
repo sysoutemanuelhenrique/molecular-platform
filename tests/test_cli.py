@@ -19,6 +19,7 @@ def test_init_creates_experiment_structure(tmp_path, monkeypatch):
     assert (project / "experiment.yaml").exists()
     assert (project / "inputs" / "receptor").exists()
     assert (project / "inputs" / "ligands").exists()
+    assert (project / "inputs" / "proteins").exists()
     assert (project / "artifacts").exists()
     assert (project / "results").exists()
     assert (project / "logs").exists()
@@ -246,6 +247,267 @@ def test_plan_records_activity_entry_on_failure(tmp_path, monkeypatch):
     assert len(lines) == 1
     assert "command=plan" in lines[0]
     assert "outcome=error" in lines[0]
+
+
+def _init_valid_experiment(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    project = tmp_path / "exp001"
+    project.mkdir()
+    (project / "experiment.yaml").write_text(
+        'schema_version: "1.0"\n'
+        'experiment_id: "exp001"\n',
+        encoding="utf-8",
+    )
+    return project
+
+
+def test_ligand_add_registers_uploaded_ligand(tmp_path, monkeypatch):
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+    raw_file = tmp_path / "curcumin.sdf"
+    raw_file.write_bytes(b"fake-sdf-bytes")
+
+    result = runner.invoke(
+        app,
+        [
+            "ligand",
+            "add",
+            "exp001",
+            "curcumin",
+            "--name",
+            "Curcumin",
+            "--acquisition-method",
+            "uploaded",
+            "--raw-file",
+            str(raw_file),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Ligand 'curcumin' registered successfully." in result.output
+    assert (project / "inputs" / "ligands" / "curcumin.yaml").exists()
+
+
+def test_ligand_add_registers_downloaded_ligand_with_source_info(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    raw_file = tmp_path / "curcumin.sdf"
+    raw_file.write_bytes(b"fake-sdf-bytes")
+
+    result = runner.invoke(
+        app,
+        [
+            "ligand",
+            "add",
+            "exp001",
+            "curcumin",
+            "--name",
+            "Curcumin",
+            "--external-id",
+            "CID 969516",
+            "--acquisition-method",
+            "downloaded",
+            "--source-name",
+            "PubChem",
+            "--source-identifier",
+            "CID 969516",
+            "--raw-file",
+            str(raw_file),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Ligand 'curcumin' registered successfully." in result.output
+
+
+def test_protein_add_registers_downloaded_protein(tmp_path, monkeypatch):
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+    raw_file = tmp_path / "3la4.cif"
+    raw_file.write_bytes(b"fake-cif-bytes")
+
+    result = runner.invoke(
+        app,
+        [
+            "protein",
+            "add",
+            "exp001",
+            "urease",
+            "--name",
+            "Jack bean urease",
+            "--external-id",
+            "3LA4",
+            "--acquisition-method",
+            "downloaded",
+            "--source-name",
+            "RCSB PDB",
+            "--source-identifier",
+            "3LA4",
+            "--raw-file",
+            str(raw_file),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Protein 'urease' registered successfully." in result.output
+    assert (project / "inputs" / "proteins" / "urease.yaml").exists()
+
+
+def test_ligand_add_writes_activity_log_entry(tmp_path, monkeypatch):
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+    raw_file = tmp_path / "curcumin.sdf"
+    raw_file.write_bytes(b"fake-sdf-bytes")
+
+    runner.invoke(
+        app,
+        [
+            "ligand",
+            "add",
+            "exp001",
+            "curcumin",
+            "--name",
+            "Curcumin",
+            "--acquisition-method",
+            "uploaded",
+            "--raw-file",
+            str(raw_file),
+        ],
+    )
+
+    log_file = project / "logs" / "activity.log"
+    lines = log_file.read_text(encoding="utf-8").splitlines()
+
+    assert len(lines) == 1
+    assert "command=ligand-add" in lines[0]
+    assert "outcome=success" in lines[0]
+
+
+def test_ligand_add_rejects_missing_raw_file(tmp_path, monkeypatch):
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+
+    result = runner.invoke(
+        app,
+        [
+            "ligand",
+            "add",
+            "exp001",
+            "curcumin",
+            "--name",
+            "Curcumin",
+            "--acquisition-method",
+            "uploaded",
+            "--raw-file",
+            str(tmp_path / "missing.sdf"),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "INPUT ERROR" in result.output
+
+    log_file = project / "logs" / "activity.log"
+    lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert "command=ligand-add" in lines[0]
+    assert "outcome=error" in lines[0]
+
+
+def test_ligand_add_rejects_duplicate_id(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    raw_file = tmp_path / "curcumin.sdf"
+    raw_file.write_bytes(b"fake-sdf-bytes")
+
+    args = [
+        "ligand",
+        "add",
+        "exp001",
+        "curcumin",
+        "--name",
+        "Curcumin",
+        "--acquisition-method",
+        "uploaded",
+        "--raw-file",
+        str(raw_file),
+    ]
+
+    runner.invoke(app, args)
+    result = runner.invoke(app, args)
+
+    assert result.exit_code != 0
+    assert "INPUT ERROR" in result.output
+
+
+def test_ligand_add_rejects_downloaded_without_source_info(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    raw_file = tmp_path / "curcumin.sdf"
+    raw_file.write_bytes(b"fake-sdf-bytes")
+
+    result = runner.invoke(
+        app,
+        [
+            "ligand",
+            "add",
+            "exp001",
+            "curcumin",
+            "--name",
+            "Curcumin",
+            "--acquisition-method",
+            "downloaded",
+            "--raw-file",
+            str(raw_file),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "CONFIGURATION ERROR" in result.output
+    assert "Ligand 'curcumin' is invalid." in result.output
+
+
+def test_ligand_add_rejects_invalid_acquisition_method(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    raw_file = tmp_path / "curcumin.sdf"
+    raw_file.write_bytes(b"fake-sdf-bytes")
+
+    result = runner.invoke(
+        app,
+        [
+            "ligand",
+            "add",
+            "exp001",
+            "curcumin",
+            "--name",
+            "Curcumin",
+            "--acquisition-method",
+            "synthesized",
+            "--raw-file",
+            str(raw_file),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "CONFIGURATION ERROR" in result.output
+
+
+def test_ligand_add_rejects_missing_experiment(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    raw_file = tmp_path / "curcumin.sdf"
+    raw_file.write_bytes(b"fake-sdf-bytes")
+
+    result = runner.invoke(
+        app,
+        [
+            "ligand",
+            "add",
+            "nao_existe",
+            "curcumin",
+            "--name",
+            "Curcumin",
+            "--acquisition-method",
+            "uploaded",
+            "--raw-file",
+            str(raw_file),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "INPUT ERROR" in result.output
+    assert "Experiment 'nao_existe' was not found." in result.output
 
 
 def test_plan_rejects_malformed_yaml(tmp_path, monkeypatch):

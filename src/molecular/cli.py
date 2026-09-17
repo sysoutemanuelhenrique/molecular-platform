@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Optional
 
 import typer
 import yaml
@@ -7,10 +8,16 @@ from pydantic import ValidationError
 
 from molecular.activity import record_activity
 from molecular.config import load_experiment
+from molecular.registry import register_ligand, register_protein
 
 app = typer.Typer(
     help="Molecular Platform - scientific molecular research platform."
 )
+
+ligand_app = typer.Typer(help="Manage ligand inputs.")
+protein_app = typer.Typer(help="Manage protein inputs.")
+app.add_typer(ligand_app, name="ligand")
+app.add_typer(protein_app, name="protein")
 
 @app.callback()
 def main():
@@ -27,6 +34,7 @@ def init(name: str):
     directories = [
         project_dir / "inputs" / "receptor",
         project_dir / "inputs" / "ligands",
+        project_dir / "inputs" / "proteins",
         project_dir / "artifacts",
         project_dir / "results",
         project_dir / "logs",
@@ -49,13 +57,8 @@ def init(name: str):
 def _record_activity_safely(name: str, command: str, outcome: str) -> None:
     """Best-effort activity logging that must never affect the caller's own outcome."""
 
-    project_dir = Path(name)
-
-    if not project_dir.exists():
-        return
-
     try:
-        record_activity(project_dir, command=command, outcome=outcome)
+        record_activity(Path(name), command=command, outcome=outcome)
     except OSError:
         pass
 
@@ -121,3 +124,122 @@ def plan(name: str):
     typer.echo("No execution steps are defined yet.")
 
     _record_activity_safely(name, command="plan", outcome="success")
+
+
+def _add_scientific_input(
+    *,
+    register_fn,
+    label: str,
+    command: str,
+    experiment: str,
+    input_id: str,
+    name: str,
+    acquisition_method: str,
+    raw_file: str,
+    external_id: Optional[str],
+    source_name: Optional[str],
+    source_identifier: Optional[str],
+    source_uri: Optional[str],
+    file_format: Optional[str],
+) -> None:
+    """Shared registration flow for `ligand add` / `protein add`."""
+
+    _load_experiment_or_exit(experiment, command=command)
+
+    try:
+        registered = register_fn(
+            Path(experiment),
+            input_id=input_id,
+            name=name,
+            method=acquisition_method,
+            raw_file=Path(raw_file),
+            external_id=external_id,
+            source_name=source_name,
+            source_identifier=source_identifier,
+            source_uri=source_uri,
+            file_format=file_format,
+        )
+
+    except (FileNotFoundError, FileExistsError) as error:
+        typer.echo("INPUT ERROR")
+        typer.echo(str(error))
+        _record_activity_safely(experiment, command=command, outcome="error")
+        raise typer.Exit(code=1)
+
+    except ValidationError as error:
+        typer.echo("CONFIGURATION ERROR")
+        typer.echo(f"{label} '{input_id}' is invalid.")
+
+        for item in error.errors():
+            field = ".".join(str(part) for part in item["loc"])
+            typer.echo(f"- {field}: {item['msg']}")
+
+        _record_activity_safely(experiment, command=command, outcome="error")
+        raise typer.Exit(code=1)
+
+    typer.echo(f"{label} '{registered.id}' registered successfully.")
+    _record_activity_safely(experiment, command=command, outcome="success")
+
+
+@ligand_app.command("add")
+def ligand_add(
+    experiment: str,
+    input_id: str,
+    name: str = typer.Option(..., "--name"),
+    acquisition_method: str = typer.Option(..., "--acquisition-method"),
+    raw_file: str = typer.Option(..., "--raw-file"),
+    external_id: Optional[str] = typer.Option(None, "--external-id"),
+    source_name: Optional[str] = typer.Option(None, "--source-name"),
+    source_identifier: Optional[str] = typer.Option(None, "--source-identifier"),
+    source_uri: Optional[str] = typer.Option(None, "--source-uri"),
+    file_format: Optional[str] = typer.Option(None, "--format"),
+):
+    """Register a ligand input and its acquisition provenance."""
+
+    _add_scientific_input(
+        register_fn=register_ligand,
+        label="Ligand",
+        command="ligand-add",
+        experiment=experiment,
+        input_id=input_id,
+        name=name,
+        acquisition_method=acquisition_method,
+        raw_file=raw_file,
+        external_id=external_id,
+        source_name=source_name,
+        source_identifier=source_identifier,
+        source_uri=source_uri,
+        file_format=file_format,
+    )
+
+
+@protein_app.command("add")
+def protein_add(
+    experiment: str,
+    input_id: str,
+    name: str = typer.Option(..., "--name"),
+    acquisition_method: str = typer.Option(..., "--acquisition-method"),
+    raw_file: str = typer.Option(..., "--raw-file"),
+    external_id: Optional[str] = typer.Option(None, "--external-id"),
+    source_name: Optional[str] = typer.Option(None, "--source-name"),
+    source_identifier: Optional[str] = typer.Option(None, "--source-identifier"),
+    source_uri: Optional[str] = typer.Option(None, "--source-uri"),
+    file_format: Optional[str] = typer.Option(None, "--format"),
+):
+    """Register a protein input and its acquisition provenance."""
+
+    _add_scientific_input(
+        register_fn=register_protein,
+        label="Protein",
+        command="protein-add",
+        experiment=experiment,
+        input_id=input_id,
+        name=name,
+        acquisition_method=acquisition_method,
+        raw_file=raw_file,
+        external_id=external_id,
+        source_name=source_name,
+        source_identifier=source_identifier,
+        source_uri=source_uri,
+        file_format=file_format,
+    )
