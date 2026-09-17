@@ -1,5 +1,7 @@
 import re
 
+import pytest
+
 from molecular.activity import record_activity
 
 LINE_PATTERN = re.compile(
@@ -38,3 +40,12 @@ def test_record_activity_writes_correct_command_and_outcome(tmp_path):
     assert match is not None
     assert match.group(1) == "validate"
     assert match.group(2) == "success"
+
+
+def test_record_activity_does_not_create_missing_project_directory(tmp_path):
+    project_dir = tmp_path / "does-not-exist"
+
+    with pytest.raises(FileNotFoundError):
+        record_activity(project_dir, command="validate", outcome="error")
+
+    assert not project_dir.exists()
