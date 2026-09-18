@@ -1,8 +1,10 @@
 import hashlib
+from datetime import datetime, timezone
 
 import pytest
 from pydantic import ValidationError
 
+import molecular.registry as registry_module
 from molecular.registry import load_ligand, load_protein, register_ligand, register_protein
 
 
@@ -192,3 +194,37 @@ def test_register_rejects_downloaded_without_source_info_and_writes_nothing(tmp_
 
     assert not (project_dir / "inputs" / "ligands" / "curcumin.yaml").exists()
     assert not (project_dir / "inputs" / "ligands" / "curcumin").exists()
+
+
+def test_acquired_at_is_computed_once_and_persisted_unchanged(tmp_path, monkeypatch):
+    project_dir = tmp_path / "exp001"
+    project_dir.mkdir()
+    raw_file = _make_raw_file(tmp_path)
+
+    fixed_now = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    class _FixedDateTime(datetime):
+        calls = 0
+
+        @classmethod
+        def now(cls, tz=None):
+            cls.calls += 1
+            return fixed_now
+
+    monkeypatch.setattr(registry_module, "datetime", _FixedDateTime)
+
+    ligand = register_ligand(
+        project_dir,
+        input_id="curcumin",
+        name="Curcumin",
+        method="uploaded",
+        raw_file=raw_file,
+    )
+
+    # datetime.now() must be called exactly once per registration, even though
+    # _build_scientific_input is invoked twice (pre-write validation + final write).
+    assert _FixedDateTime.calls == 1
+    assert ligand.acquisition.acquired_at == fixed_now
+
+    reloaded = load_ligand(project_dir, "curcumin")
+    assert reloaded.acquisition.acquired_at == fixed_now

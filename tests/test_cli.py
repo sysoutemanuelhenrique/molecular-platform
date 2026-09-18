@@ -1,5 +1,6 @@
 from typer.testing import CliRunner
 
+import molecular.cli as cli_module
 from molecular.cli import app
 
 
@@ -508,6 +509,44 @@ def test_ligand_add_rejects_missing_experiment(tmp_path, monkeypatch):
     assert result.exit_code != 0
     assert "INPUT ERROR" in result.output
     assert "Experiment 'nao_existe' was not found." in result.output
+
+
+def test_ligand_add_handles_storage_error_without_traceback(tmp_path, monkeypatch):
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+    raw_file = tmp_path / "curcumin.sdf"
+    raw_file.write_bytes(b"fake-sdf-bytes")
+
+    def _raise_storage_error(*args, **kwargs):
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(cli_module, "register_ligand", _raise_storage_error)
+
+    result = runner.invoke(
+        app,
+        [
+            "ligand",
+            "add",
+            "exp001",
+            "curcumin",
+            "--name",
+            "Curcumin",
+            "--acquisition-method",
+            "uploaded",
+            "--raw-file",
+            str(raw_file),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert not isinstance(result.exception, OSError)
+    assert "STORAGE ERROR" in result.output
+    assert "simulated disk failure" in result.output
+
+    log_file = project / "logs" / "activity.log"
+    lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    assert "command=ligand-add" in lines[0]
+    assert "outcome=error" in lines[0]
 
 
 def test_plan_rejects_malformed_yaml(tmp_path, monkeypatch):

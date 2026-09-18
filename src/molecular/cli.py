@@ -177,6 +177,12 @@ def _add_scientific_input(
         _record_activity_safely(experiment, command=command, outcome="error")
         raise typer.Exit(code=1)
 
+    except OSError as error:
+        typer.echo("STORAGE ERROR")
+        typer.echo(str(error))
+        _record_activity_safely(experiment, command=command, outcome="error")
+        raise typer.Exit(code=1)
+
     typer.echo(f"{label} '{registered.id}' registered successfully.")
     _record_activity_safely(experiment, command=command, outcome="success")
 

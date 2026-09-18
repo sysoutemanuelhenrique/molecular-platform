@@ -40,6 +40,7 @@ def _build_scientific_input(
     relative_path: Path,
     file_format_value: str,
     checksum: str,
+    acquired_at: datetime,
 ) -> ScientificInputT:
     raw_artifact = RawArtifact(
         path=relative_path.as_posix(),
@@ -52,7 +53,7 @@ def _build_scientific_input(
         source_name=source_name,
         source_identifier=source_identifier,
         source_uri=source_uri,
-        acquired_at=datetime.now(timezone.utc),
+        acquired_at=acquired_at,
         raw_artifact=raw_artifact,
     )
 
@@ -99,6 +100,7 @@ def _register_input(
     relative_stored_path = Path("inputs") / kind / input_id / raw_file.name
     file_format_value = (file_format or raw_file.suffix.lstrip(".") or "unknown").lower()
     source_checksum = _compute_checksum(raw_file)
+    acquired_at = datetime.now(timezone.utc)
 
     # Validate everything (acquisition rules, id/name, etc.) before touching disk.
     _build_scientific_input(
@@ -113,6 +115,7 @@ def _register_input(
         relative_stored_path,
         file_format_value,
         source_checksum,
+        acquired_at,
     )
 
     stored_path = project_dir / relative_stored_path
@@ -139,6 +142,7 @@ def _register_input(
         relative_stored_path,
         file_format_value,
         stored_checksum,
+        acquired_at,
     )
 
     metadata_file.write_text(
