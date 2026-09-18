@@ -1,3 +1,7 @@
+import tempfile
+from pathlib import Path
+
+import yaml
 from typer.testing import CliRunner
 
 import molecular.cli as cli_module
@@ -547,6 +551,302 @@ def test_ligand_add_handles_storage_error_without_traceback(tmp_path, monkeypatc
     assert len(lines) == 1
     assert "command=ligand-add" in lines[0]
     assert "outcome=error" in lines[0]
+
+
+def _fake_fetch_returning(tmp_path, content=b"fake-pubchem-sdf-bytes"):
+    """Build a fake fetch_pubchem_sdf_2d replacement that returns a real temp
+    file inside its own isolated directory (mirroring the real function's
+    contract, so cleanup_temp_artifact's rmtree-the-parent behavior only
+    removes that isolated directory), without touching the network."""
+
+    def _fetch(cid, timeout=None):
+        temp_dir = tmp_path / f"fake_pubchem_temp_{cid}"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        temp_path = temp_dir / f"pubchem_{cid}_fake.sdf"
+        temp_path.write_bytes(content)
+        return temp_path
+
+    return _fetch
+
+
+def test_ligand_fetch_pubchem_registers_successfully(tmp_path, monkeypatch):
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+
+    fake_fetch = _fake_fetch_returning(tmp_path)
+    monkeypatch.setattr(cli_module, "fetch_pubchem_sdf_2d", fake_fetch)
+
+    result = runner.invoke(
+        app,
+        [
+            "ligand",
+            "fetch-pubchem",
+            "exp001",
+            "curcumin",
+            "--cid",
+            "969516",
+            "--name",
+            "Curcumin",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Ligand 'curcumin' registered successfully." in result.output
+
+    metadata_file = project / "inputs" / "ligands" / "curcumin.yaml"
+    assert metadata_file.exists()
+
+    metadata = yaml.safe_load(metadata_file.read_text(encoding="utf-8"))
+    acquisition = metadata["acquisition"]
+    assert metadata["external_id"] == "CID 969516"
+    assert acquisition["method"] == "downloaded"
+    assert acquisition["source_name"] == "PubChem"
+    assert acquisition["source_identifier"] == "CID 969516"
+    assert acquisition["source_uri"] == (
+        "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/969516/SDF?record_type=2d"
+    )
+    assert acquisition["raw_artifact"]["format"] == "sdf"
+
+    stored_file = project / "inputs" / "ligands" / "curcumin" / "pubchem_969516_fake.sdf"
+    assert stored_file.exists()
+    assert stored_file.read_bytes() == b"fake-pubchem-sdf-bytes"
+
+    # the temporary directory created by the (fake) fetch must be fully cleaned up
+    assert not (tmp_path / "fake_pubchem_temp_969516").exists()
+
+    log_file = project / "logs" / "activity.log"
+    lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    assert "command=ligand-fetch-pubchem" in lines[0]
+    assert "outcome=success" in lines[0]
+
+
+class _FakePubchemResponse:
+    def __init__(self, data: bytes):
+        self._data = data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def read(self):
+        return self._data
+
+
+def test_ligand_fetch_pubchem_persists_deterministic_raw_artifact_name(tmp_path, monkeypatch):
+    """End-to-end through the real fetch_pubchem_sdf_2d (only urlopen is faked),
+    proving the persisted RAW artifact name is deterministic and cleanup is total."""
+
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+
+    def _fake_urlopen(url, timeout=None):
+        return _FakePubchemResponse(b"fake-sdf-bytes-for-969516")
+
+    monkeypatch.setattr("molecular.pubchem.urllib.request.urlopen", _fake_urlopen)
+
+    result = runner.invoke(
+        app,
+        [
+            "ligand",
+            "fetch-pubchem",
+            "exp001",
+            "curcumin",
+            "--cid",
+            "969516",
+            "--name",
+            "Curcumin",
+        ],
+    )
+
+    assert result.exit_code == 0
+
+    metadata_file = project / "inputs" / "ligands" / "curcumin.yaml"
+    metadata = yaml.safe_load(metadata_file.read_text(encoding="utf-8"))
+    raw_path = metadata["acquisition"]["raw_artifact"]["path"]
+
+    assert raw_path == "inputs/ligands/curcumin/pubchem_cid_969516_2d.sdf"
+
+    stored_file = project / raw_path
+    assert stored_file.exists()
+    assert stored_file.read_bytes() == b"fake-sdf-bytes-for-969516"
+
+    # complete cleanup: no leftover pubchem temp directory anywhere in the OS temp dir
+    leftover = list(Path(tempfile.gettempdir()).glob("pubchem_969516_*"))
+    assert leftover == []
+
+
+def test_ligand_fetch_pubchem_rejects_invalid_cid_without_network_call(tmp_path, monkeypatch):
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+
+    def _fail_if_called(cid, timeout=None):
+        raise AssertionError("fetch_pubchem_sdf_2d must not be called for an invalid CID")
+
+    monkeypatch.setattr(cli_module, "fetch_pubchem_sdf_2d", _fail_if_called)
+
+    result = runner.invoke(
+        app,
+        [
+            "ligand",
+            "fetch-pubchem",
+            "exp001",
+            "curcumin",
+            "--cid",
+            "0",
+            "--name",
+            "Curcumin",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "INPUT ERROR" in result.output
+
+    log_file = project / "logs" / "activity.log"
+    lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert "command=ligand-fetch-pubchem" in lines[0]
+    assert "outcome=error" in lines[0]
+
+
+def test_ligand_fetch_pubchem_handles_not_found(tmp_path, monkeypatch):
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+
+    def _raise_not_found(cid, timeout=None):
+        raise cli_module.PubChemNotFoundError(f"PubChem has no record for CID {cid}.")
+
+    monkeypatch.setattr(cli_module, "fetch_pubchem_sdf_2d", _raise_not_found)
+
+    result = runner.invoke(
+        app,
+        [
+            "ligand",
+            "fetch-pubchem",
+            "exp001",
+            "curcumin",
+            "--cid",
+            "999999999",
+            "--name",
+            "Curcumin",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "INPUT ERROR" in result.output
+    assert "PubChem has no record for CID 999999999." in result.output
+
+    log_file = project / "logs" / "activity.log"
+    lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert "command=ligand-fetch-pubchem" in lines[0]
+    assert "outcome=error" in lines[0]
+
+
+def test_ligand_fetch_pubchem_handles_acquisition_error(tmp_path, monkeypatch):
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+
+    def _raise_acquisition_error(cid, timeout=None):
+        raise cli_module.PubChemAcquisitionError("PubChem request timed out after 30.0s for CID 969516.")
+
+    monkeypatch.setattr(cli_module, "fetch_pubchem_sdf_2d", _raise_acquisition_error)
+
+    result = runner.invoke(
+        app,
+        [
+            "ligand",
+            "fetch-pubchem",
+            "exp001",
+            "curcumin",
+            "--cid",
+            "969516",
+            "--name",
+            "Curcumin",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "ACQUISITION ERROR" in result.output
+    assert "timed out" in result.output
+
+    log_file = project / "logs" / "activity.log"
+    lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert "command=ligand-fetch-pubchem" in lines[0]
+    assert "outcome=error" in lines[0]
+
+
+def test_ligand_fetch_pubchem_rejects_missing_experiment_without_network_call(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    def _fail_if_called(cid, timeout=None):
+        raise AssertionError("fetch_pubchem_sdf_2d must not be called for a missing experiment")
+
+    monkeypatch.setattr(cli_module, "fetch_pubchem_sdf_2d", _fail_if_called)
+
+    result = runner.invoke(
+        app,
+        [
+            "ligand",
+            "fetch-pubchem",
+            "nao_existe",
+            "curcumin",
+            "--cid",
+            "969516",
+            "--name",
+            "Curcumin",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "INPUT ERROR" in result.output
+    assert "Experiment 'nao_existe' was not found." in result.output
+    assert not (tmp_path / "nao_existe").exists()
+
+
+def test_ligand_fetch_pubchem_rejects_duplicate_id_and_cleans_up_temp_file(tmp_path, monkeypatch):
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+
+    existing_raw_file = tmp_path / "existing.sdf"
+    existing_raw_file.write_bytes(b"already-registered-bytes")
+    runner.invoke(
+        app,
+        [
+            "ligand",
+            "add",
+            "exp001",
+            "curcumin",
+            "--name",
+            "Curcumin",
+            "--acquisition-method",
+            "uploaded",
+            "--raw-file",
+            str(existing_raw_file),
+        ],
+    )
+
+    fake_fetch = _fake_fetch_returning(tmp_path)
+    monkeypatch.setattr(cli_module, "fetch_pubchem_sdf_2d", fake_fetch)
+
+    result = runner.invoke(
+        app,
+        [
+            "ligand",
+            "fetch-pubchem",
+            "exp001",
+            "curcumin",
+            "--cid",
+            "969516",
+            "--name",
+            "Curcumin",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "INPUT ERROR" in result.output
+    assert "already registered" in result.output
+
+    # the original registration must be untouched (no overwrite)
+    stored_file = project / "inputs" / "ligands" / "curcumin" / "existing.sdf"
+    assert stored_file.read_bytes() == b"already-registered-bytes"
+
+    # the temp directory from the failed fetch-pubchem attempt must still be cleaned up
+    assert not (tmp_path / "fake_pubchem_temp_969516").exists()
 
 
 def test_plan_rejects_malformed_yaml(tmp_path, monkeypatch):

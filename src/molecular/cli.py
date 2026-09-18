@@ -8,6 +8,13 @@ from pydantic import ValidationError
 
 from molecular.activity import record_activity
 from molecular.config import load_experiment
+from molecular.pubchem import (
+    PubChemAcquisitionError,
+    PubChemNotFoundError,
+    build_pubchem_sdf_url,
+    cleanup_temp_artifact,
+    fetch_pubchem_sdf_2d,
+)
 from molecular.registry import register_ligand, register_protein
 
 app = typer.Typer(
@@ -217,6 +224,66 @@ def ligand_add(
         source_uri=source_uri,
         file_format=file_format,
     )
+
+
+@ligand_app.command("fetch-pubchem")
+def ligand_fetch_pubchem(
+    experiment: str,
+    input_id: str,
+    cid: int = typer.Option(..., "--cid"),
+    name: str = typer.Option(..., "--name"),
+):
+    """Download a ligand's 2D SDF structure from PubChem by CID and register it."""
+
+    command = "ligand-fetch-pubchem"
+
+    _load_experiment_or_exit(experiment, command=command)
+
+    if cid <= 0:
+        typer.echo("INPUT ERROR")
+        typer.echo(f"'{cid}' is not a valid PubChem CID.")
+        _record_activity_safely(experiment, command=command, outcome="error")
+        raise typer.Exit(code=1)
+
+    try:
+        temp_path = fetch_pubchem_sdf_2d(cid)
+
+    except PubChemNotFoundError as error:
+        typer.echo("INPUT ERROR")
+        typer.echo(str(error))
+        _record_activity_safely(experiment, command=command, outcome="error")
+        raise typer.Exit(code=1)
+
+    except PubChemAcquisitionError as error:
+        typer.echo("ACQUISITION ERROR")
+        typer.echo(str(error))
+        _record_activity_safely(experiment, command=command, outcome="error")
+        raise typer.Exit(code=1)
+
+    except OSError as error:
+        typer.echo("STORAGE ERROR")
+        typer.echo(str(error))
+        _record_activity_safely(experiment, command=command, outcome="error")
+        raise typer.Exit(code=1)
+
+    try:
+        _add_scientific_input(
+            register_fn=register_ligand,
+            label="Ligand",
+            command=command,
+            experiment=experiment,
+            input_id=input_id,
+            name=name,
+            acquisition_method="downloaded",
+            raw_file=str(temp_path),
+            external_id=f"CID {cid}",
+            source_name="PubChem",
+            source_identifier=f"CID {cid}",
+            source_uri=build_pubchem_sdf_url(cid),
+            file_format="sdf",
+        )
+    finally:
+        cleanup_temp_artifact(temp_path)
 
 
 @protein_app.command("add")
