@@ -235,3 +235,100 @@ def test_declared_experiment_id_ignores_non_string_values(tmp_path):
 
     with pytest.raises(ExperimentNotFoundError):
         resolve_experiment("123", base_dir=tmp_path)
+
+
+# --- Identity conflicts span every candidate with a known id, valid or not ---
+
+
+def test_ambiguous_when_one_valid_and_one_invalid_candidate_share_the_id(tmp_path):
+    """(A) A valid candidate and an invalid-but-known-id candidate declaring
+    the same experiment_id must raise ambiguity, not silently return the
+    valid one."""
+
+    _write_experiment_yaml(tmp_path / "folder_a", experiment_id="EXP-001")
+    _write_experiment_yaml(tmp_path / "folder_b", experiment_id="EXP-001", schema_version="2.0")
+
+    with pytest.raises(AmbiguousExperimentError) as excinfo:
+        resolve_experiment("EXP-001", base_dir=tmp_path)
+
+    assert sorted(excinfo.value.directories) == ["folder_a", "folder_b"]
+
+
+def test_ambiguous_when_two_invalid_candidates_share_the_id(tmp_path):
+    """(B) Two invalid-but-known-id candidates declaring the same id must
+    raise ambiguity, not pick whichever was encountered first."""
+
+    _write_experiment_yaml(tmp_path / "folder_a", experiment_id="EXP-001", schema_version="2.0")
+    _write_experiment_yaml(tmp_path / "folder_b", experiment_id="EXP-001", schema_version="2.0")
+
+    with pytest.raises(AmbiguousExperimentError) as excinfo:
+        resolve_experiment("EXP-001", base_dir=tmp_path)
+
+    assert sorted(excinfo.value.directories) == ["folder_a", "folder_b"]
+
+
+def test_ambiguity_error_names_every_conflicting_directory_valid_and_invalid(tmp_path):
+    """(C) Every conflicting directory - valid or invalid-but-known - must
+    be named in the ambiguity error, regardless of how many there are or
+    which are valid."""
+
+    _write_experiment_yaml(tmp_path / "folder_a", experiment_id="EXP-001")
+    _write_experiment_yaml(tmp_path / "folder_b", experiment_id="EXP-001", schema_version="2.0")
+    _write_experiment_yaml(tmp_path / "folder_c", experiment_id="EXP-001", schema_version="2.0")
+
+    with pytest.raises(AmbiguousExperimentError) as excinfo:
+        resolve_experiment("EXP-001", base_dir=tmp_path)
+
+    assert sorted(excinfo.value.directories) == ["folder_a", "folder_b", "folder_c"]
+    assert "folder_a" in str(excinfo.value)
+    assert "folder_b" in str(excinfo.value)
+    assert "folder_c" in str(excinfo.value)
+
+
+def test_single_invalid_candidate_without_conflict_still_raises_invalid_config_error(tmp_path):
+    """(D) Sanity check: a lone invalid-but-known-id candidate, with no
+    other candidate declaring the same id, is InvalidExperimentConfigError,
+    not ambiguity."""
+
+    _write_experiment_yaml(tmp_path / "folder_a", experiment_id="EXP-001", schema_version="2.0")
+
+    with pytest.raises(InvalidExperimentConfigError):
+        resolve_experiment("EXP-001", base_dir=tmp_path)
+
+
+def test_single_valid_candidate_without_conflict_still_resolves_normally(tmp_path):
+    """(E) Sanity check: a lone valid candidate, with no other candidate
+    declaring the same id, resolves normally, not ambiguity."""
+
+    _write_experiment_yaml(tmp_path / "folder_a", experiment_id="EXP-001")
+
+    context = resolve_experiment("EXP-001", base_dir=tmp_path)
+
+    assert context.project_dir == tmp_path / "folder_a"
+
+
+def test_malformed_candidate_never_joins_an_identity_conflict(tmp_path):
+    """(F) A malformed candidate has no recoverable identity at all, so it
+    never participates in ambiguity detection - even if its directory
+    happens to be named after the identifier being looked up."""
+
+    _write_experiment_yaml(tmp_path / "folder_a", experiment_id="EXP-001")
+    broken = tmp_path / "EXP-001"
+    broken.mkdir()
+    (broken / "experiment.yaml").write_text("experiment_id: [unclosed\n", encoding="utf-8")
+
+    context = resolve_experiment("EXP-001", base_dir=tmp_path)
+
+    assert context.project_dir == tmp_path / "folder_a"
+
+
+def test_directory_differing_from_id_still_resolves_with_conflict_detection_in_place(tmp_path):
+    """(G) The cross-candidate conflict-detection path must not regress the
+    base case of directory != experiment_id."""
+
+    _write_experiment_yaml(tmp_path / "some_folder", experiment_id="exp001")
+
+    context = resolve_experiment("exp001", base_dir=tmp_path)
+
+    assert context.experiment_id == "exp001"
+    assert context.project_dir == tmp_path / "some_folder"

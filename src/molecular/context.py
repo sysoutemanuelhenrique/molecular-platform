@@ -186,34 +186,45 @@ def resolve_experiment(
     """Resolve an experiment by its logical experiment_id (exact match only).
 
     Directory names are never treated as identity - only config.experiment_id
-    counts. A directory that merely shares a name with the identifier cannot
-    satisfy the lookup on its own, and comparison is always exact (case
-    sensitive), independent of the underlying filesystem's case sensitivity.
+    (or, for an invalid candidate, its declared experiment_id field) counts.
+    A directory that merely shares a name with the identifier cannot satisfy
+    the lookup on its own, and comparison is always exact (case sensitive),
+    independent of the underlying filesystem's case sensitivity.
 
-    Four outcomes are possible:
-    - exactly one valid candidate declares the id: it is returned.
-    - more than one valid candidate declares the id: AmbiguousExperimentError.
-    - no valid candidate declares it, but a candidate's parseable YAML
-      declares it and only fails ExperimentConfig validation:
-      InvalidExperimentConfigError - the identity is confiably known (from
-      the YAML itself, never from the directory name), even though the
-      config can't be loaded.
+    Ambiguity is checked across every candidate with a confiably known
+    identity - valid ones and invalid-but-known ones alike - since a config
+    being invalid doesn't make its declared identity any less real. Four
+    outcomes are possible:
+    - more than one candidate (valid, invalid-with-id, or a mix) declares
+      the id: AmbiguousExperimentError, naming every conflicting directory.
+    - exactly one candidate declares it: returned as an ExperimentContext if
+      valid, or raised as InvalidExperimentConfigError if not.
     - otherwise: ExperimentNotFoundError - either genuinely absent, or only
       present in candidates with no recoverable identity at all (malformed
       YAML, filesystem errors, or a non-string experiment_id).
     """
 
     valid, invalid_with_id, _skipped = _scan_candidates(base_dir, loader)
-    matches = [context for context in valid if context.experiment_id == identifier]
 
-    if len(matches) == 1:
-        return matches[0]
+    valid_matches = [context for context in valid if context.experiment_id == identifier]
+    invalid_matches = [
+        (project_dir, error)
+        for project_dir, declared_id, error in invalid_with_id
+        if declared_id == identifier
+    ]
 
-    if len(matches) > 1:
-        raise AmbiguousExperimentError(identifier, [context.project_dir.name for context in matches])
+    if len(valid_matches) + len(invalid_matches) > 1:
+        directories = sorted(
+            [context.project_dir.name for context in valid_matches]
+            + [project_dir.name for project_dir, _error in invalid_matches]
+        )
+        raise AmbiguousExperimentError(identifier, directories)
 
-    for project_dir, declared_id, error in invalid_with_id:
-        if declared_id == identifier:
-            raise InvalidExperimentConfigError(identifier, project_dir, error)
+    if len(valid_matches) == 1:
+        return valid_matches[0]
+
+    if len(invalid_matches) == 1:
+        project_dir, error = invalid_matches[0]
+        raise InvalidExperimentConfigError(identifier, project_dir, error)
 
     raise ExperimentNotFoundError(identifier)
