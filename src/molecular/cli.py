@@ -8,7 +8,15 @@ import yaml
 from pydantic import ValidationError
 
 from molecular.activity import record_activity
+from molecular.atomic import atomic_write_text
 from molecular.config import load_experiment
+from molecular.context import (
+    AmbiguousExperimentError,
+    ExperimentContext,
+    ExperimentNotFoundError,
+    resolve_experiment,
+    scan_experiments,
+)
 from molecular.models import ExperimentConfig
 from molecular.pubchem import (
     PubChemAcquisitionError,
@@ -81,51 +89,46 @@ def init(
 
             raise typer.Exit(code=1)
 
-        experiment_file.write_text(
+        atomic_write_text(
+            experiment_file,
             yaml.safe_dump(config.model_dump(mode="json"), sort_keys=False),
-            encoding="utf-8",
         )
 
     typer.echo(f"Experiment '{name}' created successfully.")
 
-def _record_activity_safely(name: str, command: str, outcome: str) -> None:
+def _record_activity_safely(project_dir: Path, command: str, outcome: str) -> None:
     """Best-effort activity logging that must never affect the caller's own outcome."""
 
     try:
-        record_activity(Path(name), command=command, outcome=outcome)
+        record_activity(project_dir, command=command, outcome=outcome)
     except OSError:
         pass
 
 
-def _load_experiment_or_exit(name: str, command: str):
-    """Load and validate an experiment, exiting with a friendly error on failure."""
+def _resolve_experiment_or_exit(identifier: str) -> ExperimentContext:
+    """Resolve an experiment by its logical experiment_id, or exit with a
+    friendly error.
 
-    experiment_file = Path(name) / "experiment.yaml"
+    There is no activity log entry on failure here: without a resolved
+    context there is no project_dir to log against.
+    """
 
     try:
-        return load_experiment(experiment_file)
+        return resolve_experiment(identifier, loader=load_experiment)
 
-    except FileNotFoundError:
+    except ExperimentNotFoundError:
         typer.echo("INPUT ERROR")
-        typer.echo(f"Experiment '{name}' was not found.")
-        _record_activity_safely(name, command=command, outcome="error")
+        typer.echo(f"Experiment '{identifier}' was not found.")
         raise typer.Exit(code=1)
 
-    except yaml.YAMLError:
+    except AmbiguousExperimentError as error:
         typer.echo("CONFIGURATION ERROR")
-        typer.echo(f"Experiment '{name}' has malformed YAML.")
-        _record_activity_safely(name, command=command, outcome="error")
+        typer.echo(str(error))
         raise typer.Exit(code=1)
 
-    except ValidationError as error:
-        typer.echo("CONFIGURATION ERROR")
-        typer.echo(f"Experiment '{name}' is invalid.")
-
-        for item in error.errors():
-            field = ".".join(str(part) for part in item["loc"])
-            typer.echo(f"- {field}: {item['msg']}")
-
-        _record_activity_safely(name, command=command, outcome="error")
+    except OSError as error:
+        typer.echo("STORAGE ERROR")
+        typer.echo(f"Could not read the current directory: {error}")
         raise typer.Exit(code=1)
 
 
@@ -133,31 +136,31 @@ def _load_experiment_or_exit(name: str, command: str):
 def validate(name: str):
     """Validate a molecular experiment."""
 
-    config = _load_experiment_or_exit(name, command="validate")
+    context = _resolve_experiment_or_exit(name)
 
     typer.echo(
-        f"Experiment '{config.experiment_id}' is valid "
-        f"(schema {config.schema_version})."
+        f"Experiment '{context.config.experiment_id}' is valid "
+        f"(schema {context.config.schema_version})."
     )
 
-    _record_activity_safely(name, command="validate", outcome="success")
+    _record_activity_safely(context.project_dir, command="validate", outcome="success")
 
 
 @app.command()
 def plan(name: str):
     """Show the execution plan for a molecular experiment."""
 
-    config = _load_experiment_or_exit(name, command="plan")
+    context = _resolve_experiment_or_exit(name)
 
     typer.echo("EXPERIMENT PLAN")
     typer.echo()
-    typer.echo(f"Experiment: {config.experiment_id}")
-    typer.echo(f"Schema: {config.schema_version}")
+    typer.echo(f"Experiment: {context.config.experiment_id}")
+    typer.echo(f"Schema: {context.config.schema_version}")
     typer.echo("Status: VALID")
     typer.echo()
     typer.echo("No execution steps are defined yet.")
 
-    _record_activity_safely(name, command="plan", outcome="success")
+    _record_activity_safely(context.project_dir, command="plan", outcome="success")
 
 
 def _add_scientific_input(
@@ -165,7 +168,7 @@ def _add_scientific_input(
     register_fn,
     label: str,
     command: str,
-    experiment: str,
+    context: ExperimentContext,
     input_id: str,
     name: str,
     acquisition_method: str,
@@ -178,11 +181,9 @@ def _add_scientific_input(
 ) -> None:
     """Shared registration flow for `ligand add` / `protein add`."""
 
-    _load_experiment_or_exit(experiment, command=command)
-
     try:
         registered = register_fn(
-            Path(experiment),
+            context.project_dir,
             input_id=input_id,
             name=name,
             method=acquisition_method,
@@ -197,7 +198,7 @@ def _add_scientific_input(
     except (FileNotFoundError, FileExistsError) as error:
         typer.echo("INPUT ERROR")
         typer.echo(str(error))
-        _record_activity_safely(experiment, command=command, outcome="error")
+        _record_activity_safely(context.project_dir, command=command, outcome="error")
         raise typer.Exit(code=1)
 
     except ValidationError as error:
@@ -208,17 +209,17 @@ def _add_scientific_input(
             field = ".".join(str(part) for part in item["loc"])
             typer.echo(f"- {field}: {item['msg']}")
 
-        _record_activity_safely(experiment, command=command, outcome="error")
+        _record_activity_safely(context.project_dir, command=command, outcome="error")
         raise typer.Exit(code=1)
 
     except OSError as error:
         typer.echo("STORAGE ERROR")
         typer.echo(str(error))
-        _record_activity_safely(experiment, command=command, outcome="error")
+        _record_activity_safely(context.project_dir, command=command, outcome="error")
         raise typer.Exit(code=1)
 
     typer.echo(f"{label} '{registered.id}' registered successfully.")
-    _record_activity_safely(experiment, command=command, outcome="success")
+    _record_activity_safely(context.project_dir, command=command, outcome="success")
 
 
 @ligand_app.command("add")
@@ -236,11 +237,13 @@ def ligand_add(
 ):
     """Register a ligand input and its acquisition provenance."""
 
+    context = _resolve_experiment_or_exit(experiment)
+
     _add_scientific_input(
         register_fn=register_ligand,
         label="Ligand",
         command="ligand-add",
-        experiment=experiment,
+        context=context,
         input_id=input_id,
         name=name,
         acquisition_method=acquisition_method,
@@ -264,12 +267,12 @@ def ligand_fetch_pubchem(
 
     command = "ligand-fetch-pubchem"
 
-    _load_experiment_or_exit(experiment, command=command)
+    context = _resolve_experiment_or_exit(experiment)
 
     if cid <= 0:
         typer.echo("INPUT ERROR")
         typer.echo(f"'{cid}' is not a valid PubChem CID.")
-        _record_activity_safely(experiment, command=command, outcome="error")
+        _record_activity_safely(context.project_dir, command=command, outcome="error")
         raise typer.Exit(code=1)
 
     try:
@@ -278,19 +281,19 @@ def ligand_fetch_pubchem(
     except PubChemNotFoundError as error:
         typer.echo("INPUT ERROR")
         typer.echo(str(error))
-        _record_activity_safely(experiment, command=command, outcome="error")
+        _record_activity_safely(context.project_dir, command=command, outcome="error")
         raise typer.Exit(code=1)
 
     except PubChemAcquisitionError as error:
         typer.echo("ACQUISITION ERROR")
         typer.echo(str(error))
-        _record_activity_safely(experiment, command=command, outcome="error")
+        _record_activity_safely(context.project_dir, command=command, outcome="error")
         raise typer.Exit(code=1)
 
     except OSError as error:
         typer.echo("STORAGE ERROR")
         typer.echo(str(error))
-        _record_activity_safely(experiment, command=command, outcome="error")
+        _record_activity_safely(context.project_dir, command=command, outcome="error")
         raise typer.Exit(code=1)
 
     try:
@@ -298,7 +301,7 @@ def ligand_fetch_pubchem(
             register_fn=register_ligand,
             label="Ligand",
             command=command,
-            experiment=experiment,
+            context=context,
             input_id=input_id,
             name=name,
             acquisition_method="downloaded",
@@ -328,11 +331,13 @@ def protein_add(
 ):
     """Register a protein input and its acquisition provenance."""
 
+    context = _resolve_experiment_or_exit(experiment)
+
     _add_scientific_input(
         register_fn=register_protein,
         label="Protein",
         command="protein-add",
-        experiment=experiment,
+        context=context,
         input_id=input_id,
         name=name,
         acquisition_method=acquisition_method,
@@ -343,84 +348,6 @@ def protein_add(
         source_uri=source_uri,
         file_format=file_format,
     )
-
-
-class _ExperimentNotFoundError(Exception):
-    """Raised when no experiment matches the given identifier."""
-
-
-class _AmbiguousExperimentError(Exception):
-    """Raised when more than one experiment declares the same experiment_id."""
-
-    def __init__(self, identifier: str, directories: list[str]):
-        self.identifier = identifier
-        self.directories = directories
-        super().__init__(
-            f"Multiple experiments declare experiment_id '{identifier}': "
-            f"{', '.join(directories)}. Resolve the conflict before querying by id."
-        )
-
-
-def _scan_experiments() -> tuple[list[tuple[Path, ExperimentConfig]], list[str]]:
-    """Scan immediate CWD subdirectories for experiments.
-
-    Returns (valid, skipped_names). A subdirectory without experiment.yaml is
-    not an experiment and is silently ignored. A subdirectory whose candidate
-    fails for any reason - malformed/invalid YAML, or a filesystem error such
-    as experiment.yaml being a directory, a permission error, or any other
-    OSError while inspecting or reading it - is reported as skipped. A single
-    broken candidate must never raise out of this function and take down the
-    whole scan.
-
-    Raises OSError only if the CWD itself cannot be enumerated at all.
-    """
-
-    valid: list[tuple[Path, ExperimentConfig]] = []
-    skipped: list[str] = []
-
-    for entry in sorted(Path(".").iterdir()):
-        try:
-            if not entry.is_dir():
-                continue
-
-            experiment_file = entry / "experiment.yaml"
-            if not experiment_file.exists():
-                continue
-
-            config = load_experiment(experiment_file)
-
-        except (OSError, yaml.YAMLError, ValidationError):
-            skipped.append(entry.name)
-            continue
-
-        valid.append((entry, config))
-
-    return valid, skipped
-
-
-def _resolve_experiment(identifier: str) -> tuple[Path, ExperimentConfig]:
-    """Resolve an experiment by its logical experiment_id (exact match only).
-
-    Directory names are never treated as identity - only config.experiment_id
-    counts. A directory that merely shares a name with the identifier cannot
-    satisfy the lookup on its own, and comparison is always exact (case
-    sensitive), independent of the underlying filesystem's case sensitivity.
-    """
-
-    valid, _skipped = _scan_experiments()
-    matches = [
-        (directory, config)
-        for directory, config in valid
-        if config.experiment_id == identifier
-    ]
-
-    if len(matches) == 1:
-        return matches[0]
-
-    if not matches:
-        raise _ExperimentNotFoundError(identifier)
-
-    raise _AmbiguousExperimentError(identifier, [directory.name for directory, _ in matches])
 
 
 def _count_registered_inputs(project_dir: Path, kind: str) -> int:
@@ -439,46 +366,30 @@ def _count_registered_inputs(project_dir: Path, kind: str) -> int:
 def experiment_get(identifier: str):
     """Show metadata and input counts for a single experiment."""
 
-    command = "experiment-get"
-
-    try:
-        directory, config = _resolve_experiment(identifier)
-
-    except _ExperimentNotFoundError:
-        typer.echo("INPUT ERROR")
-        typer.echo(f"Experiment '{identifier}' was not found.")
-        raise typer.Exit(code=1)
-
-    except _AmbiguousExperimentError as error:
-        typer.echo("CONFIGURATION ERROR")
-        typer.echo(str(error))
-        raise typer.Exit(code=1)
-
-    except OSError as error:
-        typer.echo("STORAGE ERROR")
-        typer.echo(f"Could not read the current directory: {error}")
-        raise typer.Exit(code=1)
+    context = _resolve_experiment_or_exit(identifier)
 
     typer.echo("EXPERIMENT")
     typer.echo()
-    typer.echo(f"ID: {config.experiment_id}")
-    typer.echo(f"Directory: {directory.name}")
-    typer.echo(f"Title: {config.title or ''}")
-    typer.echo(f"Responsible: {config.responsible or ''}")
-    typer.echo(f"Created: {config.created_at.isoformat() if config.created_at else ''}")
+    typer.echo(f"ID: {context.config.experiment_id}")
+    typer.echo(f"Directory: {context.project_dir.name}")
+    typer.echo(f"Title: {context.config.title or ''}")
+    typer.echo(f"Responsible: {context.config.responsible or ''}")
+    typer.echo(
+        f"Created: {context.config.created_at.isoformat() if context.config.created_at else ''}"
+    )
     typer.echo("Status: VALID")
 
-    if config.summary:
+    if context.config.summary:
         typer.echo()
         typer.echo("Summary:")
-        typer.echo(config.summary)
+        typer.echo(context.config.summary)
 
     typer.echo()
     typer.echo("Inputs:")
-    typer.echo(f"Ligands: {_count_registered_inputs(directory, 'ligands')}")
-    typer.echo(f"Proteins: {_count_registered_inputs(directory, 'proteins')}")
+    typer.echo(f"Ligands: {_count_registered_inputs(context.project_dir, 'ligands')}")
+    typer.echo(f"Proteins: {_count_registered_inputs(context.project_dir, 'proteins')}")
 
-    _record_activity_safely(directory.name, command=command, outcome="success")
+    _record_activity_safely(context.project_dir, command="experiment-get", outcome="success")
 
 
 @experiment_app.command("list")
@@ -486,7 +397,7 @@ def experiment_list():
     """List all valid experiments found in the current directory."""
 
     try:
-        valid, skipped = _scan_experiments()
+        valid, skipped = scan_experiments(loader=load_experiment)
     except OSError as error:
         typer.echo("STORAGE ERROR")
         typer.echo(f"Could not read the current directory: {error}")
@@ -498,10 +409,10 @@ def experiment_list():
     if not valid:
         typer.echo("No experiments found in the current directory.")
     else:
-        id_width = max([len("ID")] + [len(config.experiment_id) for _, config in valid])
-        title_width = max([len("TITLE")] + [len(config.title or "") for _, config in valid])
+        id_width = max([len("ID")] + [len(context.config.experiment_id) for context in valid])
+        title_width = max([len("TITLE")] + [len(context.config.title or "") for context in valid])
         responsible_width = max(
-            [len("RESPONSIBLE")] + [len(config.responsible or "") for _, config in valid]
+            [len("RESPONSIBLE")] + [len(context.config.responsible or "") for context in valid]
         )
 
         typer.echo(
@@ -509,12 +420,12 @@ def experiment_list():
             f"{'RESPONSIBLE'.ljust(responsible_width)}   DIRECTORY"
         )
 
-        for directory, config in valid:
+        for context in valid:
             typer.echo(
-                f"{config.experiment_id.ljust(id_width)}   "
-                f"{(config.title or '').ljust(title_width)}   "
-                f"{(config.responsible or '').ljust(responsible_width)}   "
-                f"{directory.name}"
+                f"{context.config.experiment_id.ljust(id_width)}   "
+                f"{(context.config.title or '').ljust(title_width)}   "
+                f"{(context.config.responsible or '').ljust(responsible_width)}   "
+                f"{context.project_dir.name}"
             )
 
     if skipped:
