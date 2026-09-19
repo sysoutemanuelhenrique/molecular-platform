@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -8,6 +9,7 @@ from pydantic import ValidationError
 
 from molecular.activity import record_activity
 from molecular.config import load_experiment
+from molecular.models import ExperimentConfig
 from molecular.pubchem import (
     PubChemAcquisitionError,
     PubChemNotFoundError,
@@ -23,8 +25,10 @@ app = typer.Typer(
 
 ligand_app = typer.Typer(help="Manage ligand inputs.")
 protein_app = typer.Typer(help="Manage protein inputs.")
+experiment_app = typer.Typer(help="Query experiment metadata.")
 app.add_typer(ligand_app, name="ligand")
 app.add_typer(protein_app, name="protein")
+app.add_typer(experiment_app, name="experiment")
 
 @app.callback()
 def main():
@@ -33,7 +37,12 @@ def main():
 
 
 @app.command()
-def init(name: str):
+def init(
+    name: str,
+    title: Optional[str] = typer.Option(None, "--title"),
+    responsible: Optional[str] = typer.Option(None, "--responsible"),
+    summary: Optional[str] = typer.Option(None, "--summary"),
+):
     """Create a new molecular experiment."""
 
     project_dir = Path(name)
@@ -53,9 +62,27 @@ def init(name: str):
     experiment_file = project_dir / "experiment.yaml"
 
     if not experiment_file.exists():
+        try:
+            config = ExperimentConfig(
+                schema_version="1.1",
+                experiment_id=name,
+                title=title,
+                responsible=responsible,
+                summary=summary,
+                created_at=datetime.now(timezone.utc),
+            )
+        except ValidationError as error:
+            typer.echo("CONFIGURATION ERROR")
+            typer.echo(f"Experiment '{name}' metadata is invalid.")
+
+            for item in error.errors():
+                field = ".".join(str(part) for part in item["loc"])
+                typer.echo(f"- {field}: {item['msg']}")
+
+            raise typer.Exit(code=1)
+
         experiment_file.write_text(
-            'schema_version: "1.0"\n'
-            f'experiment_id: "{name}"\n',
+            yaml.safe_dump(config.model_dump(mode="json"), sort_keys=False),
             encoding="utf-8",
         )
 
@@ -316,3 +343,183 @@ def protein_add(
         source_uri=source_uri,
         file_format=file_format,
     )
+
+
+class _ExperimentNotFoundError(Exception):
+    """Raised when no experiment matches the given identifier."""
+
+
+class _AmbiguousExperimentError(Exception):
+    """Raised when more than one experiment declares the same experiment_id."""
+
+    def __init__(self, identifier: str, directories: list[str]):
+        self.identifier = identifier
+        self.directories = directories
+        super().__init__(
+            f"Multiple experiments declare experiment_id '{identifier}': "
+            f"{', '.join(directories)}. Resolve the conflict before querying by id."
+        )
+
+
+def _scan_experiments() -> tuple[list[tuple[Path, ExperimentConfig]], list[str]]:
+    """Scan immediate CWD subdirectories for experiments.
+
+    Returns (valid, skipped_names). A subdirectory without experiment.yaml is
+    not an experiment and is silently ignored. A subdirectory whose candidate
+    fails for any reason - malformed/invalid YAML, or a filesystem error such
+    as experiment.yaml being a directory, a permission error, or any other
+    OSError while inspecting or reading it - is reported as skipped. A single
+    broken candidate must never raise out of this function and take down the
+    whole scan.
+
+    Raises OSError only if the CWD itself cannot be enumerated at all.
+    """
+
+    valid: list[tuple[Path, ExperimentConfig]] = []
+    skipped: list[str] = []
+
+    for entry in sorted(Path(".").iterdir()):
+        try:
+            if not entry.is_dir():
+                continue
+
+            experiment_file = entry / "experiment.yaml"
+            if not experiment_file.exists():
+                continue
+
+            config = load_experiment(experiment_file)
+
+        except (OSError, yaml.YAMLError, ValidationError):
+            skipped.append(entry.name)
+            continue
+
+        valid.append((entry, config))
+
+    return valid, skipped
+
+
+def _resolve_experiment(identifier: str) -> tuple[Path, ExperimentConfig]:
+    """Resolve an experiment by its logical experiment_id (exact match only).
+
+    Directory names are never treated as identity - only config.experiment_id
+    counts. A directory that merely shares a name with the identifier cannot
+    satisfy the lookup on its own, and comparison is always exact (case
+    sensitive), independent of the underlying filesystem's case sensitivity.
+    """
+
+    valid, _skipped = _scan_experiments()
+    matches = [
+        (directory, config)
+        for directory, config in valid
+        if config.experiment_id == identifier
+    ]
+
+    if len(matches) == 1:
+        return matches[0]
+
+    if not matches:
+        raise _ExperimentNotFoundError(identifier)
+
+    raise _AmbiguousExperimentError(identifier, [directory.name for directory, _ in matches])
+
+
+def _count_registered_inputs(project_dir: Path, kind: str) -> int:
+    """Count registered <kind> inputs: one .yaml file per input, ignoring
+    the RAW artifact subdirectories that sit alongside them."""
+
+    kind_dir = project_dir / "inputs" / kind
+
+    if not kind_dir.is_dir():
+        return 0
+
+    return sum(1 for entry in kind_dir.iterdir() if entry.is_file() and entry.suffix == ".yaml")
+
+
+@experiment_app.command("get")
+def experiment_get(identifier: str):
+    """Show metadata and input counts for a single experiment."""
+
+    command = "experiment-get"
+
+    try:
+        directory, config = _resolve_experiment(identifier)
+
+    except _ExperimentNotFoundError:
+        typer.echo("INPUT ERROR")
+        typer.echo(f"Experiment '{identifier}' was not found.")
+        raise typer.Exit(code=1)
+
+    except _AmbiguousExperimentError as error:
+        typer.echo("CONFIGURATION ERROR")
+        typer.echo(str(error))
+        raise typer.Exit(code=1)
+
+    except OSError as error:
+        typer.echo("STORAGE ERROR")
+        typer.echo(f"Could not read the current directory: {error}")
+        raise typer.Exit(code=1)
+
+    typer.echo("EXPERIMENT")
+    typer.echo()
+    typer.echo(f"ID: {config.experiment_id}")
+    typer.echo(f"Directory: {directory.name}")
+    typer.echo(f"Title: {config.title or ''}")
+    typer.echo(f"Responsible: {config.responsible or ''}")
+    typer.echo(f"Created: {config.created_at.isoformat() if config.created_at else ''}")
+    typer.echo("Status: VALID")
+
+    if config.summary:
+        typer.echo()
+        typer.echo("Summary:")
+        typer.echo(config.summary)
+
+    typer.echo()
+    typer.echo("Inputs:")
+    typer.echo(f"Ligands: {_count_registered_inputs(directory, 'ligands')}")
+    typer.echo(f"Proteins: {_count_registered_inputs(directory, 'proteins')}")
+
+    _record_activity_safely(directory.name, command=command, outcome="success")
+
+
+@experiment_app.command("list")
+def experiment_list():
+    """List all valid experiments found in the current directory."""
+
+    try:
+        valid, skipped = _scan_experiments()
+    except OSError as error:
+        typer.echo("STORAGE ERROR")
+        typer.echo(f"Could not read the current directory: {error}")
+        raise typer.Exit(code=1)
+
+    typer.echo("EXPERIMENTS")
+    typer.echo()
+
+    if not valid:
+        typer.echo("No experiments found in the current directory.")
+    else:
+        id_width = max([len("ID")] + [len(config.experiment_id) for _, config in valid])
+        title_width = max([len("TITLE")] + [len(config.title or "") for _, config in valid])
+        responsible_width = max(
+            [len("RESPONSIBLE")] + [len(config.responsible or "") for _, config in valid]
+        )
+
+        typer.echo(
+            f"{'ID'.ljust(id_width)}   {'TITLE'.ljust(title_width)}   "
+            f"{'RESPONSIBLE'.ljust(responsible_width)}   DIRECTORY"
+        )
+
+        for directory, config in valid:
+            typer.echo(
+                f"{config.experiment_id.ljust(id_width)}   "
+                f"{(config.title or '').ljust(title_width)}   "
+                f"{(config.responsible or '').ljust(responsible_width)}   "
+                f"{directory.name}"
+            )
+
+    if skipped:
+        typer.echo()
+        typer.echo(
+            f"{len(skipped)} directories skipped (invalid experiment.yaml): "
+            f"{', '.join(skipped)}"
+        )

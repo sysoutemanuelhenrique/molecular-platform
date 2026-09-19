@@ -866,3 +866,427 @@ def test_plan_rejects_malformed_yaml(tmp_path, monkeypatch):
     assert result.exit_code != 0
     assert "CONFIGURATION ERROR" in result.output
     assert "Experiment 'exp001' has malformed YAML." in result.output
+
+
+def _write_experiment_yaml(project: Path, **fields) -> None:
+    project.mkdir(parents=True, exist_ok=True)
+    (project / "experiment.yaml").write_text(
+        yaml.safe_dump(fields, sort_keys=False),
+        encoding="utf-8",
+    )
+
+
+def test_init_writes_schema_version_1_1(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    runner.invoke(app, ["init", "exp001"])
+
+    metadata = yaml.safe_load((tmp_path / "exp001" / "experiment.yaml").read_text(encoding="utf-8"))
+    assert metadata["schema_version"] == "1.1"
+
+
+def test_init_writes_created_at_in_utc(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    runner.invoke(app, ["init", "exp001"])
+
+    metadata = yaml.safe_load((tmp_path / "exp001" / "experiment.yaml").read_text(encoding="utf-8"))
+    assert metadata["created_at"] is not None
+    assert metadata["created_at"].endswith("Z") or "+00:00" in metadata["created_at"]
+
+
+def test_init_persists_metadata_flags(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    runner.invoke(
+        app,
+        [
+            "init",
+            "exp001",
+            "--title",
+            "Curcumin x Jack bean urease",
+            "--responsible",
+            "Emanuel Henrique",
+            "--summary",
+            "Docking study.",
+        ],
+    )
+
+    metadata = yaml.safe_load((tmp_path / "exp001" / "experiment.yaml").read_text(encoding="utf-8"))
+    assert metadata["title"] == "Curcumin x Jack bean urease"
+    assert metadata["responsible"] == "Emanuel Henrique"
+    assert metadata["summary"] == "Docking study."
+
+
+def test_init_without_metadata_flags_leaves_fields_empty(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["init", "exp001"])
+
+    assert result.exit_code == 0
+    metadata = yaml.safe_load((tmp_path / "exp001" / "experiment.yaml").read_text(encoding="utf-8"))
+    assert metadata["title"] is None
+    assert metadata["responsible"] is None
+    assert metadata["summary"] is None
+
+
+def test_init_rejects_empty_title(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["init", "exp001", "--title", ""])
+
+    assert result.exit_code != 0
+    assert "CONFIGURATION ERROR" in result.output
+
+
+def test_experiment_get_resolves_when_directory_name_matches_id(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write_experiment_yaml(
+        tmp_path / "exp001",
+        schema_version="1.1",
+        experiment_id="exp001",
+        title="Curcumin x Jack bean urease",
+        responsible="Emanuel Henrique",
+        summary="Docking study.",
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+
+    result = runner.invoke(app, ["experiment", "get", "exp001"])
+
+    assert result.exit_code == 0
+    assert "EXPERIMENT" in result.output
+    assert "ID: exp001" in result.output
+    assert "Directory: exp001" in result.output
+    assert "Title: Curcumin x Jack bean urease" in result.output
+    assert "Responsible: Emanuel Henrique" in result.output
+    assert "Status: VALID" in result.output
+    assert "Summary:" in result.output
+    assert "Docking study." in result.output
+    assert "Ligands: 0" in result.output
+    assert "Proteins: 0" in result.output
+
+    log_file = tmp_path / "exp001" / "logs" / "activity.log"
+    lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert "command=experiment-get" in lines[0]
+    assert "outcome=success" in lines[0]
+
+
+def test_experiment_get_resolves_by_experiment_id_when_directory_name_differs(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write_experiment_yaml(
+        tmp_path / "some_folder",
+        schema_version="1.1",
+        experiment_id="exp001",
+        title="Curcumin x Jack bean urease",
+    )
+
+    result = runner.invoke(app, ["experiment", "get", "exp001"])
+
+    assert result.exit_code == 0
+    assert "ID: exp001" in result.output
+    assert "Directory: some_folder" in result.output
+
+    log_file = tmp_path / "some_folder" / "logs" / "activity.log"
+    lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert "command=experiment-get" in lines[0]
+    assert "outcome=success" in lines[0]
+
+
+def test_experiment_get_counts_only_yaml_metadata_files(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write_experiment_yaml(tmp_path / "exp001", schema_version="1.1", experiment_id="exp001")
+
+    raw_file = tmp_path / "curcumin.sdf"
+    raw_file.write_bytes(b"fake-sdf-bytes")
+    runner.invoke(
+        app,
+        [
+            "ligand",
+            "add",
+            "exp001",
+            "curcumin",
+            "--name",
+            "Curcumin",
+            "--acquisition-method",
+            "uploaded",
+            "--raw-file",
+            str(raw_file),
+        ],
+    )
+
+    result = runner.invoke(app, ["experiment", "get", "exp001"])
+
+    assert result.exit_code == 0
+    assert "Ligands: 1" in result.output
+    assert "Proteins: 0" in result.output
+
+
+def test_experiment_get_handles_legacy_experiment_without_metadata(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write_experiment_yaml(tmp_path / "exp001", schema_version="1.0", experiment_id="exp001")
+
+    result = runner.invoke(app, ["experiment", "get", "exp001"])
+
+    assert result.exit_code == 0
+    assert "ID: exp001" in result.output
+    assert "Title: \n" in result.output or result.output.count("Title: ") == 1
+    assert "Summary:" not in result.output
+
+
+def test_experiment_get_returns_input_error_when_not_found(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["experiment", "get", "nao_existe"])
+
+    assert result.exit_code != 0
+    assert "INPUT ERROR" in result.output
+    assert "Experiment 'nao_existe' was not found." in result.output
+    assert not (tmp_path / "nao_existe").exists()
+
+
+def test_experiment_get_returns_ambiguity_error_without_choosing(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write_experiment_yaml(tmp_path / "folder_a", schema_version="1.1", experiment_id="dup001")
+    _write_experiment_yaml(tmp_path / "folder_b", schema_version="1.1", experiment_id="dup001")
+
+    result = runner.invoke(app, ["experiment", "get", "dup001"])
+
+    assert result.exit_code != 0
+    assert "CONFIGURATION ERROR" in result.output
+    assert "dup001" in result.output
+    assert "folder_a" in result.output
+    assert "folder_b" in result.output
+
+    assert not (tmp_path / "folder_a" / "logs" / "activity.log").exists()
+    assert not (tmp_path / "folder_b" / "logs" / "activity.log").exists()
+
+
+def test_experiment_get_treats_invalid_candidate_as_not_found(tmp_path, monkeypatch):
+    """A directory with a broken experiment.yaml never contributes a valid
+    experiment_id to match against (it's skipped during scanning), so asking
+    for it by name now surfaces as 'not found', not a configuration error
+    tied to that specific directory - a direct consequence of resolution
+    being purely id-based (no directory-name shortcut)."""
+
+    monkeypatch.chdir(tmp_path)
+    project = tmp_path / "exp001"
+    project.mkdir()
+    (project / "experiment.yaml").write_text(
+        'schema_version: "2.0"\n'
+        'experiment_id: "exp001"\n',
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["experiment", "get", "exp001"])
+
+    assert result.exit_code != 0
+    assert "INPUT ERROR" in result.output
+    assert "Experiment 'exp001' was not found." in result.output
+    assert not (project / "logs" / "activity.log").exists()
+
+
+# --- FIX 2: identity must never be shortcut by a matching directory name ---
+
+
+def test_experiment_get_directory_name_does_not_satisfy_wrong_id(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write_experiment_yaml(
+        tmp_path / "exp001",
+        schema_version="1.1",
+        experiment_id="totally-different-experiment",
+    )
+
+    result = runner.invoke(app, ["experiment", "get", "exp001"])
+
+    assert result.exit_code != 0
+    assert "INPUT ERROR" in result.output
+    assert "Experiment 'exp001' was not found." in result.output
+
+
+def test_experiment_get_finds_correct_id_even_when_another_directory_shares_the_name(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    _write_experiment_yaml(
+        tmp_path / "exp001",
+        schema_version="1.1",
+        experiment_id="totally-different-experiment",
+    )
+    _write_experiment_yaml(
+        tmp_path / "real_exp001",
+        schema_version="1.1",
+        experiment_id="exp001",
+    )
+
+    result = runner.invoke(app, ["experiment", "get", "exp001"])
+
+    assert result.exit_code == 0
+    assert "ID: exp001" in result.output
+    assert "Directory: real_exp001" in result.output
+
+
+def test_experiment_get_id_comparison_is_case_sensitive(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write_experiment_yaml(tmp_path / "exp001", schema_version="1.1", experiment_id="exp001")
+
+    result = runner.invoke(app, ["experiment", "get", "EXP001"])
+
+    assert result.exit_code != 0
+    assert "INPUT ERROR" in result.output
+    assert "Experiment 'EXP001' was not found." in result.output
+
+
+def test_experiment_get_ambiguity_not_shortcut_by_matching_directory_name(tmp_path, monkeypatch):
+    """Even when one of the ambiguous directories is literally named after
+    the identifier, the directory-name shortcut no longer exists, so
+    ambiguity must still be raised rather than silently returning that one."""
+
+    monkeypatch.chdir(tmp_path)
+    _write_experiment_yaml(tmp_path / "dup001", schema_version="1.1", experiment_id="dup001")
+    _write_experiment_yaml(tmp_path / "folder_b", schema_version="1.1", experiment_id="dup001")
+
+    result = runner.invoke(app, ["experiment", "get", "dup001"])
+
+    assert result.exit_code != 0
+    assert "CONFIGURATION ERROR" in result.output
+    assert "dup001" in result.output
+    assert "folder_b" in result.output
+
+    assert not (tmp_path / "dup001" / "logs" / "activity.log").exists()
+    assert not (tmp_path / "folder_b" / "logs" / "activity.log").exists()
+
+
+# --- FIX 1: a single broken filesystem candidate must not crash discovery ---
+
+
+def test_experiment_list_skips_experiment_yaml_that_is_a_directory(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write_experiment_yaml(tmp_path / "good_exp", schema_version="1.1", experiment_id="good")
+    (tmp_path / "weird_exp" / "experiment.yaml").mkdir(parents=True)
+
+    result = runner.invoke(app, ["experiment", "list"])
+
+    assert result.exit_code == 0
+    assert not isinstance(result.exception, OSError)
+    assert "good" in result.output
+    assert "1 directories skipped" in result.output
+    assert "weird_exp" in result.output
+
+
+def test_experiment_get_skips_experiment_yaml_that_is_a_directory_and_still_finds_valid_one(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    _write_experiment_yaml(tmp_path / "good_exp", schema_version="1.1", experiment_id="good")
+    (tmp_path / "weird_exp" / "experiment.yaml").mkdir(parents=True)
+
+    result = runner.invoke(app, ["experiment", "get", "good"])
+
+    assert result.exit_code == 0
+    assert not isinstance(result.exception, OSError)
+    assert "ID: good" in result.output
+
+
+def test_experiment_list_skips_candidate_raising_permission_error(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write_experiment_yaml(tmp_path / "good_exp", schema_version="1.1", experiment_id="good")
+    _write_experiment_yaml(tmp_path / "locked_exp", schema_version="1.1", experiment_id="locked")
+
+    real_load_experiment = cli_module.load_experiment
+
+    def _flaky_load_experiment(path):
+        if "locked_exp" in str(path):
+            raise PermissionError("simulated permission error")
+        return real_load_experiment(path)
+
+    monkeypatch.setattr(cli_module, "load_experiment", _flaky_load_experiment)
+
+    result = runner.invoke(app, ["experiment", "list"])
+
+    assert result.exit_code == 0
+    assert not isinstance(result.exception, PermissionError)
+    assert "good" in result.output
+    assert "1 directories skipped" in result.output
+    assert "locked_exp" in result.output
+
+
+def test_experiment_list_handles_unreadable_workspace_gracefully(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    def _raise_oserror(self):
+        raise OSError("simulated unreadable directory")
+
+    monkeypatch.setattr(Path, "iterdir", _raise_oserror)
+
+    result = runner.invoke(app, ["experiment", "list"])
+
+    assert result.exit_code == 1
+    assert not isinstance(result.exception, OSError)
+    assert "STORAGE ERROR" in result.output
+
+
+def test_experiment_list_shows_id_from_yaml_and_location(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write_experiment_yaml(
+        tmp_path / "folder_a",
+        schema_version="1.1",
+        experiment_id="exp001",
+        title="Curcumin x Jack bean urease",
+        responsible="Emanuel Henrique",
+    )
+
+    result = runner.invoke(app, ["experiment", "list"])
+
+    assert result.exit_code == 0
+    assert "EXPERIMENTS" in result.output
+    assert "exp001" in result.output
+    assert "Curcumin x Jack bean urease" in result.output
+    assert "Emanuel Henrique" in result.output
+    assert "folder_a" in result.output
+
+
+def test_experiment_list_ignores_non_experiment_directories(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write_experiment_yaml(tmp_path / "exp001", schema_version="1.1", experiment_id="exp001")
+    (tmp_path / "not_an_experiment").mkdir()
+
+    result = runner.invoke(app, ["experiment", "list"])
+
+    assert result.exit_code == 0
+    assert "not_an_experiment" not in result.output
+
+
+def test_experiment_list_reports_aggregated_warning_for_invalid_experiments(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write_experiment_yaml(tmp_path / "exp001", schema_version="1.1", experiment_id="exp001")
+
+    broken = tmp_path / "broken_exp"
+    broken.mkdir()
+    (broken / "experiment.yaml").write_text("experiment_id: [unclosed\n", encoding="utf-8")
+
+    result = runner.invoke(app, ["experiment", "list"])
+
+    assert result.exit_code == 0
+    assert "exp001" in result.output
+    assert "1 directories skipped" in result.output
+    assert "broken_exp" in result.output
+    # the invalid experiment must not appear as if it were a valid row
+    assert "broken_exp" not in result.output.split("skipped")[0]
+
+
+def test_experiment_list_shows_empty_message_when_no_experiments(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["experiment", "list"])
+
+    assert result.exit_code == 0
+    assert "No experiments found in the current directory." in result.output
+
+
+def test_experiment_list_does_not_write_activity_log(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write_experiment_yaml(tmp_path / "exp001", schema_version="1.1", experiment_id="exp001")
+
+    runner.invoke(app, ["experiment", "list"])
+
+    assert not (tmp_path / "exp001" / "logs" / "activity.log").exists()
