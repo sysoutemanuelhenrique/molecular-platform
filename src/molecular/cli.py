@@ -14,6 +14,7 @@ from molecular.context import (
     AmbiguousExperimentError,
     ExperimentContext,
     ExperimentNotFoundError,
+    InvalidExperimentConfigError,
     resolve_experiment,
     scan_experiments,
 )
@@ -119,6 +120,16 @@ def _resolve_experiment_or_exit(identifier: str) -> ExperimentContext:
     except ExperimentNotFoundError:
         typer.echo("INPUT ERROR")
         typer.echo(f"Experiment '{identifier}' was not found.")
+        raise typer.Exit(code=1)
+
+    except InvalidExperimentConfigError as error:
+        typer.echo("CONFIGURATION ERROR")
+        typer.echo(f"Experiment '{identifier}' is invalid.")
+
+        for item in error.validation_error.errors():
+            field = ".".join(str(part) for part in item["loc"])
+            typer.echo(f"- {field}: {item['msg']}")
+
         raise typer.Exit(code=1)
 
     except AmbiguousExperimentError as error:

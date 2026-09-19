@@ -1,13 +1,17 @@
+import dataclasses
 from pathlib import Path
 
 import pytest
 
 from molecular.context import (
     AmbiguousExperimentError,
+    ExperimentContext,
     ExperimentNotFoundError,
+    InvalidExperimentConfigError,
     resolve_experiment,
     scan_experiments,
 )
+from molecular.models import ExperimentConfig
 
 
 def _write_experiment_yaml(project: Path, experiment_id: str, schema_version: str = "1.1") -> None:
@@ -126,3 +130,108 @@ def test_scan_and_resolve_perform_no_writes(tmp_path):
         assert path.stat().st_mtime_ns == mtime
 
     assert not (tmp_path / "exp001" / "logs").exists()
+
+
+# --- ExperimentContext: one fact, one authority ---
+
+
+def test_experiment_context_has_no_independent_experiment_id_field():
+    """There is no stored field that could disagree with config.experiment_id -
+    identity is derived, never duplicated."""
+
+    field_names = {field.name for field in dataclasses.fields(ExperimentContext)}
+    assert field_names == {"project_dir", "config"}
+
+
+def test_experiment_context_experiment_id_is_derived_from_config():
+    config = ExperimentConfig(schema_version="1.1", experiment_id="exp001")
+    context = ExperimentContext(project_dir=Path("some_dir"), config=config)
+
+    assert context.experiment_id == "exp001"
+    assert context.experiment_id == context.config.experiment_id
+
+
+def test_experiment_context_experiment_id_cannot_be_set_independently():
+    config = ExperimentConfig(schema_version="1.1", experiment_id="exp001")
+    context = ExperimentContext(project_dir=Path("some_dir"), config=config)
+
+    with pytest.raises(AttributeError):
+        context.experiment_id = "different-id"
+
+
+def test_resolved_context_experiment_id_always_matches_its_config(tmp_path):
+    _write_experiment_yaml(tmp_path / "some_folder", experiment_id="exp001")
+
+    context = resolve_experiment("exp001", base_dir=tmp_path)
+
+    assert context.experiment_id == context.config.experiment_id == "exp001"
+
+
+# --- Invalid config with a confiably known experiment_id vs. no recoverable identity ---
+
+
+def test_resolve_raises_invalid_config_error_when_declared_id_matches_but_schema_invalid(tmp_path):
+    _write_experiment_yaml(tmp_path / "exp001", experiment_id="exp001", schema_version="2.0")
+
+    with pytest.raises(InvalidExperimentConfigError) as excinfo:
+        resolve_experiment("exp001", base_dir=tmp_path)
+
+    assert excinfo.value.identifier == "exp001"
+    assert excinfo.value.project_dir == tmp_path / "exp001"
+
+
+def test_resolve_invalid_config_error_works_even_when_directory_name_differs(tmp_path):
+    """Identity is read from the YAML's own experiment_id field, never from
+    the directory name - so this must still surface as a config error even
+    though the directory isn't named after the id."""
+
+    _write_experiment_yaml(tmp_path / "some_folder", experiment_id="exp001", schema_version="2.0")
+
+    with pytest.raises(InvalidExperimentConfigError) as excinfo:
+        resolve_experiment("exp001", base_dir=tmp_path)
+
+    assert excinfo.value.project_dir == tmp_path / "some_folder"
+
+
+def test_resolve_does_not_raise_invalid_config_error_for_a_different_identifier(tmp_path):
+    """An invalid candidate declaring a different id must not surface as
+    'invalid' for an unrelated lookup - it's simply not found."""
+
+    _write_experiment_yaml(
+        tmp_path / "exp001", experiment_id="totally-different-id", schema_version="2.0"
+    )
+
+    with pytest.raises(ExperimentNotFoundError):
+        resolve_experiment("exp001", base_dir=tmp_path)
+
+
+def test_resolve_still_not_found_for_malformed_yaml_with_no_recoverable_id(tmp_path):
+    """Malformed YAML (as opposed to a schema violation on an otherwise
+    parseable document) leaves no confiable identity to recover, so it
+    remains unresolved regardless of the directory's name."""
+
+    broken = tmp_path / "exp001"
+    broken.mkdir()
+    (broken / "experiment.yaml").write_text("experiment_id: [unclosed\n", encoding="utf-8")
+
+    with pytest.raises(ExperimentNotFoundError):
+        resolve_experiment("exp001", base_dir=tmp_path)
+
+
+def test_declared_experiment_id_ignores_non_string_values(tmp_path):
+    """A schema violation where experiment_id itself isn't a usable string
+    (e.g. a number) leaves no confiable identity to recover - the candidate
+    is skipped entirely rather than treated as an invalid-but-known id."""
+
+    project = tmp_path / "exp001"
+    project.mkdir()
+    (project / "experiment.yaml").write_text(
+        'schema_version: "1.1"\nexperiment_id: 123\n', encoding="utf-8"
+    )
+
+    valid, skipped = scan_experiments(base_dir=tmp_path)
+    assert valid == []
+    assert skipped == ["exp001"]
+
+    with pytest.raises(ExperimentNotFoundError):
+        resolve_experiment("123", base_dir=tmp_path)

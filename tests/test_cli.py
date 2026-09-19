@@ -74,12 +74,13 @@ def test_validate_writes_activity_log_entry(tmp_path, monkeypatch):
     assert "outcome=success" in lines[0]
 
 
-def test_validate_treats_invalid_candidate_as_not_found(tmp_path, monkeypatch):
-    """validate resolves by logical experiment_id like every other command. A
-    directory whose experiment.yaml fails schema validation never yields a
-    usable experiment_id, so it cannot be resolved - even though its
-    directory happens to be named after the identifier - and the command
-    reports 'not found' rather than a config error tied to that directory."""
+def test_validate_treats_invalid_schema_with_known_id_as_configuration_error(tmp_path, monkeypatch):
+    """validate resolves by logical experiment_id like every other command.
+    Here the YAML parses fine and clearly declares experiment_id 'exp001' -
+    only schema_version fails validation. That identity is confiably known
+    (read from the YAML itself, never from the directory name), so the
+    command must report a config error tied to it, not claim the experiment
+    doesn't exist."""
 
     monkeypatch.chdir(tmp_path)
 
@@ -96,8 +97,9 @@ def test_validate_treats_invalid_candidate_as_not_found(tmp_path, monkeypatch):
     result = runner.invoke(app, ["validate", "exp001"])
 
     assert result.exit_code != 0
-    assert "INPUT ERROR" in result.output
-    assert "Experiment 'exp001' was not found." in result.output
+    assert "CONFIGURATION ERROR" in result.output
+    assert "Experiment 'exp001' is invalid." in result.output
+    assert "schema_version" in result.output
 
 
 def test_validate_does_not_record_activity_when_candidate_cannot_be_resolved(tmp_path, monkeypatch):
@@ -217,9 +219,10 @@ def test_plan_rejects_missing_experiment(tmp_path, monkeypatch):
     assert "Experiment 'nao_existe' was not found." in result.output
 
 
-def test_plan_treats_invalid_candidate_as_not_found(tmp_path, monkeypatch):
-    """Same resolution rule as validate: a candidate that fails schema
-    validation never yields an experiment_id, so it resolves to 'not found'."""
+def test_plan_treats_invalid_schema_with_known_id_as_configuration_error(tmp_path, monkeypatch):
+    """Same resolution rule as validate: a candidate whose YAML declares a
+    usable experiment_id but fails schema validation surfaces as a config
+    error tied to that known identity, not as 'not found'."""
 
     monkeypatch.chdir(tmp_path)
 
@@ -236,8 +239,9 @@ def test_plan_treats_invalid_candidate_as_not_found(tmp_path, monkeypatch):
     result = runner.invoke(app, ["plan", "exp001"])
 
     assert result.exit_code != 0
-    assert "INPUT ERROR" in result.output
-    assert "Experiment 'exp001' was not found." in result.output
+    assert "CONFIGURATION ERROR" in result.output
+    assert "Experiment 'exp001' is invalid." in result.output
+    assert "schema_version" in result.output
 
 
 def test_plan_does_not_record_activity_when_candidate_cannot_be_resolved(tmp_path, monkeypatch):
@@ -1065,12 +1069,15 @@ def test_experiment_get_returns_ambiguity_error_without_choosing(tmp_path, monke
     assert not (tmp_path / "folder_b" / "logs" / "activity.log").exists()
 
 
-def test_experiment_get_treats_invalid_candidate_as_not_found(tmp_path, monkeypatch):
-    """A directory with a broken experiment.yaml never contributes a valid
-    experiment_id to match against (it's skipped during scanning), so asking
-    for it by name now surfaces as 'not found', not a configuration error
-    tied to that specific directory - a direct consequence of resolution
-    being purely id-based (no directory-name shortcut)."""
+def test_experiment_get_treats_invalid_schema_with_known_id_as_configuration_error(
+    tmp_path, monkeypatch
+):
+    """A directory whose experiment.yaml parses and clearly declares
+    experiment_id 'exp001', but fails schema validation on schema_version,
+    has a confiably known identity - read from the YAML, never the
+    directory name. Asking for it by that id surfaces a configuration
+    error tied to it, not a false 'not found'. No activity log is written
+    either way, since no ExperimentContext was ever resolved."""
 
     monkeypatch.chdir(tmp_path)
     project = tmp_path / "exp001"
@@ -1080,6 +1087,25 @@ def test_experiment_get_treats_invalid_candidate_as_not_found(tmp_path, monkeypa
         'experiment_id: "exp001"\n',
         encoding="utf-8",
     )
+
+    result = runner.invoke(app, ["experiment", "get", "exp001"])
+
+    assert result.exit_code != 0
+    assert "CONFIGURATION ERROR" in result.output
+    assert "Experiment 'exp001' is invalid." in result.output
+    assert "schema_version" in result.output
+    assert not (project / "logs" / "activity.log").exists()
+
+
+def test_experiment_get_treats_malformed_yaml_as_not_found(tmp_path, monkeypatch):
+    """Unlike a schema violation with a recoverable id, YAML that doesn't
+    parse at all leaves no confiable identity, so it still resolves to
+    'not found'."""
+
+    monkeypatch.chdir(tmp_path)
+    project = tmp_path / "exp001"
+    project.mkdir()
+    (project / "experiment.yaml").write_text("experiment_id: [unclosed\n", encoding="utf-8")
 
     result = runner.invoke(app, ["experiment", "get", "exp001"])
 

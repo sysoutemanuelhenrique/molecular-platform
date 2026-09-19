@@ -9,7 +9,7 @@ is a location hint at most - it never satisfies a lookup by itself.
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, List, Optional, Tuple
 
 import yaml
 from pydantic import ValidationError
@@ -22,17 +22,19 @@ Loader = Callable[[Path], ExperimentConfig]
 
 @dataclass(frozen=True)
 class ExperimentContext:
-    """The resolved identity and location of one experiment.
+    """The resolved location of one experiment, alongside its validated config.
 
-    `experiment_id` is the logical identity; `project_dir` is where it
-    currently lives. Nothing should assume `project_dir.name` equals
-    `experiment_id` - resolving one from the other is exactly what this
-    module exists to do.
+    `experiment_id` is never stored here directly - `config.experiment_id`
+    is the single authority for identity. It is exposed as a read-only
+    property so the two can never diverge.
     """
 
-    experiment_id: str
     project_dir: Path
     config: ExperimentConfig
+
+    @property
+    def experiment_id(self) -> str:
+        return self.config.experiment_id
 
 
 class ExperimentNotFoundError(Exception):
@@ -55,30 +57,74 @@ class AmbiguousExperimentError(Exception):
         )
 
 
-def scan_experiments(
-    base_dir: Path = Path("."), loader: Optional[Loader] = None
-) -> tuple[list[ExperimentContext], list[str]]:
-    """Scan immediate subdirectories of base_dir for experiments.
+class InvalidExperimentConfigError(Exception):
+    """Raised when a candidate's experiment.yaml parses and declares the
+    requested experiment_id, but the resulting ExperimentConfig fails
+    schema validation.
 
-    Returns (valid, skipped_names). A subdirectory without experiment.yaml is
-    not an experiment and is silently ignored. A subdirectory whose candidate
-    fails for any reason - malformed/invalid YAML, or a filesystem error such
-    as experiment.yaml being a directory, a permission error, or any other
-    OSError while inspecting or reading it - is reported as skipped. A single
-    broken candidate must never raise out of this function and take down the
-    whole scan.
+    The identity here is confiably known - read directly from the parsed
+    YAML's own experiment_id field, never guessed from the directory name -
+    even though the experiment cannot be loaded as valid. This is distinct
+    from a candidate with no recoverable identity at all (malformed YAML,
+    a non-string experiment_id, or a filesystem error), which is simply not
+    resolvable and surfaces as ExperimentNotFoundError instead.
+    """
 
-    This performs reads only: it never writes, creates, or mutates anything
-    on disk.
+    def __init__(self, identifier: str, project_dir: Path, validation_error: ValidationError):
+        self.identifier = identifier
+        self.project_dir = project_dir
+        self.validation_error = validation_error
+        super().__init__(f"Experiment '{identifier}' is invalid.")
 
-    Raises OSError only if base_dir itself cannot be enumerated at all.
+
+def _declared_experiment_id(experiment_file: Path) -> Optional[str]:
+    """Best-effort read of the experiment_id declared in parseable YAML,
+    without validating anything else about the document.
+
+    Returns None whenever there is no confiably recoverable identity: the
+    file can't be parsed, the parsed document isn't a mapping, or
+    experiment_id isn't present as a non-empty string.
+    """
+
+    try:
+        with experiment_file.open("r", encoding="utf-8") as file:
+            raw = yaml.safe_load(file)
+    except (OSError, yaml.YAMLError):
+        return None
+
+    if not isinstance(raw, dict):
+        return None
+
+    value = raw.get("experiment_id")
+    return value if isinstance(value, str) and value else None
+
+
+def _scan_candidates(
+    base_dir: Path, loader: Optional[Loader]
+) -> Tuple[List[ExperimentContext], List[Tuple[Path, str, ValidationError]], List[str]]:
+    """Scan immediate subdirectories of base_dir, classifying every candidate
+    that has an experiment.yaml into exactly one of three buckets:
+
+    - valid: loaded and validated successfully.
+    - invalid_with_id: YAML parses and declares a usable experiment_id, but
+      ExperimentConfig validation fails - identity is confiably known even
+      though the config itself is broken.
+    - skipped (by name): everything else - malformed YAML, a filesystem
+      error, or a schema failure with no usable experiment_id declared. No
+      confiable identity exists for these, so they can never be resolved by
+      id, no matter what their directory happens to be named.
+
+    A single broken candidate never raises out of this function and takes
+    down the whole scan. Raises OSError only if base_dir itself cannot be
+    enumerated at all.
     """
 
     if loader is None:
         loader = _default_load_experiment
 
-    valid: list[ExperimentContext] = []
-    skipped: list[str] = []
+    valid: List[ExperimentContext] = []
+    invalid_with_id: List[Tuple[Path, str, ValidationError]] = []
+    skipped: List[str] = []
 
     for entry in sorted(Path(base_dir).iterdir()):
         try:
@@ -88,18 +134,50 @@ def scan_experiments(
             experiment_file = entry / "experiment.yaml"
             if not experiment_file.exists():
                 continue
-
-            config = loader(experiment_file)
-
-        except (OSError, yaml.YAMLError, ValidationError):
+        except OSError:
             skipped.append(entry.name)
             continue
 
-        valid.append(
-            ExperimentContext(experiment_id=config.experiment_id, project_dir=entry, config=config)
-        )
+        try:
+            config = loader(experiment_file)
+        except ValidationError as error:
+            declared_id = _declared_experiment_id(experiment_file)
+            if declared_id is not None:
+                invalid_with_id.append((entry, declared_id, error))
+            else:
+                skipped.append(entry.name)
+            continue
+        except (OSError, yaml.YAMLError):
+            skipped.append(entry.name)
+            continue
 
-    return valid, skipped
+        valid.append(ExperimentContext(project_dir=entry, config=config))
+
+    return valid, invalid_with_id, skipped
+
+
+def scan_experiments(
+    base_dir: Path = Path("."), loader: Optional[Loader] = None
+) -> tuple[list[ExperimentContext], list[str]]:
+    """Scan immediate subdirectories of base_dir for experiments.
+
+    Returns (valid, skipped_names). A subdirectory without experiment.yaml is
+    not an experiment and is silently ignored. Any candidate that isn't
+    fully valid - malformed/invalid YAML, a schema violation (whether or not
+    its experiment_id could be recovered), or a filesystem error - is
+    reported as skipped, uniformly, regardless of which of those reasons
+    applies. A single broken candidate must never raise out of this
+    function and take down the whole scan.
+
+    This performs reads only: it never writes, creates, or mutates anything
+    on disk.
+
+    Raises OSError only if base_dir itself cannot be enumerated at all.
+    """
+
+    valid, invalid_with_id, skipped = _scan_candidates(base_dir, loader)
+    all_skipped = skipped + [entry.name for entry, _declared_id, _error in invalid_with_id]
+    return valid, all_skipped
 
 
 def resolve_experiment(
@@ -112,19 +190,30 @@ def resolve_experiment(
     satisfy the lookup on its own, and comparison is always exact (case
     sensitive), independent of the underlying filesystem's case sensitivity.
 
-    A candidate that cannot be read as a valid experiment (malformed YAML,
-    schema violation, filesystem error) never contributes an id to match
-    against, so it cannot be resolved this way even if its directory name
-    equals the identifier - see scan_experiments.
+    Four outcomes are possible:
+    - exactly one valid candidate declares the id: it is returned.
+    - more than one valid candidate declares the id: AmbiguousExperimentError.
+    - no valid candidate declares it, but a candidate's parseable YAML
+      declares it and only fails ExperimentConfig validation:
+      InvalidExperimentConfigError - the identity is confiably known (from
+      the YAML itself, never from the directory name), even though the
+      config can't be loaded.
+    - otherwise: ExperimentNotFoundError - either genuinely absent, or only
+      present in candidates with no recoverable identity at all (malformed
+      YAML, filesystem errors, or a non-string experiment_id).
     """
 
-    valid, _skipped = scan_experiments(base_dir, loader=loader)
+    valid, invalid_with_id, _skipped = _scan_candidates(base_dir, loader)
     matches = [context for context in valid if context.experiment_id == identifier]
 
     if len(matches) == 1:
         return matches[0]
 
-    if not matches:
-        raise ExperimentNotFoundError(identifier)
+    if len(matches) > 1:
+        raise AmbiguousExperimentError(identifier, [context.project_dir.name for context in matches])
 
-    raise AmbiguousExperimentError(identifier, [context.project_dir.name for context in matches])
+    for project_dir, declared_id, error in invalid_with_id:
+        if declared_id == identifier:
+            raise InvalidExperimentConfigError(identifier, project_dir, error)
+
+    raise ExperimentNotFoundError(identifier)
