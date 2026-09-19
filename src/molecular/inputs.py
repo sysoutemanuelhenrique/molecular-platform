@@ -1,9 +1,35 @@
+import re
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 AcquisitionMethod = Literal["uploaded", "downloaded"]
+
+_INPUT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+
+
+def validate_input_id(value: str) -> str:
+    """Validate that `value` is safe to use as a filesystem path component
+    for an input's storage location.
+
+    This is the single canonical authority for input_id format: it accepts
+    only ASCII letters, digits, hyphens and underscores, starting with an
+    alphanumeric character - which rules out empty strings, path separators
+    (forward or backward slash), leading dots (so it can never be mistaken
+    for the reserved `.staging` namespace or any other dotfile), `.`/`..`,
+    whitespace, and absolute paths. It never sanitizes, normalizes, or
+    otherwise changes the value - a rejected value is rejected outright, by
+    raising ValueError, never silently altered.
+    """
+
+    if not isinstance(value, str) or not _INPUT_ID_PATTERN.match(value):
+        raise ValueError(
+            "input_id must match ^[A-Za-z0-9][A-Za-z0-9_-]*$ "
+            f"(got {value!r})"
+        )
+
+    return value
 
 
 class RawArtifact(BaseModel):
@@ -52,6 +78,11 @@ class ScientificInput(BaseModel):
     name: str = Field(min_length=1)
     external_id: str | None = None
     acquisition: AcquisitionRecord
+
+    @field_validator("id")
+    @classmethod
+    def _validate_id_format(cls, value: str) -> str:
+        return validate_input_id(value)
 
 
 class LigandInput(ScientificInput):

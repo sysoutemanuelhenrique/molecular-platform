@@ -36,3 +36,35 @@ def atomic_write_text(path: Path, content: str, *, encoding: str = "utf-8") -> N
         except OSError:
             pass
         raise
+
+
+def publish_staged_directory(staging_dir: Path, final_dir: Path) -> None:
+    """Publish a fully-prepared staging directory to its final location.
+
+    This is a single filesystem rename, not a transaction manager: it only
+    guarantees that `final_dir` is not deliberately overwritten by this
+    call, and that the move itself (`os.rename`) is a single atomic
+    operation on the same filesystem. It never touches metadata and never
+    commits anything else - the caller decides what "published" means.
+
+    Raises FileExistsError if `final_dir` already exists, checked
+    explicitly beforehand: `os.rename`'s behavior on an existing directory
+    destination differs across platforms (POSIX silently replaces an empty
+    directory; Windows always raises), so relying on it alone would make
+    overwrite-or-not filesystem-dependent. This pre-check narrows but does
+    not eliminate a TOCTOU race - another process could create `final_dir`
+    between the check and the rename, in which case the OSError raised by
+    `os.rename` itself is the last guard and is left to propagate. This
+    same-destination guard is not a general-purpose mutex - it does not
+    serialize two callers whose destination names merely casefold-collide
+    rather than match exactly; see the identity-conflict check in
+    registry.py for the fuller discussion of that residual window.
+    """
+
+    staging_dir = Path(staging_dir)
+    final_dir = Path(final_dir)
+
+    if final_dir.exists():
+        raise FileExistsError(f"Destination already exists: {final_dir}")
+
+    os.rename(staging_dir, final_dir)

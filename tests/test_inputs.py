@@ -3,7 +3,13 @@ from datetime import datetime, timezone
 import pytest
 from pydantic import ValidationError
 
-from molecular.inputs import AcquisitionRecord, LigandInput, ProteinInput, RawArtifact
+from molecular.inputs import (
+    AcquisitionRecord,
+    LigandInput,
+    ProteinInput,
+    RawArtifact,
+    validate_input_id,
+)
 
 
 def _raw_artifact(**overrides):
@@ -112,6 +118,75 @@ def test_scientific_input_rejects_missing_name():
     with pytest.raises(ValidationError):
         LigandInput(
             id="curcumin",
+            acquisition=AcquisitionRecord(
+                method="uploaded",
+                acquired_at=datetime.now(timezone.utc),
+                raw_artifact=_raw_artifact(),
+            ),
+        )
+
+
+# --- validate_input_id: the single canonical authority for input_id format ---
+
+
+def test_validate_input_id_accepts_valid_value():
+    assert validate_input_id("my_ligand-2") == "my_ligand-2"
+
+
+def test_validate_input_id_rejects_empty_string():
+    with pytest.raises(ValueError):
+        validate_input_id("")
+
+
+def test_validate_input_id_rejects_parent_directory_traversal():
+    with pytest.raises(ValueError):
+        validate_input_id("../etc")
+
+
+def test_validate_input_id_rejects_forward_slash():
+    with pytest.raises(ValueError):
+        validate_input_id("a/b")
+
+
+def test_validate_input_id_rejects_backslash():
+    with pytest.raises(ValueError):
+        validate_input_id("a\\b")
+
+
+def test_validate_input_id_rejects_leading_dot():
+    with pytest.raises(ValueError):
+        validate_input_id(".hidden")
+
+
+def test_validate_input_id_rejects_whitespace():
+    with pytest.raises(ValueError):
+        validate_input_id("curcumin 2")
+
+
+def test_validate_input_id_rejects_bare_dot_and_dotdot():
+    with pytest.raises(ValueError):
+        validate_input_id(".")
+
+    with pytest.raises(ValueError):
+        validate_input_id("..")
+
+
+def test_validate_input_id_preserves_exact_case_of_valid_values():
+    """validate_input_id never sanitizes or normalizes - a value that
+    passes comes back byte-for-byte identical."""
+
+    for value in ("curcumin", "CURCUMIN_48", "ligand-2", "a1"):
+        assert validate_input_id(value) == value
+
+
+def test_scientific_input_id_field_uses_validate_input_id():
+    """ScientificInput.id must reject exactly what validate_input_id
+    rejects - proving both call sites share the one canonical rule."""
+
+    with pytest.raises(ValidationError):
+        LigandInput(
+            id="a/b",
+            name="Curcumin",
             acquisition=AcquisitionRecord(
                 method="uploaded",
                 acquired_at=datetime.now(timezone.utc),
