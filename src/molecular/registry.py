@@ -7,8 +7,10 @@ it published (renamed) into its final location, and only once *that*
 succeeds is the metadata committed atomically. This ordering means a crash
 between publish and metadata commit can leave an orphaned RAW directory
 with no metadata - a known, accepted residual risk (see module-level notes
-in the increment history). An orphan is not a registration, and this module
-does not attempt to detect, repair, or recover one automatically.
+in the increment history). An orphan is not a registration. It may be
+detected as a storage identity conflict on a later registration attempt
+for the same id (see _check_storage_identity_conflict), but this module
+does not automatically repair, remove, or recover it.
 
 What is registered here is a ScientificInput / acquisition record, not a
 MolecularState - this module knows nothing about scientific state.
