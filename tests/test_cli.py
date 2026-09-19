@@ -74,7 +74,14 @@ def test_validate_writes_activity_log_entry(tmp_path, monkeypatch):
     assert "outcome=success" in lines[0]
 
 
-def test_validate_rejects_invalid_experiment(tmp_path, monkeypatch):
+def test_validate_treats_invalid_schema_with_known_id_as_configuration_error(tmp_path, monkeypatch):
+    """validate resolves by logical experiment_id like every other command.
+    Here the YAML parses fine and clearly declares experiment_id 'exp001' -
+    only schema_version fails validation. That identity is confiably known
+    (read from the YAML itself, never from the directory name), so the
+    command must report a config error tied to it, not claim the experiment
+    doesn't exist."""
+
     monkeypatch.chdir(tmp_path)
 
     project = tmp_path / "exp001"
@@ -95,7 +102,10 @@ def test_validate_rejects_invalid_experiment(tmp_path, monkeypatch):
     assert "schema_version" in result.output
 
 
-def test_validate_records_activity_entry_on_failure(tmp_path, monkeypatch):
+def test_validate_does_not_record_activity_when_candidate_cannot_be_resolved(tmp_path, monkeypatch):
+    """No context can be resolved for a broken candidate, so there is no
+    project_dir to log against - the failure leaves no activity log entry."""
+
     monkeypatch.chdir(tmp_path)
 
     project = tmp_path / "exp001"
@@ -110,12 +120,7 @@ def test_validate_records_activity_entry_on_failure(tmp_path, monkeypatch):
 
     runner.invoke(app, ["validate", "exp001"])
 
-    log_file = project / "logs" / "activity.log"
-    lines = log_file.read_text(encoding="utf-8").splitlines()
-
-    assert len(lines) == 1
-    assert "command=validate" in lines[0]
-    assert "outcome=error" in lines[0]
+    assert not (project / "logs" / "activity.log").exists()
 
 def test_validate_rejects_missing_experiment(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
@@ -135,7 +140,10 @@ def test_validate_missing_experiment_does_not_create_project_dir(tmp_path, monke
     assert not (tmp_path / "nao_existe").exists()
 
 
-def test_validate_rejects_malformed_yaml(tmp_path, monkeypatch):
+def test_validate_treats_malformed_yaml_as_not_found(tmp_path, monkeypatch):
+    """A candidate with malformed YAML can't yield an experiment_id either,
+    so - same as an invalid schema - it resolves to 'not found'."""
+
     monkeypatch.chdir(tmp_path)
 
     project = tmp_path / "exp001"
@@ -150,8 +158,8 @@ def test_validate_rejects_malformed_yaml(tmp_path, monkeypatch):
     result = runner.invoke(app, ["validate", "exp001"])
 
     assert result.exit_code != 0
-    assert "CONFIGURATION ERROR" in result.output
-    assert "Experiment 'exp001' has malformed YAML." in result.output
+    assert "INPUT ERROR" in result.output
+    assert "Experiment 'exp001' was not found." in result.output
 
 
 def test_plan_valid_experiment(tmp_path, monkeypatch):
@@ -211,7 +219,11 @@ def test_plan_rejects_missing_experiment(tmp_path, monkeypatch):
     assert "Experiment 'nao_existe' was not found." in result.output
 
 
-def test_plan_rejects_invalid_experiment(tmp_path, monkeypatch):
+def test_plan_treats_invalid_schema_with_known_id_as_configuration_error(tmp_path, monkeypatch):
+    """Same resolution rule as validate: a candidate whose YAML declares a
+    usable experiment_id but fails schema validation surfaces as a config
+    error tied to that known identity, not as 'not found'."""
+
     monkeypatch.chdir(tmp_path)
 
     project = tmp_path / "exp001"
@@ -229,9 +241,10 @@ def test_plan_rejects_invalid_experiment(tmp_path, monkeypatch):
     assert result.exit_code != 0
     assert "CONFIGURATION ERROR" in result.output
     assert "Experiment 'exp001' is invalid." in result.output
+    assert "schema_version" in result.output
 
 
-def test_plan_records_activity_entry_on_failure(tmp_path, monkeypatch):
+def test_plan_does_not_record_activity_when_candidate_cannot_be_resolved(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
 
     project = tmp_path / "exp001"
@@ -246,12 +259,7 @@ def test_plan_records_activity_entry_on_failure(tmp_path, monkeypatch):
 
     runner.invoke(app, ["plan", "exp001"])
 
-    log_file = project / "logs" / "activity.log"
-    lines = log_file.read_text(encoding="utf-8").splitlines()
-
-    assert len(lines) == 1
-    assert "command=plan" in lines[0]
-    assert "outcome=error" in lines[0]
+    assert not (project / "logs" / "activity.log").exists()
 
 
 def _init_valid_experiment(tmp_path, monkeypatch):
@@ -849,7 +857,7 @@ def test_ligand_fetch_pubchem_rejects_duplicate_id_and_cleans_up_temp_file(tmp_p
     assert not (tmp_path / "fake_pubchem_temp_969516").exists()
 
 
-def test_plan_rejects_malformed_yaml(tmp_path, monkeypatch):
+def test_plan_treats_malformed_yaml_as_not_found(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
 
     project = tmp_path / "exp001"
@@ -864,8 +872,8 @@ def test_plan_rejects_malformed_yaml(tmp_path, monkeypatch):
     result = runner.invoke(app, ["plan", "exp001"])
 
     assert result.exit_code != 0
-    assert "CONFIGURATION ERROR" in result.output
-    assert "Experiment 'exp001' has malformed YAML." in result.output
+    assert "INPUT ERROR" in result.output
+    assert "Experiment 'exp001' was not found." in result.output
 
 
 def _write_experiment_yaml(project: Path, **fields) -> None:
@@ -1061,12 +1069,15 @@ def test_experiment_get_returns_ambiguity_error_without_choosing(tmp_path, monke
     assert not (tmp_path / "folder_b" / "logs" / "activity.log").exists()
 
 
-def test_experiment_get_treats_invalid_candidate_as_not_found(tmp_path, monkeypatch):
-    """A directory with a broken experiment.yaml never contributes a valid
-    experiment_id to match against (it's skipped during scanning), so asking
-    for it by name now surfaces as 'not found', not a configuration error
-    tied to that specific directory - a direct consequence of resolution
-    being purely id-based (no directory-name shortcut)."""
+def test_experiment_get_treats_invalid_schema_with_known_id_as_configuration_error(
+    tmp_path, monkeypatch
+):
+    """A directory whose experiment.yaml parses and clearly declares
+    experiment_id 'exp001', but fails schema validation on schema_version,
+    has a confiably known identity - read from the YAML, never the
+    directory name. Asking for it by that id surfaces a configuration
+    error tied to it, not a false 'not found'. No activity log is written
+    either way, since no ExperimentContext was ever resolved."""
 
     monkeypatch.chdir(tmp_path)
     project = tmp_path / "exp001"
@@ -1076,6 +1087,25 @@ def test_experiment_get_treats_invalid_candidate_as_not_found(tmp_path, monkeypa
         'experiment_id: "exp001"\n',
         encoding="utf-8",
     )
+
+    result = runner.invoke(app, ["experiment", "get", "exp001"])
+
+    assert result.exit_code != 0
+    assert "CONFIGURATION ERROR" in result.output
+    assert "Experiment 'exp001' is invalid." in result.output
+    assert "schema_version" in result.output
+    assert not (project / "logs" / "activity.log").exists()
+
+
+def test_experiment_get_treats_malformed_yaml_as_not_found(tmp_path, monkeypatch):
+    """Unlike a schema violation with a recoverable id, YAML that doesn't
+    parse at all leaves no confiable identity, so it still resolves to
+    'not found'."""
+
+    monkeypatch.chdir(tmp_path)
+    project = tmp_path / "exp001"
+    project.mkdir()
+    (project / "experiment.yaml").write_text("experiment_id: [unclosed\n", encoding="utf-8")
 
     result = runner.invoke(app, ["experiment", "get", "exp001"])
 
@@ -1290,3 +1320,153 @@ def test_experiment_list_does_not_write_activity_log(tmp_path, monkeypatch):
     runner.invoke(app, ["experiment", "list"])
 
     assert not (tmp_path / "exp001" / "logs" / "activity.log").exists()
+
+
+# --- Incremento 008: all commands resolve through the same ExperimentContext,
+# so directory != experiment_id must work uniformly, not just for `experiment get`. ---
+
+
+def test_validate_resolves_by_experiment_id_when_directory_name_differs(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write_experiment_yaml(tmp_path / "some_folder", schema_version="1.1", experiment_id="exp001")
+
+    result = runner.invoke(app, ["validate", "exp001"])
+
+    assert result.exit_code == 0
+    assert "Experiment 'exp001' is valid (schema 1.1)." in result.output
+
+    log_file = tmp_path / "some_folder" / "logs" / "activity.log"
+    lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert "command=validate" in lines[0]
+    assert "outcome=success" in lines[0]
+
+
+def test_validate_rejects_ambiguous_experiment_id(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write_experiment_yaml(tmp_path / "folder_a", schema_version="1.1", experiment_id="dup001")
+    _write_experiment_yaml(tmp_path / "folder_b", schema_version="1.1", experiment_id="dup001")
+
+    result = runner.invoke(app, ["validate", "dup001"])
+
+    assert result.exit_code != 0
+    assert "CONFIGURATION ERROR" in result.output
+    assert "dup001" in result.output
+    assert "folder_a" in result.output
+    assert "folder_b" in result.output
+
+    assert not (tmp_path / "folder_a" / "logs" / "activity.log").exists()
+    assert not (tmp_path / "folder_b" / "logs" / "activity.log").exists()
+
+
+def test_plan_resolves_by_experiment_id_when_directory_name_differs(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write_experiment_yaml(tmp_path / "some_folder", schema_version="1.1", experiment_id="exp001")
+
+    result = runner.invoke(app, ["plan", "exp001"])
+
+    assert result.exit_code == 0
+    assert "Experiment: exp001" in result.output
+
+    log_file = tmp_path / "some_folder" / "logs" / "activity.log"
+    lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert "command=plan" in lines[0]
+    assert "outcome=success" in lines[0]
+
+
+def test_ligand_add_registers_when_directory_name_differs_from_experiment_id(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write_experiment_yaml(tmp_path / "some_folder", schema_version="1.1", experiment_id="exp001")
+    raw_file = tmp_path / "curcumin.sdf"
+    raw_file.write_bytes(b"fake-sdf-bytes")
+
+    result = runner.invoke(
+        app,
+        [
+            "ligand",
+            "add",
+            "exp001",
+            "curcumin",
+            "--name",
+            "Curcumin",
+            "--acquisition-method",
+            "uploaded",
+            "--raw-file",
+            str(raw_file),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Ligand 'curcumin' registered successfully." in result.output
+
+    project = tmp_path / "some_folder"
+    assert (project / "inputs" / "ligands" / "curcumin.yaml").exists()
+
+    log_file = project / "logs" / "activity.log"
+    lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert "command=ligand-add" in lines[0]
+    assert "outcome=success" in lines[0]
+
+
+def test_protein_add_registers_when_directory_name_differs_from_experiment_id(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write_experiment_yaml(tmp_path / "some_folder", schema_version="1.1", experiment_id="exp001")
+    raw_file = tmp_path / "3la4.cif"
+    raw_file.write_bytes(b"fake-cif-bytes")
+
+    result = runner.invoke(
+        app,
+        [
+            "protein",
+            "add",
+            "exp001",
+            "urease",
+            "--name",
+            "Jack bean urease",
+            "--external-id",
+            "3LA4",
+            "--acquisition-method",
+            "downloaded",
+            "--source-name",
+            "RCSB PDB",
+            "--source-identifier",
+            "3LA4",
+            "--raw-file",
+            str(raw_file),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Protein 'urease' registered successfully." in result.output
+
+    project = tmp_path / "some_folder"
+    assert (project / "inputs" / "proteins" / "urease.yaml").exists()
+
+
+def test_ligand_fetch_pubchem_registers_when_directory_name_differs_from_experiment_id(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    _write_experiment_yaml(tmp_path / "some_folder", schema_version="1.1", experiment_id="exp001")
+
+    fake_fetch = _fake_fetch_returning(tmp_path)
+    monkeypatch.setattr(cli_module, "fetch_pubchem_sdf_2d", fake_fetch)
+
+    result = runner.invoke(
+        app,
+        [
+            "ligand",
+            "fetch-pubchem",
+            "exp001",
+            "curcumin",
+            "--cid",
+            "969516",
+            "--name",
+            "Curcumin",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Ligand 'curcumin' registered successfully." in result.output
+
+    project = tmp_path / "some_folder"
+    assert (project / "inputs" / "ligands" / "curcumin.yaml").exists()
