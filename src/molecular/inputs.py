@@ -23,7 +23,7 @@ def validate_input_id(value: str) -> str:
     raising ValueError, never silently altered.
     """
 
-    if not isinstance(value, str) or not _INPUT_ID_PATTERN.match(value):
+    if not isinstance(value, str) or not _INPUT_ID_PATTERN.fullmatch(value):
         raise ValueError(
             "input_id must match ^[A-Za-z0-9][A-Za-z0-9_-]*$ "
             f"(got {value!r})"

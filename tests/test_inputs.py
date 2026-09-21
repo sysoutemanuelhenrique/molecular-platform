@@ -163,6 +163,14 @@ def test_validate_input_id_rejects_whitespace():
         validate_input_id("curcumin 2")
 
 
+def test_validate_input_id_rejects_trailing_newline():
+    """`$` can match immediately before a trailing newline, so the pattern
+    must be applied with fullmatch, not match, to reject the whole string."""
+
+    with pytest.raises(ValueError):
+        validate_input_id("curcumin\n")
+
+
 def test_validate_input_id_rejects_bare_dot_and_dotdot():
     with pytest.raises(ValueError):
         validate_input_id(".")
