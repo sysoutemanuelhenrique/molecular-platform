@@ -8,6 +8,7 @@ import yaml
 from pydantic import ValidationError
 
 from molecular.activity import record_activity
+from molecular.application import InvalidPubChemCidError, register_ligand_from_pubchem
 from molecular.atomic import atomic_write_text
 from molecular.config import load_experiment
 from molecular.context import (
@@ -19,13 +20,7 @@ from molecular.context import (
     scan_experiments,
 )
 from molecular.models import ExperimentConfig
-from molecular.pubchem import (
-    PubChemAcquisitionError,
-    PubChemNotFoundError,
-    build_pubchem_sdf_url,
-    cleanup_temp_artifact,
-    fetch_pubchem_sdf_2d,
-)
+from molecular.pubchem import PubChemAcquisitionError, PubChemNotFoundError
 from molecular.registry import register_ligand, register_protein
 
 app = typer.Typer(
@@ -276,55 +271,58 @@ def ligand_fetch_pubchem(
 ):
     """Download a ligand's 2D SDF structure from PubChem by CID and register it."""
 
-    command = "ligand-fetch-pubchem"
-
-    context = _resolve_experiment_or_exit(experiment)
-
-    if cid <= 0:
-        typer.echo("INPUT ERROR")
-        typer.echo(f"'{cid}' is not a valid PubChem CID.")
-        _record_activity_safely(context.project_dir, command=command, outcome="error")
-        raise typer.Exit(code=1)
-
     try:
-        temp_path = fetch_pubchem_sdf_2d(cid)
+        ligand = register_ligand_from_pubchem(
+            experiment, input_id, cid, name, base_dir=Path(".")
+        )
 
-    except PubChemNotFoundError as error:
+    except (
+        ExperimentNotFoundError,
+        PubChemNotFoundError,
+        InvalidPubChemCidError,
+        FileNotFoundError,
+        FileExistsError,
+    ) as error:
         typer.echo("INPUT ERROR")
         typer.echo(str(error))
-        _record_activity_safely(context.project_dir, command=command, outcome="error")
+        raise typer.Exit(code=1)
+
+    except InvalidExperimentConfigError as error:
+        typer.echo("CONFIGURATION ERROR")
+        typer.echo(f"Experiment '{experiment}' is invalid.")
+
+        for item in error.validation_error.errors():
+            field = ".".join(str(part) for part in item["loc"])
+            typer.echo(f"- {field}: {item['msg']}")
+
+        raise typer.Exit(code=1)
+
+    except AmbiguousExperimentError as error:
+        typer.echo("CONFIGURATION ERROR")
+        typer.echo(str(error))
+        raise typer.Exit(code=1)
+
+    except ValidationError as error:
+        typer.echo("CONFIGURATION ERROR")
+        typer.echo(f"Ligand '{input_id}' is invalid.")
+
+        for item in error.errors():
+            field = ".".join(str(part) for part in item["loc"])
+            typer.echo(f"- {field}: {item['msg']}")
+
         raise typer.Exit(code=1)
 
     except PubChemAcquisitionError as error:
         typer.echo("ACQUISITION ERROR")
         typer.echo(str(error))
-        _record_activity_safely(context.project_dir, command=command, outcome="error")
         raise typer.Exit(code=1)
 
     except OSError as error:
         typer.echo("STORAGE ERROR")
         typer.echo(str(error))
-        _record_activity_safely(context.project_dir, command=command, outcome="error")
         raise typer.Exit(code=1)
 
-    try:
-        _add_scientific_input(
-            register_fn=register_ligand,
-            label="Ligand",
-            command=command,
-            context=context,
-            input_id=input_id,
-            name=name,
-            acquisition_method="downloaded",
-            raw_file=str(temp_path),
-            external_id=f"CID {cid}",
-            source_name="PubChem",
-            source_identifier=f"CID {cid}",
-            source_uri=build_pubchem_sdf_url(cid),
-            file_format="sdf",
-        )
-    finally:
-        cleanup_temp_artifact(temp_path)
+    typer.echo(f"Ligand '{ligand.id}' registered successfully.")
 
 
 @protein_app.command("add")

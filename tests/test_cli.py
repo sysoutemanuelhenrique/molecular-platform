@@ -4,6 +4,7 @@ from pathlib import Path
 import yaml
 from typer.testing import CliRunner
 
+import molecular.application as application_module
 import molecular.cli as cli_module
 from molecular.cli import app
 
@@ -581,7 +582,7 @@ def test_ligand_fetch_pubchem_registers_successfully(tmp_path, monkeypatch):
     project = _init_valid_experiment(tmp_path, monkeypatch)
 
     fake_fetch = _fake_fetch_returning(tmp_path)
-    monkeypatch.setattr(cli_module, "fetch_pubchem_sdf_2d", fake_fetch)
+    monkeypatch.setattr(application_module, "fetch_pubchem_sdf_2d", fake_fetch)
 
     result = runner.invoke(
         app,
@@ -690,7 +691,7 @@ def test_ligand_fetch_pubchem_rejects_invalid_cid_without_network_call(tmp_path,
     def _fail_if_called(cid, timeout=None):
         raise AssertionError("fetch_pubchem_sdf_2d must not be called for an invalid CID")
 
-    monkeypatch.setattr(cli_module, "fetch_pubchem_sdf_2d", _fail_if_called)
+    monkeypatch.setattr(application_module, "fetch_pubchem_sdf_2d", _fail_if_called)
 
     result = runner.invoke(
         app,
@@ -721,7 +722,7 @@ def test_ligand_fetch_pubchem_handles_not_found(tmp_path, monkeypatch):
     def _raise_not_found(cid, timeout=None):
         raise cli_module.PubChemNotFoundError(f"PubChem has no record for CID {cid}.")
 
-    monkeypatch.setattr(cli_module, "fetch_pubchem_sdf_2d", _raise_not_found)
+    monkeypatch.setattr(application_module, "fetch_pubchem_sdf_2d", _raise_not_found)
 
     result = runner.invoke(
         app,
@@ -753,7 +754,7 @@ def test_ligand_fetch_pubchem_handles_acquisition_error(tmp_path, monkeypatch):
     def _raise_acquisition_error(cid, timeout=None):
         raise cli_module.PubChemAcquisitionError("PubChem request timed out after 30.0s for CID 969516.")
 
-    monkeypatch.setattr(cli_module, "fetch_pubchem_sdf_2d", _raise_acquisition_error)
+    monkeypatch.setattr(application_module, "fetch_pubchem_sdf_2d", _raise_acquisition_error)
 
     result = runner.invoke(
         app,
@@ -785,7 +786,7 @@ def test_ligand_fetch_pubchem_rejects_missing_experiment_without_network_call(tm
     def _fail_if_called(cid, timeout=None):
         raise AssertionError("fetch_pubchem_sdf_2d must not be called for a missing experiment")
 
-    monkeypatch.setattr(cli_module, "fetch_pubchem_sdf_2d", _fail_if_called)
+    monkeypatch.setattr(application_module, "fetch_pubchem_sdf_2d", _fail_if_called)
 
     result = runner.invoke(
         app,
@@ -829,7 +830,7 @@ def test_ligand_fetch_pubchem_rejects_duplicate_id_and_cleans_up_temp_file(tmp_p
     )
 
     fake_fetch = _fake_fetch_returning(tmp_path)
-    monkeypatch.setattr(cli_module, "fetch_pubchem_sdf_2d", fake_fetch)
+    monkeypatch.setattr(application_module, "fetch_pubchem_sdf_2d", fake_fetch)
 
     result = runner.invoke(
         app,
@@ -1449,7 +1450,7 @@ def test_ligand_fetch_pubchem_registers_when_directory_name_differs_from_experim
     _write_experiment_yaml(tmp_path / "some_folder", schema_version="1.1", experiment_id="exp001")
 
     fake_fetch = _fake_fetch_returning(tmp_path)
-    monkeypatch.setattr(cli_module, "fetch_pubchem_sdf_2d", fake_fetch)
+    monkeypatch.setattr(application_module, "fetch_pubchem_sdf_2d", fake_fetch)
 
     result = runner.invoke(
         app,
