@@ -25,7 +25,12 @@ from typing import Type, TypeVar
 
 import yaml
 
-from molecular.atomic import atomic_write_text, compute_sha256, publish_staged_directory
+from molecular.atomic import (
+    atomic_write_text,
+    check_storage_identity_conflict,
+    compute_sha256,
+    publish_staged_directory,
+)
 from molecular.inputs import (
     AcquisitionMethod,
     AcquisitionRecord,
@@ -110,57 +115,18 @@ def _check_storage_identity_conflict(kind_dir: Path, input_id: str) -> None:
     (`kind_dir/.staging`) is never a candidate - it holds only private,
     uncommitted attempts, never a real or orphaned input.
 
-    Detection is pure Python string comparison over a directory listing; it
-    never depends on - and is never masked by - whatever case sensitivity
-    the underlying filesystem happens to have. For registrations observed
-    sequentially - one call completing before the next begins, the only
-    access pattern this increment targets - this check deterministically
-    rejects 'Curcumin' once 'curcumin' already occupies the kind_dir
-    namespace (or vice versa), on every platform, regardless of whether the
-    underlying filesystem is itself case-sensitive.
-
-    This is NOT equivalent to multi-process/multi-thread serialization.
-    Two concurrent callers can each run this check - and each see no
-    conflict - before either one has published its final RAW directory via
-    publish_staged_directory() in atomic.py: there is a residual TOCTOU
-    window between this check and the actual filesystem publish. When both
-    callers' ids are exactly equal, that window happens to be closed as a
-    side effect of publish_staged_directory()'s destination-exists guard
-    (the second os.rename fails because the destination is already taken) -
-    but that guard is not a general-purpose mutex, and it does not help
-    when two ids merely casefold-collide (e.g. 'curcumin' and 'Curcumin'):
-    on a case-insensitive filesystem the OS happens to treat those as the
-    same path and one rename fails by accident, but on a case-sensitive
-    filesystem (e.g. Linux) nothing prevents both renames from succeeding
-    independently, which could leave two casefold-colliding registrations
-    coexisting. This window is knowingly accepted for this increment: the
-    CLI is used as a single process today, multi-process locking/mutex is
-    explicitly out of scope, and this protocol makes no promise of
-    concurrent-writer safety.
+    Delegates to the shared check_storage_identity_conflict primitive in
+    molecular.atomic (also used by scientific_registry.py and
+    transformation_registry.py) - see its docstring for the fuller
+    discussion of the residual TOCTOU window against concurrent writers.
     """
 
-    if not kind_dir.is_dir():
-        return
-
-    folded = input_id.casefold()
-
-    for entry in kind_dir.iterdir():
-        if entry.name == STAGING_DIRNAME:
-            continue
-
-        if entry.is_dir():
-            existing_id = entry.name
-        elif entry.is_file() and entry.suffix == ".yaml":
-            existing_id = entry.stem
-        else:
-            continue
-
-        if existing_id.casefold() == folded:
-            raise InputIdentityConflictError(
-                f"'{input_id}' is already registered under {kind_dir} "
-                f"(conflicts with existing entry '{existing_id}'; "
-                "storage identity is case-insensitive)."
-            )
+    check_storage_identity_conflict(
+        kind_dir,
+        input_id,
+        conflict_error=InputIdentityConflictError,
+        reserved_names=frozenset({STAGING_DIRNAME}),
+    )
 
 
 def _cleanup_directory_best_effort(path: Path, *, description: str) -> None:

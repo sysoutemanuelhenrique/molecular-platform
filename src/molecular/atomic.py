@@ -4,6 +4,7 @@ import hashlib
 import os
 import tempfile
 from pathlib import Path
+from typing import FrozenSet, Type
 
 
 def compute_sha256(path: Path) -> str:
@@ -52,6 +53,71 @@ def atomic_write_text(path: Path, content: str, *, encoding: str = "utf-8") -> N
         raise
 
 
+def check_storage_identity_conflict(
+    directory: Path,
+    candidate_id: str,
+    *,
+    conflict_error: Type[FileExistsError],
+    reserved_names: FrozenSet[str] = frozenset(),
+) -> None:
+    """Raise `conflict_error` if `candidate_id` collides - exactly or by
+    casefold - with an existing entry directly under `directory`: a
+    committed metadata file (`<id>.yaml`) or a published subdirectory
+    (`<id>/`). Entries named in `reserved_names` (e.g. a `.staging`
+    namespace) are never candidates.
+
+    Shared by registry.py, scientific_registry.py, and
+    transformation_registry.py - each passes its own `conflict_error`
+    subclass so callers keep catching the specific exception type they
+    already catch today. This is a storage-layer check only: identity is
+    compared case-insensitively (via .casefold()) no matter how the
+    underlying filesystem itself treats case, because two distinct logical
+    ids that only differ by case cannot both be given a directory or
+    metadata file in the same `directory` portably across case-sensitive
+    and case-insensitive filesystems.
+
+    Detection is pure Python string comparison over a directory listing; it
+    never depends on - and is never masked by - whatever case sensitivity
+    the underlying filesystem happens to have.
+
+    This is NOT equivalent to multi-process/multi-thread serialization. Two
+    concurrent callers can each run this check - and each see no conflict -
+    before either one has published its final entry: there is a residual
+    TOCTOU window between this check and the actual filesystem write. When
+    two candidate ids are exactly equal, that window happens to be closed
+    as a side effect of the eventual write itself (an atomic replace, or
+    publish_staged_directory's destination-exists guard) - but that is not
+    a general-purpose mutex, and it does not help when two ids merely
+    casefold-collide. This window is knowingly accepted: every caller of
+    this function is used as a single process today, multi-process
+    locking/mutex is explicitly out of scope, and none of these protocols
+    promise concurrent-writer safety.
+    """
+
+    if not directory.is_dir():
+        return
+
+    folded = candidate_id.casefold()
+
+    for entry in directory.iterdir():
+        if entry.name in reserved_names:
+            continue
+
+        if entry.is_dir():
+            existing_id = entry.name
+        elif entry.is_file() and entry.suffix == ".yaml":
+            existing_id = entry.stem
+        else:
+            continue
+
+        if existing_id.casefold() == folded:
+            raise conflict_error(
+                f"'{candidate_id}' is already registered under {directory} "
+                f"(conflicts with existing entry '{existing_id}'; "
+                "storage identity is case-insensitive)."
+            )
+
+
 def publish_staged_directory(staging_dir: Path, final_dir: Path) -> None:
     """Publish a fully-prepared staging directory to its final location.
 
@@ -71,8 +137,8 @@ def publish_staged_directory(staging_dir: Path, final_dir: Path) -> None:
     `os.rename` itself is the last guard and is left to propagate. This
     same-destination guard is not a general-purpose mutex - it does not
     serialize two callers whose destination names merely casefold-collide
-    rather than match exactly; see the identity-conflict check in
-    registry.py for the fuller discussion of that residual window.
+    rather than match exactly; see check_storage_identity_conflict above
+    for the fuller discussion of that residual window.
     """
 
     staging_dir = Path(staging_dir)
