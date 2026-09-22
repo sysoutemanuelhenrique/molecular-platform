@@ -16,7 +16,6 @@ What is registered here is a ScientificInput / acquisition record, not a
 MolecularState - this module knows nothing about scientific state.
 """
 
-import hashlib
 import logging
 import shutil
 import uuid
@@ -26,7 +25,7 @@ from typing import Type, TypeVar
 
 import yaml
 
-from molecular.atomic import atomic_write_text, publish_staged_directory
+from molecular.atomic import atomic_write_text, compute_sha256, publish_staged_directory
 from molecular.inputs import (
     AcquisitionMethod,
     AcquisitionRecord,
@@ -63,13 +62,7 @@ class InputIdentityConflictError(FileExistsError):
 
 
 def _compute_checksum(path: Path) -> str:
-    digest = hashlib.sha256()
-
-    with path.open("rb") as file:
-        for chunk in iter(lambda: file.read(65536), b""):
-            digest.update(chunk)
-
-    return digest.hexdigest()
+    return compute_sha256(path)
 
 
 def _build_scientific_input(
