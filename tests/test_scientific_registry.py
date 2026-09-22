@@ -894,6 +894,10 @@ def test_register_conformer_checksum_mismatch_leaves_nothing_published(tmp_path,
     )
     assert not final_dir.exists()
 
+    staging_root = tmp_path / "scientific" / "artifacts" / "conformers" / ".staging"
+    if staging_root.exists():
+        assert list(staging_root.iterdir()) == []
+
 
 def test_register_conformer_copy_failure_leaves_no_final_artifact_no_metadata(
     tmp_path, monkeypatch
@@ -917,6 +921,10 @@ def test_register_conformer_copy_failure_leaves_no_final_artifact_no_metadata(
 
     conformers_dir = tmp_path / "scientific" / "conformers"
     assert not (conformers_dir / "curcumin-initial-conf-001.yaml").exists()
+
+    staging_root = tmp_path / "scientific" / "artifacts" / "conformers" / ".staging"
+    if staging_root.exists():
+        assert list(staging_root.iterdir()) == []
 
 
 def test_register_conformer_publish_failure_creates_no_metadata_and_no_final(
@@ -947,6 +955,10 @@ def test_register_conformer_publish_failure_creates_no_metadata_and_no_final(
     )
     assert not final_dir.exists()
 
+    staging_root = tmp_path / "scientific" / "artifacts" / "conformers" / ".staging"
+    if staging_root.exists():
+        assert list(staging_root.iterdir()) == []
+
 
 def test_register_conformer_metadata_commit_failure_removes_just_published_artifact(
     tmp_path, monkeypatch
@@ -975,3 +987,52 @@ def test_register_conformer_metadata_commit_failure_removes_just_published_artif
         tmp_path / "scientific" / "artifacts" / "conformers" / "curcumin-initial-conf-001"
     )
     assert not final_dir.exists()
+
+
+def test_register_conformer_cleanup_failure_still_propagates_original_error_and_logs_warning(
+    tmp_path, monkeypatch, caplog
+):
+    """A cleanup failure must never mask the original error, and must be
+    logged as a warning."""
+
+    _setup_entity_and_state(tmp_path)
+    source_file = _write_source_file(tmp_path, name="conf.sdf")
+
+    def _raise_copy(*args, **kwargs):
+        raise OSError("simulated copy failure")
+
+    def _raise_rmtree(*args, **kwargs):
+        raise OSError("simulated cleanup failure")
+
+    monkeypatch.setattr(scientific_registry_module.shutil, "copyfile", _raise_copy)
+    monkeypatch.setattr(scientific_registry_module.shutil, "rmtree", _raise_rmtree)
+
+    with caplog.at_level(logging.WARNING, logger="molecular.scientific_registry"):
+        with pytest.raises(OSError, match="simulated copy failure"):
+            register_conformer(
+                tmp_path,
+                conformer_id="curcumin-initial-conf-001",
+                state_id="curcumin-initial",
+                source_file=source_file,
+                format="sdf",
+            )
+
+    assert any("Failed to clean up" in record.getMessage() for record in caplog.records)
+
+
+def test_register_conformer_relative_representation_path_uses_posix_style(tmp_path):
+    _setup_entity_and_state(tmp_path)
+    source_file = _write_source_file(tmp_path, name="conf.sdf")
+
+    conformer = register_conformer(
+        tmp_path,
+        conformer_id="curcumin-initial-conf-001",
+        state_id="curcumin-initial",
+        source_file=source_file,
+        format="sdf",
+    )
+
+    assert conformer.representation.path == (
+        "scientific/artifacts/conformers/curcumin-initial-conf-001/conf.sdf"
+    )
+    assert "\\" not in conformer.representation.path
