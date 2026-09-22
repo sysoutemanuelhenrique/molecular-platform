@@ -11,13 +11,17 @@ import yaml
 from pydantic import ValidationError
 
 import molecular.scientific_registry as scientific_registry_module
-from molecular.scientific import MolecularState, ScientificEntity
+from molecular.scientific import Conformer, MolecularState, ScientificEntity
 from molecular.scientific_registry import (
+    ConformerIdentityConflictError,
     EntityIdentityConflictError,
     StateIdentityConflictError,
     list_entity_states,
+    list_state_conformers,
+    load_conformer,
     load_entity,
     load_state,
+    register_conformer,
     register_entity,
     register_state,
 )
@@ -565,3 +569,470 @@ def test_register_state_cleanup_failure_still_propagates_original_error_and_logs
             )
 
     assert any("Failed to clean up" in record.getMessage() for record in caplog.records)
+
+
+# --- register_conformer / load_conformer / list_state_conformers ---
+
+
+def _setup_entity_and_state(tmp_path, entity_id="curcumin", state_id="curcumin-initial"):
+    register_entity(tmp_path, _entity(entity_id=entity_id))
+    register_state(
+        tmp_path,
+        state_id=state_id,
+        entity_id=entity_id,
+        source_file=_write_source_file(tmp_path, name="state.sdf"),
+        format="sdf",
+    )
+
+
+def test_register_conformer_requires_existing_parent_state(tmp_path):
+    source_file = _write_source_file(tmp_path, name="conf.sdf")
+
+    with pytest.raises(FileNotFoundError):
+        register_conformer(
+            tmp_path,
+            conformer_id="curcumin-initial-conf-001",
+            state_id="curcumin-initial",
+            source_file=source_file,
+            format="sdf",
+        )
+
+
+def test_register_conformer_persists_metadata_and_artifact(tmp_path):
+    _setup_entity_and_state(tmp_path)
+    source_file = _write_source_file(tmp_path, name="conf.sdf", content=b"conformer-bytes")
+
+    conformer = register_conformer(
+        tmp_path,
+        conformer_id="curcumin-initial-conf-001",
+        state_id="curcumin-initial",
+        source_file=source_file,
+        format="sdf",
+    )
+
+    assert conformer.id == "curcumin-initial-conf-001"
+    assert conformer.state_id == "curcumin-initial"
+
+    metadata_file = tmp_path / "scientific" / "conformers" / "curcumin-initial-conf-001.yaml"
+    assert metadata_file.exists()
+
+    artifact_file = (
+        tmp_path
+        / "scientific"
+        / "artifacts"
+        / "conformers"
+        / "curcumin-initial-conf-001"
+        / "conf.sdf"
+    )
+    assert artifact_file.exists()
+    assert artifact_file.read_bytes() == b"conformer-bytes"
+
+
+def test_conformer_serialization_matches_expected_shape(tmp_path):
+    _setup_entity_and_state(tmp_path)
+    source_file = _write_source_file(tmp_path, name="conf.sdf")
+
+    register_conformer(
+        tmp_path,
+        conformer_id="curcumin-initial-conf-001",
+        state_id="curcumin-initial",
+        source_file=source_file,
+        format="sdf",
+    )
+
+    metadata_file = tmp_path / "scientific" / "conformers" / "curcumin-initial-conf-001.yaml"
+    data = yaml.safe_load(metadata_file.read_text(encoding="utf-8"))
+
+    assert data["schema_version"] == "1.0"
+    assert data["id"] == "curcumin-initial-conf-001"
+    assert data["state_id"] == "curcumin-initial"
+    assert data["representation"]["format"] == "sdf"
+    assert data["representation"]["path"] == (
+        "scientific/artifacts/conformers/curcumin-initial-conf-001/conf.sdf"
+    )
+
+
+def test_register_conformer_computes_correct_checksum(tmp_path):
+    import hashlib
+
+    _setup_entity_and_state(tmp_path)
+    source_file = _write_source_file(tmp_path, name="conf.sdf", content=b"deterministic-conf")
+
+    conformer = register_conformer(
+        tmp_path,
+        conformer_id="curcumin-initial-conf-001",
+        state_id="curcumin-initial",
+        source_file=source_file,
+        format="sdf",
+    )
+
+    expected = hashlib.sha256(b"deterministic-conf").hexdigest()
+    assert conformer.representation.checksum == expected
+
+
+def test_load_conformer_round_trips(tmp_path):
+    _setup_entity_and_state(tmp_path)
+    source_file = _write_source_file(tmp_path, name="conf.sdf")
+
+    register_conformer(
+        tmp_path,
+        conformer_id="curcumin-initial-conf-001",
+        state_id="curcumin-initial",
+        source_file=source_file,
+        format="sdf",
+    )
+
+    loaded = load_conformer(tmp_path, "curcumin-initial-conf-001")
+
+    assert loaded.id == "curcumin-initial-conf-001"
+    assert loaded.state_id == "curcumin-initial"
+
+
+def test_load_conformer_missing_raises_file_not_found(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        load_conformer(tmp_path, "nao_existe")
+
+
+def test_register_conformer_rejects_exact_duplicate(tmp_path):
+    _setup_entity_and_state(tmp_path)
+
+    register_conformer(
+        tmp_path,
+        conformer_id="curcumin-initial-conf-001",
+        state_id="curcumin-initial",
+        source_file=_write_source_file(tmp_path, name="a.sdf"),
+        format="sdf",
+    )
+
+    with pytest.raises(FileExistsError):
+        register_conformer(
+            tmp_path,
+            conformer_id="curcumin-initial-conf-001",
+            state_id="curcumin-initial",
+            source_file=_write_source_file(tmp_path, name="b.sdf"),
+            format="sdf",
+        )
+
+
+def test_register_conformer_rejects_casefold_collision(tmp_path):
+    _setup_entity_and_state(tmp_path)
+
+    register_conformer(
+        tmp_path,
+        conformer_id="curcumin-initial-conf-001",
+        state_id="curcumin-initial",
+        source_file=_write_source_file(tmp_path, name="a.sdf"),
+        format="sdf",
+    )
+
+    with pytest.raises(ConformerIdentityConflictError):
+        register_conformer(
+            tmp_path,
+            conformer_id="Curcumin-Initial-Conf-001",
+            state_id="curcumin-initial",
+            source_file=_write_source_file(tmp_path, name="b.sdf"),
+            format="sdf",
+        )
+
+
+def test_multiple_conformers_for_same_state(tmp_path):
+    _setup_entity_and_state(tmp_path)
+
+    register_conformer(
+        tmp_path,
+        conformer_id="curcumin-initial-conf-001",
+        state_id="curcumin-initial",
+        source_file=_write_source_file(tmp_path, name="a.sdf"),
+        format="sdf",
+    )
+    register_conformer(
+        tmp_path,
+        conformer_id="curcumin-initial-conf-002",
+        state_id="curcumin-initial",
+        source_file=_write_source_file(tmp_path, name="b.sdf"),
+        format="sdf",
+    )
+
+    conformers = list_state_conformers(tmp_path, "curcumin-initial")
+
+    assert {c.id for c in conformers} == {
+        "curcumin-initial-conf-001",
+        "curcumin-initial-conf-002",
+    }
+
+
+def test_list_state_conformers_filters_by_state(tmp_path):
+    register_entity(tmp_path, _entity())
+    register_state(
+        tmp_path,
+        state_id="state-a",
+        entity_id="curcumin",
+        source_file=_write_source_file(tmp_path, name="a-state.sdf"),
+        format="sdf",
+    )
+    register_state(
+        tmp_path,
+        state_id="state-b",
+        entity_id="curcumin",
+        source_file=_write_source_file(tmp_path, name="b-state.sdf"),
+        format="sdf",
+    )
+    register_conformer(
+        tmp_path,
+        conformer_id="conf-a-001",
+        state_id="state-a",
+        source_file=_write_source_file(tmp_path, name="conf-a.sdf"),
+        format="sdf",
+    )
+    register_conformer(
+        tmp_path,
+        conformer_id="conf-b-001",
+        state_id="state-b",
+        source_file=_write_source_file(tmp_path, name="conf-b.sdf"),
+        format="sdf",
+    )
+
+    state_a_conformers = list_state_conformers(tmp_path, "state-a")
+    state_b_conformers = list_state_conformers(tmp_path, "state-b")
+
+    assert [c.id for c in state_a_conformers] == ["conf-a-001"]
+    assert [c.id for c in state_b_conformers] == ["conf-b-001"]
+
+
+def test_list_state_conformers_returns_empty_list_when_directory_missing(tmp_path):
+    assert list_state_conformers(tmp_path, "nao_existe") == []
+
+
+def test_conformer_registration_does_not_mutate_parent_state(tmp_path):
+    _setup_entity_and_state(tmp_path)
+
+    before = load_state(tmp_path, "curcumin-initial")
+
+    register_conformer(
+        tmp_path,
+        conformer_id="curcumin-initial-conf-001",
+        state_id="curcumin-initial",
+        source_file=_write_source_file(tmp_path, name="conf.sdf"),
+        format="sdf",
+    )
+
+    after = load_state(tmp_path, "curcumin-initial")
+    assert before == after
+
+
+def test_register_conformer_rejects_missing_source_file(tmp_path):
+    _setup_entity_and_state(tmp_path)
+
+    with pytest.raises(FileNotFoundError):
+        register_conformer(
+            tmp_path,
+            conformer_id="curcumin-initial-conf-001",
+            state_id="curcumin-initial",
+            source_file=tmp_path / "does-not-exist.sdf",
+            format="sdf",
+        )
+
+
+def test_register_conformer_rejects_empty_format(tmp_path):
+    _setup_entity_and_state(tmp_path)
+
+    with pytest.raises(ValueError):
+        register_conformer(
+            tmp_path,
+            conformer_id="curcumin-initial-conf-001",
+            state_id="curcumin-initial",
+            source_file=_write_source_file(tmp_path, name="conf.sdf"),
+            format="",
+        )
+
+
+def test_register_conformer_rejects_invalid_conformer_id(tmp_path):
+    _setup_entity_and_state(tmp_path)
+
+    with pytest.raises(ValueError):
+        register_conformer(
+            tmp_path,
+            conformer_id="a/b",
+            state_id="curcumin-initial",
+            source_file=_write_source_file(tmp_path, name="conf.sdf"),
+            format="sdf",
+        )
+
+
+# --- conformer fault injection: stage -> verify -> publish -> commit ---
+
+
+def test_register_conformer_checksum_mismatch_leaves_nothing_published(tmp_path, monkeypatch):
+    _setup_entity_and_state(tmp_path)
+    source_file = _write_source_file(tmp_path, name="conf.sdf")
+
+    real_compute_sha256 = scientific_registry_module.compute_sha256
+    call_count = {"n": 0}
+
+    def _flaky_checksum(path):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            return "0" * 64
+        return real_compute_sha256(path)
+
+    monkeypatch.setattr(scientific_registry_module, "compute_sha256", _flaky_checksum)
+
+    with pytest.raises(OSError, match="Checksum mismatch"):
+        register_conformer(
+            tmp_path,
+            conformer_id="curcumin-initial-conf-001",
+            state_id="curcumin-initial",
+            source_file=source_file,
+            format="sdf",
+        )
+
+    conformers_dir = tmp_path / "scientific" / "conformers"
+    assert not (conformers_dir / "curcumin-initial-conf-001.yaml").exists()
+
+    final_dir = (
+        tmp_path / "scientific" / "artifacts" / "conformers" / "curcumin-initial-conf-001"
+    )
+    assert not final_dir.exists()
+
+    staging_root = tmp_path / "scientific" / "artifacts" / "conformers" / ".staging"
+    if staging_root.exists():
+        assert list(staging_root.iterdir()) == []
+
+
+def test_register_conformer_copy_failure_leaves_no_final_artifact_no_metadata(
+    tmp_path, monkeypatch
+):
+    _setup_entity_and_state(tmp_path)
+    source_file = _write_source_file(tmp_path, name="conf.sdf")
+
+    def _raise_copy(*args, **kwargs):
+        raise OSError("simulated copy failure")
+
+    monkeypatch.setattr(scientific_registry_module.shutil, "copyfile", _raise_copy)
+
+    with pytest.raises(OSError):
+        register_conformer(
+            tmp_path,
+            conformer_id="curcumin-initial-conf-001",
+            state_id="curcumin-initial",
+            source_file=source_file,
+            format="sdf",
+        )
+
+    conformers_dir = tmp_path / "scientific" / "conformers"
+    assert not (conformers_dir / "curcumin-initial-conf-001.yaml").exists()
+
+    staging_root = tmp_path / "scientific" / "artifacts" / "conformers" / ".staging"
+    if staging_root.exists():
+        assert list(staging_root.iterdir()) == []
+
+
+def test_register_conformer_publish_failure_creates_no_metadata_and_no_final(
+    tmp_path, monkeypatch
+):
+    _setup_entity_and_state(tmp_path)
+    source_file = _write_source_file(tmp_path, name="conf.sdf")
+
+    def _raise_publish(*args, **kwargs):
+        raise OSError("simulated publish failure")
+
+    monkeypatch.setattr(scientific_registry_module, "publish_staged_directory", _raise_publish)
+
+    with pytest.raises(OSError):
+        register_conformer(
+            tmp_path,
+            conformer_id="curcumin-initial-conf-001",
+            state_id="curcumin-initial",
+            source_file=source_file,
+            format="sdf",
+        )
+
+    conformers_dir = tmp_path / "scientific" / "conformers"
+    assert not (conformers_dir / "curcumin-initial-conf-001.yaml").exists()
+
+    final_dir = (
+        tmp_path / "scientific" / "artifacts" / "conformers" / "curcumin-initial-conf-001"
+    )
+    assert not final_dir.exists()
+
+    staging_root = tmp_path / "scientific" / "artifacts" / "conformers" / ".staging"
+    if staging_root.exists():
+        assert list(staging_root.iterdir()) == []
+
+
+def test_register_conformer_metadata_commit_failure_removes_just_published_artifact(
+    tmp_path, monkeypatch
+):
+    _setup_entity_and_state(tmp_path)
+    source_file = _write_source_file(tmp_path, name="conf.sdf")
+
+    def _raise_atomic_write(*args, **kwargs):
+        raise OSError("simulated metadata commit failure")
+
+    monkeypatch.setattr(scientific_registry_module, "atomic_write_text", _raise_atomic_write)
+
+    with pytest.raises(OSError):
+        register_conformer(
+            tmp_path,
+            conformer_id="curcumin-initial-conf-001",
+            state_id="curcumin-initial",
+            source_file=source_file,
+            format="sdf",
+        )
+
+    conformers_dir = tmp_path / "scientific" / "conformers"
+    assert not (conformers_dir / "curcumin-initial-conf-001.yaml").exists()
+
+    final_dir = (
+        tmp_path / "scientific" / "artifacts" / "conformers" / "curcumin-initial-conf-001"
+    )
+    assert not final_dir.exists()
+
+
+def test_register_conformer_cleanup_failure_still_propagates_original_error_and_logs_warning(
+    tmp_path, monkeypatch, caplog
+):
+    """A cleanup failure must never mask the original error, and must be
+    logged as a warning."""
+
+    _setup_entity_and_state(tmp_path)
+    source_file = _write_source_file(tmp_path, name="conf.sdf")
+
+    def _raise_copy(*args, **kwargs):
+        raise OSError("simulated copy failure")
+
+    def _raise_rmtree(*args, **kwargs):
+        raise OSError("simulated cleanup failure")
+
+    monkeypatch.setattr(scientific_registry_module.shutil, "copyfile", _raise_copy)
+    monkeypatch.setattr(scientific_registry_module.shutil, "rmtree", _raise_rmtree)
+
+    with caplog.at_level(logging.WARNING, logger="molecular.scientific_registry"):
+        with pytest.raises(OSError, match="simulated copy failure"):
+            register_conformer(
+                tmp_path,
+                conformer_id="curcumin-initial-conf-001",
+                state_id="curcumin-initial",
+                source_file=source_file,
+                format="sdf",
+            )
+
+    assert any("Failed to clean up" in record.getMessage() for record in caplog.records)
+
+
+def test_register_conformer_relative_representation_path_uses_posix_style(tmp_path):
+    _setup_entity_and_state(tmp_path)
+    source_file = _write_source_file(tmp_path, name="conf.sdf")
+
+    conformer = register_conformer(
+        tmp_path,
+        conformer_id="curcumin-initial-conf-001",
+        state_id="curcumin-initial",
+        source_file=source_file,
+        format="sdf",
+    )
+
+    assert conformer.representation.path == (
+        "scientific/artifacts/conformers/curcumin-initial-conf-001/conf.sdf"
+    )
+    assert "\\" not in conformer.representation.path

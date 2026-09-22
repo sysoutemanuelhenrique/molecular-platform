@@ -1,11 +1,16 @@
 """Model-level tests for the scientific domain foundation: ScientificEntity,
-MolecularRepresentationRef, and MolecularState. No filesystem I/O here -
-see test_scientific_registry.py for persistence behavior."""
+MolecularRepresentationRef, MolecularState, and Conformer. No filesystem
+I/O here - see test_scientific_registry.py for persistence behavior."""
 
 import pytest
 from pydantic import ValidationError
 
-from molecular.scientific import MolecularRepresentationRef, MolecularState, ScientificEntity
+from molecular.scientific import (
+    Conformer,
+    MolecularRepresentationRef,
+    MolecularState,
+    ScientificEntity,
+)
 
 
 def _representation(**overrides):
@@ -185,3 +190,149 @@ def test_molecular_state_is_immutable():
 
     with pytest.raises(ValidationError):
         state.entity_id = "ibuprofen"
+
+
+# --- Conformer ---
+
+
+def test_conformer_accepts_valid_data():
+    conformer = Conformer(
+        schema_version="1.0",
+        id="curcumin-initial-conf-001",
+        state_id="curcumin-initial",
+        representation=_representation(),
+    )
+
+    assert conformer.id == "curcumin-initial-conf-001"
+    assert conformer.state_id == "curcumin-initial"
+    assert conformer.representation.format == "sdf"
+
+
+def test_conformer_requires_schema_version():
+    with pytest.raises(ValidationError):
+        Conformer(
+            id="curcumin-initial-conf-001",
+            state_id="curcumin-initial",
+            representation=_representation(),
+        )
+
+
+def test_conformer_rejects_unknown_schema_version():
+    with pytest.raises(ValidationError):
+        Conformer(
+            schema_version="9.9",
+            id="curcumin-initial-conf-001",
+            state_id="curcumin-initial",
+            representation=_representation(),
+        )
+
+
+def test_conformer_rejects_empty_id():
+    with pytest.raises(ValidationError):
+        Conformer(
+            schema_version="1.0",
+            id="",
+            state_id="curcumin-initial",
+            representation=_representation(),
+        )
+
+
+def test_conformer_rejects_id_with_path_separator():
+    with pytest.raises(ValidationError):
+        Conformer(
+            schema_version="1.0",
+            id="a/b",
+            state_id="curcumin-initial",
+            representation=_representation(),
+        )
+
+
+def test_conformer_rejects_empty_state_id():
+    with pytest.raises(ValidationError):
+        Conformer(
+            schema_version="1.0",
+            id="curcumin-initial-conf-001",
+            state_id="",
+            representation=_representation(),
+        )
+
+
+def test_conformer_rejects_state_id_with_leading_dot():
+    with pytest.raises(ValidationError):
+        Conformer(
+            schema_version="1.0",
+            id="curcumin-initial-conf-001",
+            state_id=".hidden",
+            representation=_representation(),
+        )
+
+
+def test_conformer_requires_representation():
+    with pytest.raises(ValidationError):
+        Conformer(
+            schema_version="1.0",
+            id="curcumin-initial-conf-001",
+            state_id="curcumin-initial",
+        )
+
+
+def test_conformer_rejects_extra_fields():
+    with pytest.raises(ValidationError):
+        Conformer(
+            schema_version="1.0",
+            id="curcumin-initial-conf-001",
+            state_id="curcumin-initial",
+            representation=_representation(),
+            energy=-42.0,
+        )
+
+
+def test_conformer_is_immutable():
+    conformer = Conformer(
+        schema_version="1.0",
+        id="curcumin-initial-conf-001",
+        state_id="curcumin-initial",
+        representation=_representation(),
+    )
+
+    with pytest.raises(ValidationError):
+        conformer.state_id = "ibuprofen-initial"
+
+
+def test_conformer_reuses_molecular_representation_ref_validation():
+    """Smoke test only - MolecularRepresentationRef's own validation rules
+    (absolute path, traversal components, empty format/checksum) are
+    already exhaustively covered by its own tests above; this just proves
+    Conformer actually wires the same class in, unmodified."""
+
+    with pytest.raises(ValidationError):
+        Conformer(
+            schema_version="1.0",
+            id="curcumin-initial-conf-001",
+            state_id="curcumin-initial",
+            representation=_representation(path="/etc/passwd"),
+        )
+
+    with pytest.raises(ValidationError):
+        Conformer(
+            schema_version="1.0",
+            id="curcumin-initial-conf-001",
+            state_id="curcumin-initial",
+            representation=_representation(path="../escape.sdf"),
+        )
+
+
+def test_conformer_accepts_any_non_empty_format():
+    """Normative decision: no closed/allowed list of '3D-capable' formats
+    in this increment - format is an unvalidated hint, exactly like
+    MolecularState's representation. A format such as 'smiles' - which
+    could never actually carry 3D coordinates - is not rejected here."""
+
+    conformer = Conformer(
+        schema_version="1.0",
+        id="curcumin-initial-conf-001",
+        state_id="curcumin-initial",
+        representation=_representation(format="smiles"),
+    )
+
+    assert conformer.representation.format == "smiles"
