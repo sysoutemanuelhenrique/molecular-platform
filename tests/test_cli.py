@@ -7,6 +7,7 @@ from typer.testing import CliRunner
 import molecular.application as application_module
 import molecular.cli as cli_module
 from molecular.cli import app
+from molecular.scientific import ScientificEntity
 
 
 runner = CliRunner()
@@ -3387,12 +3388,91 @@ def test_provenance_show_never_echoes_activity_log_content(tmp_path, monkeypatch
 # --- manual acquisition -> scientific model bridge (Decision A) ---
 
 
+def _extract_labeled_line(output: str, label: str) -> str:
+    """Extract the value of a `<label>: <value>` line printed by the CLI.
+
+    Splits only on the label prefix, never on ':', so a Windows absolute
+    path (which itself contains a drive-letter colon) is returned intact.
+    """
+
+    prefix = f"{label}:"
+    for line in output.splitlines():
+        if line.startswith(prefix):
+            return line[len(prefix):].strip()
+    raise AssertionError(f"'{prefix}' line not found in output:\n{output}")
+
+
+def test_ligand_show_prints_a_resolved_source_path_usable_directly_in_source_file(
+    tmp_path, monkeypatch
+):
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+    raw_file = _write_source_file(tmp_path, name="curcumin.sdf", content=b"curcumin-bytes")
+    runner.invoke(
+        app,
+        [
+            "ligand",
+            "add",
+            "exp001",
+            "curcumin-lig",
+            "--name",
+            "Curcumin",
+            "--acquisition-method",
+            "uploaded",
+            "--raw-file",
+            str(raw_file),
+        ],
+    )
+
+    show_result = runner.invoke(app, ["ligand", "show", "exp001", "curcumin-lig"])
+    assert show_result.exit_code == 0
+    assert "Stored path: inputs/ligands/curcumin-lig/curcumin.sdf" in show_result.output
+
+    resolved_path = _extract_labeled_line(show_result.output, "Resolved source path")
+
+    assert Path(resolved_path).is_absolute()
+    assert Path(resolved_path).is_file()
+    assert Path(resolved_path) == (
+        project / "inputs" / "ligands" / "curcumin-lig" / "curcumin.sdf"
+    ).resolve()
+
+
+def test_protein_show_prints_a_resolved_source_path_pointing_to_an_existing_file(
+    tmp_path, monkeypatch
+):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    raw_file = _write_source_file(tmp_path, name="urease.cif", content=b"urease-bytes")
+    runner.invoke(
+        app,
+        [
+            "protein",
+            "add",
+            "exp001",
+            "urease",
+            "--name",
+            "Urease",
+            "--acquisition-method",
+            "uploaded",
+            "--raw-file",
+            str(raw_file),
+        ],
+    )
+
+    show_result = runner.invoke(app, ["protein", "show", "exp001", "urease"])
+
+    resolved_path = _extract_labeled_line(show_result.output, "Resolved source path")
+
+    assert Path(resolved_path).is_absolute()
+    assert Path(resolved_path).is_file()
+
+
 def test_manual_bridge_from_ligand_to_state_duplicates_the_artifact(tmp_path, monkeypatch):
     """Demonstrates the manual, ergonomics-only bridge from ligand
-    acquisition to the scientific model (Decision A): copying the ligand's
-    discovered artifact path into a MolecularState creates a second,
-    independently stored copy - nothing links them structurally, and
-    provenance show never claims otherwise."""
+    acquisition to the scientific model (Decision A), reproducing the real
+    user flow: the Resolved source path printed by `ligand show` is used
+    verbatim - by copy-paste, not reconstructed independently by the test -
+    as `state add`'s --source-file. This creates a second, independently
+    stored copy; nothing links the two structurally, and provenance show
+    never claims otherwise."""
 
     project = _init_valid_experiment(tmp_path, monkeypatch)
     raw_file = _write_source_file(tmp_path, name="curcumin.sdf", content=b"curcumin-bytes")
@@ -3414,11 +3494,10 @@ def test_manual_bridge_from_ligand_to_state_duplicates_the_artifact(tmp_path, mo
     )
 
     show_result = runner.invoke(app, ["ligand", "show", "exp001", "curcumin-lig"])
-    assert "inputs/ligands/curcumin-lig/curcumin.sdf" in show_result.output
+    resolved_ligand_path = _extract_labeled_line(show_result.output, "Resolved source path")
+    assert Path(resolved_ligand_path).is_file()
 
     runner.invoke(app, ["entity", "add", "exp001", "curcumin", "--name", "Curcumin"])
-
-    registered_ligand_path = project / "inputs" / "ligands" / "curcumin-lig" / "curcumin.sdf"
 
     state_result = runner.invoke(
         app,
@@ -3429,8 +3508,10 @@ def test_manual_bridge_from_ligand_to_state_duplicates_the_artifact(tmp_path, mo
             "curcumin-neutral",
             "--entity",
             "curcumin",
+            # Exactly the string `ligand show` printed above - the whole
+            # point of this test is that no path is reconstructed here.
             "--source-file",
-            str(registered_ligand_path),
+            resolved_ligand_path,
             "--format",
             "sdf",
         ],
@@ -3441,10 +3522,435 @@ def test_manual_bridge_from_ligand_to_state_duplicates_the_artifact(tmp_path, mo
         project / "scientific" / "artifacts" / "states" / "curcumin-neutral" / "curcumin.sdf"
     )
     assert state_artifact.exists()
-    assert state_artifact != registered_ligand_path
-    assert state_artifact.read_bytes() == registered_ligand_path.read_bytes()
+    assert str(state_artifact.resolve()) != resolved_ligand_path
+    assert state_artifact.read_bytes() == Path(resolved_ligand_path).read_bytes()
 
     provenance_result = runner.invoke(
         app, ["provenance", "show", "exp001", "--state", "curcumin-neutral"]
     )
     assert "No registered state-transformation provenance exists" in provenance_result.output
+
+
+# =====================================================================
+# Increment 014 hardening (post adversarial review)
+# =====================================================================
+
+
+# --- F-014-C-01: read commands must translate OSError/YAMLError/
+# ValidationError into clean banners, never an unhandled traceback ---
+
+
+def test_ligand_show_handles_storage_error_without_traceback(tmp_path, monkeypatch):
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+
+    def _raise_storage_error(*args, **kwargs):
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(cli_module, "load_ligand", _raise_storage_error)
+
+    result = runner.invoke(app, ["ligand", "show", "exp001", "curcumin"])
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "STORAGE ERROR" in result.output
+
+    line = _last_log_line(project)
+    assert "command=ligand-show" in line
+    assert "outcome=error" in line
+
+
+def test_ligand_show_handles_malformed_yaml_without_traceback(tmp_path, monkeypatch):
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+
+    def _raise_yaml_error(*args, **kwargs):
+        raise yaml.YAMLError("simulated corrupt yaml")
+
+    monkeypatch.setattr(cli_module, "load_ligand", _raise_yaml_error)
+
+    result = runner.invoke(app, ["ligand", "show", "exp001", "curcumin"])
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "CONFIGURATION ERROR" in result.output
+
+    line = _last_log_line(project)
+    assert "command=ligand-show" in line
+    assert "outcome=error" in line
+
+
+def test_protein_show_handles_storage_error_without_traceback(tmp_path, monkeypatch):
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+
+    def _raise_storage_error(*args, **kwargs):
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(cli_module, "load_protein", _raise_storage_error)
+
+    result = runner.invoke(app, ["protein", "show", "exp001", "urease"])
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "STORAGE ERROR" in result.output
+
+
+def test_entity_show_handles_validation_error_without_traceback(tmp_path, monkeypatch):
+    """A stored entities/<id>.yaml that no longer matches the model schema
+    must not surface as an unhandled pydantic traceback."""
+
+    project = _add_entity(tmp_path, monkeypatch)
+
+    def _raise_validation_error(*args, **kwargs):
+        ScientificEntity(schema_version="1.0", id="", name="Curcumin")
+
+    monkeypatch.setattr(cli_module, "load_entity", _raise_validation_error)
+
+    result = runner.invoke(app, ["entity", "show", "exp001", "curcumin"])
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "CONFIGURATION ERROR" in result.output
+
+    line = _last_log_line(project)
+    assert "command=entity-show" in line
+    assert "outcome=error" in line
+
+
+def test_entity_show_handles_storage_error_without_traceback(tmp_path, monkeypatch):
+    _add_entity(tmp_path, monkeypatch)
+
+    def _raise_storage_error(*args, **kwargs):
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(cli_module, "load_entity", _raise_storage_error)
+
+    result = runner.invoke(app, ["entity", "show", "exp001", "curcumin"])
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "STORAGE ERROR" in result.output
+
+
+def test_state_show_handles_storage_error_without_traceback(tmp_path, monkeypatch):
+    _add_entity_and_state(tmp_path, monkeypatch)
+
+    def _raise_storage_error(*args, **kwargs):
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(cli_module, "load_state", _raise_storage_error)
+
+    result = runner.invoke(app, ["state", "show", "exp001", "curcumin-neutral"])
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "STORAGE ERROR" in result.output
+
+
+def test_state_list_handles_storage_error_without_traceback_and_without_activity_log(
+    tmp_path, monkeypatch
+):
+    project = _add_entity_and_state(tmp_path, monkeypatch)
+    log_file = project / "logs" / "activity.log"
+    lines_before = log_file.read_text(encoding="utf-8").splitlines()
+
+    def _raise_storage_error(*args, **kwargs):
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(cli_module, "list_entity_states", _raise_storage_error)
+
+    result = runner.invoke(app, ["state", "list", "exp001", "--entity", "curcumin"])
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "STORAGE ERROR" in result.output
+
+    lines_after = log_file.read_text(encoding="utf-8").splitlines()
+    assert lines_after == lines_before
+
+
+def test_conformer_show_handles_storage_error_without_traceback(tmp_path, monkeypatch):
+    project = _add_entity_and_state(tmp_path, monkeypatch)
+    source_file = _write_source_file(tmp_path, name="conf.sdf")
+    runner.invoke(
+        app,
+        [
+            "conformer",
+            "add",
+            "exp001",
+            "curcumin-conf-001",
+            "--state",
+            "curcumin-neutral",
+            "--source-file",
+            str(source_file),
+            "--format",
+            "sdf",
+        ],
+    )
+
+    def _raise_storage_error(*args, **kwargs):
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(cli_module, "load_conformer", _raise_storage_error)
+
+    result = runner.invoke(app, ["conformer", "show", "exp001", "curcumin-conf-001"])
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "STORAGE ERROR" in result.output
+
+
+def test_conformer_list_handles_storage_error_without_traceback_and_without_activity_log(
+    tmp_path, monkeypatch
+):
+    project = _add_entity_and_state(tmp_path, monkeypatch)
+    log_file = project / "logs" / "activity.log"
+    lines_before = log_file.read_text(encoding="utf-8").splitlines()
+
+    def _raise_storage_error(*args, **kwargs):
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(cli_module, "list_state_conformers", _raise_storage_error)
+
+    result = runner.invoke(app, ["conformer", "list", "exp001", "--state", "curcumin-neutral"])
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "STORAGE ERROR" in result.output
+
+    lines_after = log_file.read_text(encoding="utf-8").splitlines()
+    assert lines_after == lines_before
+
+
+def test_provenance_show_handles_storage_error_without_traceback(tmp_path, monkeypatch):
+    project = _add_entity_and_state(tmp_path, monkeypatch)
+
+    def _raise_storage_error(*args, **kwargs):
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(cli_module, "list_state_transformations", _raise_storage_error)
+
+    result = runner.invoke(app, ["provenance", "show", "exp001", "--state", "curcumin-neutral"])
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "STORAGE ERROR" in result.output
+
+    line = _last_log_line(project)
+    assert "command=provenance-show" in line
+    assert "outcome=error" in line
+
+
+# --- F-014-C-02 tests already added above: resolved source path tests
+# and the rewritten manual bridge test ---
+
+
+# --- F-014-C-03: state derive pre-flight failures must log activity,
+# without ever duplicating register_derived_state's own logging ---
+
+
+def _derive_args(tmp_path, **overrides):
+    child_source = _write_source_file(tmp_path, name="child.sdf")
+    args = {
+        "operation": "protonation",
+        "parent-state": "curcumin-neutral",
+        "child-state": "curcumin-prot",
+        "transformation-id": "t1",
+        "source-file": str(child_source),
+        "format": "sdf",
+        "method-description": "manual",
+    }
+    args.update(overrides)
+
+    flat = ["state", "derive", "exp001"]
+    for key, value in args.items():
+        if value is None:
+            continue
+        if isinstance(value, list):
+            for item in value:
+                flat.extend([f"--{key}", item])
+        else:
+            flat.extend([f"--{key}", value])
+    return flat
+
+
+def test_state_derive_logs_activity_error_for_invalid_operation(tmp_path, monkeypatch):
+    project = _add_entity_and_state(tmp_path, monkeypatch)
+    called = {"value": False}
+
+    def _spy(*args, **kwargs):
+        called["value"] = True
+        raise AssertionError("register_derived_state must not be called")
+
+    monkeypatch.setattr(cli_module, "register_derived_state", _spy)
+
+    result = runner.invoke(app, _derive_args(tmp_path, operation="combustion"))
+
+    assert result.exit_code == 1
+    assert "INPUT ERROR" in result.output
+    assert called["value"] is False
+
+    line = _last_log_line(project)
+    assert "command=state-derive" in line
+    assert "outcome=error" in line
+
+
+def test_state_derive_logs_activity_error_for_producer_version_without_name(
+    tmp_path, monkeypatch
+):
+    project = _add_entity_and_state(tmp_path, monkeypatch)
+    called = {"value": False}
+
+    def _spy(*args, **kwargs):
+        called["value"] = True
+        raise AssertionError("register_derived_state must not be called")
+
+    monkeypatch.setattr(cli_module, "register_derived_state", _spy)
+
+    result = runner.invoke(
+        app, _derive_args(tmp_path, **{"producer-version": "1.0"})
+    )
+
+    assert result.exit_code == 1
+    assert "INPUT ERROR" in result.output
+    assert called["value"] is False
+
+    line = _last_log_line(project)
+    assert "command=state-derive" in line
+    assert "outcome=error" in line
+
+
+def test_state_derive_logs_activity_error_for_missing_provenance(tmp_path, monkeypatch):
+    project = _add_entity_and_state(tmp_path, monkeypatch)
+    called = {"value": False}
+
+    def _spy(*args, **kwargs):
+        called["value"] = True
+        raise AssertionError("register_derived_state must not be called")
+
+    monkeypatch.setattr(cli_module, "register_derived_state", _spy)
+
+    result = runner.invoke(
+        app, _derive_args(tmp_path, **{"method-description": None})
+    )
+
+    assert result.exit_code == 1
+    assert "INPUT ERROR" in result.output
+    assert called["value"] is False
+
+    line = _last_log_line(project)
+    assert "command=state-derive" in line
+    assert "outcome=error" in line
+
+
+def test_state_derive_logs_activity_error_for_malformed_param(tmp_path, monkeypatch):
+    project = _add_entity_and_state(tmp_path, monkeypatch)
+    called = {"value": False}
+
+    def _spy(*args, **kwargs):
+        called["value"] = True
+        raise AssertionError("register_derived_state must not be called")
+
+    monkeypatch.setattr(cli_module, "register_derived_state", _spy)
+
+    result = runner.invoke(
+        app, _derive_args(tmp_path, param="no-equals-sign")
+    )
+
+    assert result.exit_code == 1
+    assert "INPUT ERROR" in result.output
+    assert called["value"] is False
+
+    line = _last_log_line(project)
+    assert "command=state-derive" in line
+    assert "outcome=error" in line
+
+
+def test_state_derive_logs_activity_error_for_invalid_producer(tmp_path, monkeypatch):
+    """A blank --producer-name fails TransformationProducer's own field
+    validation before register_derived_state is ever called."""
+
+    project = _add_entity_and_state(tmp_path, monkeypatch)
+    called = {"value": False}
+
+    def _spy(*args, **kwargs):
+        called["value"] = True
+        raise AssertionError("register_derived_state must not be called")
+
+    monkeypatch.setattr(cli_module, "register_derived_state", _spy)
+
+    result = runner.invoke(
+        app,
+        _derive_args(
+            tmp_path, **{"producer-name": "   ", "method-description": None}
+        ),
+    )
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "CONFIGURATION ERROR" in result.output
+    assert called["value"] is False
+
+    line = _last_log_line(project)
+    assert "command=state-derive" in line
+    assert "outcome=error" in line
+
+
+def test_state_derive_logs_activity_error_for_invalid_parameter(tmp_path, monkeypatch):
+    """A --param with a blank name (e.g. "=5") fails TransformationParameter's
+    own field validation before register_derived_state is ever called."""
+
+    project = _add_entity_and_state(tmp_path, monkeypatch)
+    called = {"value": False}
+
+    def _spy(*args, **kwargs):
+        called["value"] = True
+        raise AssertionError("register_derived_state must not be called")
+
+    monkeypatch.setattr(cli_module, "register_derived_state", _spy)
+
+    result = runner.invoke(app, _derive_args(tmp_path, param="=5"))
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "CONFIGURATION ERROR" in result.output
+    assert called["value"] is False
+
+    line = _last_log_line(project)
+    assert "command=state-derive" in line
+    assert "outcome=error" in line
+
+
+def test_state_derive_does_not_log_state_derive_when_register_derived_state_is_called(
+    tmp_path, monkeypatch
+):
+    """Once register_derived_state has actually been invoked, any failure
+    from that point on (here: duplicate parameter names, detected only
+    when StateTransformationRecord is assembled inside the Application
+    Service) must rely solely on its own internal logging - the CLI must
+    never add a second command=state-derive entry."""
+
+    project = _add_entity_and_state(tmp_path, monkeypatch)
+
+    result = runner.invoke(
+        app,
+        _derive_args(tmp_path, param=["ph=7.4", "ph=8.0"]),
+    )
+
+    assert result.exit_code == 1
+    assert "CONFIGURATION ERROR" in result.output
+
+    log_text = (project / "logs" / "activity.log").read_text(encoding="utf-8")
+    assert "command=register-derived-state" in log_text
+    assert "command=state-derive" not in log_text
+
+
+# --- F-014-C-05: protein show activity-log-error test parity with ligand ---
+
+
+def test_protein_show_writes_activity_log_error(tmp_path, monkeypatch):
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+
+    runner.invoke(app, ["protein", "show", "exp001", "unknown-protein"])
+
+    line = _last_log_line(project)
+    assert "command=protein-show" in line
+    assert "outcome=error" in line
