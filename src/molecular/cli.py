@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import typer
 import yaml
@@ -8,7 +8,11 @@ import yaml
 from pydantic import ValidationError
 
 from molecular.activity import record_activity
-from molecular.application import InvalidPubChemCidError, register_ligand_from_pubchem
+from molecular.application import (
+    InvalidPubChemCidError,
+    register_derived_state,
+    register_ligand_from_pubchem,
+)
 from molecular.atomic import atomic_write_text
 from molecular.config import load_experiment
 from molecular.context import (
@@ -19,9 +23,23 @@ from molecular.context import (
     resolve_experiment,
     scan_experiments,
 )
+from molecular.inputs import validate_input_id
 from molecular.models import ExperimentConfig
 from molecular.pubchem import PubChemAcquisitionError, PubChemNotFoundError
-from molecular.registry import register_ligand, register_protein
+from molecular.registry import load_ligand, load_protein, register_ligand, register_protein
+from molecular.scientific import ScientificEntity
+from molecular.scientific_registry import (
+    list_entity_states,
+    list_state_conformers,
+    load_conformer,
+    load_entity,
+    load_state,
+    register_conformer,
+    register_entity,
+    register_state,
+)
+from molecular.transformation import TransformationParameter, TransformationProducer
+from molecular.transformation_registry import list_state_transformations
 
 app = typer.Typer(
     help="Molecular Platform - scientific molecular research platform."
@@ -30,9 +48,17 @@ app = typer.Typer(
 ligand_app = typer.Typer(help="Manage ligand inputs.")
 protein_app = typer.Typer(help="Manage protein inputs.")
 experiment_app = typer.Typer(help="Query experiment metadata.")
+entity_app = typer.Typer(help="Manage scientific entities.")
+state_app = typer.Typer(help="Manage molecular states.")
+conformer_app = typer.Typer(help="Manage conformers.")
+provenance_app = typer.Typer(help="Query state-transformation provenance.")
 app.add_typer(ligand_app, name="ligand")
 app.add_typer(protein_app, name="protein")
 app.add_typer(experiment_app, name="experiment")
+app.add_typer(entity_app, name="entity")
+app.add_typer(state_app, name="state")
+app.add_typer(conformer_app, name="conformer")
+app.add_typer(provenance_app, name="provenance")
 
 @app.callback()
 def main():
@@ -218,6 +244,12 @@ def _add_scientific_input(
         _record_activity_safely(context.project_dir, command=command, outcome="error")
         raise typer.Exit(code=1)
 
+    except ValueError as error:
+        typer.echo("INPUT ERROR")
+        typer.echo(str(error))
+        _record_activity_safely(context.project_dir, command=command, outcome="error")
+        raise typer.Exit(code=1)
+
     except OSError as error:
         typer.echo("STORAGE ERROR")
         typer.echo(str(error))
@@ -226,6 +258,126 @@ def _add_scientific_input(
 
     typer.echo(f"{label} '{registered.id}' registered successfully.")
     _record_activity_safely(context.project_dir, command=command, outcome="success")
+
+
+def _echo_validation_errors(error: ValidationError) -> None:
+    """Print one line per pydantic validation error, in the shape already
+    used throughout this module."""
+
+    for item in error.errors():
+        field = ".".join(str(part) for part in item["loc"])
+        typer.echo(f"- {field}: {item['msg']}")
+
+
+def _validate_id_or_exit(
+    value: str, *, project_dir: Optional[Path] = None, command: Optional[str] = None
+) -> str:
+    """Validate a scientific/input id at the CLI boundary before calling any
+    load/list function that does not validate id format internally itself.
+
+    A malformed id never reaches the underlying function: this fails first,
+    with a clean INPUT ERROR banner and a nonzero exit, never a Python
+    traceback. project_dir/command are optional - single-object read
+    commands pass them to log outcome="error" on this failure, mirroring
+    how they already log a later not-found failure; collection-listing
+    commands omit them, since listings never write activity log entries at
+    all (mirroring `experiment list`).
+    """
+
+    try:
+        return validate_input_id(value)
+    except ValueError as error:
+        typer.echo("INPUT ERROR")
+        typer.echo(str(error))
+        if project_dir is not None and command is not None:
+            _record_activity_safely(project_dir, command=command, outcome="error")
+        raise typer.Exit(code=1)
+
+
+def _call_or_exit(
+    fn,
+    *args,
+    project_dir: Optional[Path] = None,
+    command: Optional[str] = None,
+    **kwargs,
+):
+    """Call a read-only registry/list function and translate every failure
+    mode it can realistically raise into a clean CLI banner, never letting
+    OSError, yaml.YAMLError, or pydantic.ValidationError escape as an
+    unhandled traceback - the same INPUT/CONFIGURATION/STORAGE ERROR
+    vocabulary already used by the write-side commands.
+
+    project_dir/command are optional: single-object read commands pass
+    them to log outcome="error" on this failure, mirroring how they log a
+    not-found failure; collection-listing commands omit them, since
+    listings never write activity log entries at all, even on failure
+    (mirroring `experiment list`).
+    """
+
+    try:
+        return fn(*args, **kwargs)
+    except FileNotFoundError as error:
+        typer.echo("INPUT ERROR")
+        typer.echo(str(error))
+        if project_dir is not None and command is not None:
+            _record_activity_safely(project_dir, command=command, outcome="error")
+        raise typer.Exit(code=1)
+    except ValidationError as error:
+        typer.echo("CONFIGURATION ERROR")
+        _echo_validation_errors(error)
+        if project_dir is not None and command is not None:
+            _record_activity_safely(project_dir, command=command, outcome="error")
+        raise typer.Exit(code=1)
+    except yaml.YAMLError as error:
+        typer.echo("CONFIGURATION ERROR")
+        typer.echo(str(error))
+        if project_dir is not None and command is not None:
+            _record_activity_safely(project_dir, command=command, outcome="error")
+        raise typer.Exit(code=1)
+    except OSError as error:
+        typer.echo("STORAGE ERROR")
+        typer.echo(str(error))
+        if project_dir is not None and command is not None:
+            _record_activity_safely(project_dir, command=command, outcome="error")
+        raise typer.Exit(code=1)
+
+
+def _echo_scientific_input(item, *, label: str, project_dir: Path) -> None:
+    """Print a registered ScientificInput's (Ligand/Protein) real fields -
+    never inventing a field the model does not have.
+
+    Prints both the stored relative path (as persisted in the metadata
+    YAML) and a resolved absolute path, so the artifact can be used
+    directly - by copy-paste - as a future --source-file argument,
+    without the scientist having to resolve it against the project
+    directory by hand.
+    """
+
+    typer.echo(label)
+    typer.echo()
+    typer.echo(f"ID: {item.id}")
+    typer.echo(f"Name: {item.name}")
+
+    if item.external_id:
+        typer.echo(f"External ID: {item.external_id}")
+
+    typer.echo(f"Acquisition method: {item.acquisition.method}")
+
+    if item.acquisition.source_name:
+        typer.echo(f"Source name: {item.acquisition.source_name}")
+    if item.acquisition.source_identifier:
+        typer.echo(f"Source identifier: {item.acquisition.source_identifier}")
+    if item.acquisition.source_uri:
+        typer.echo(f"Source URI: {item.acquisition.source_uri}")
+
+    typer.echo(f"Acquired at: {item.acquisition.acquired_at.isoformat()}")
+    typer.echo()
+    typer.echo("Raw artifact:")
+    typer.echo(f"Stored path: {item.acquisition.raw_artifact.path}")
+    resolved_path = (Path(project_dir) / item.acquisition.raw_artifact.path).resolve()
+    typer.echo(f"Resolved source path: {resolved_path}")
+    typer.echo(f"Format: {item.acquisition.raw_artifact.format}")
+    typer.echo(f"Checksum: {item.acquisition.raw_artifact.checksum}")
 
 
 @ligand_app.command("add")
@@ -260,6 +412,28 @@ def ligand_add(
         source_uri=source_uri,
         file_format=file_format,
     )
+
+
+@ligand_app.command("show")
+def ligand_show(experiment: str, input_id: str):
+    """Show a registered ligand's acquisition record and stored artifact
+    path."""
+
+    context = _resolve_experiment_or_exit(experiment)
+    validated_id = _validate_id_or_exit(
+        input_id, project_dir=context.project_dir, command="ligand-show"
+    )
+
+    ligand = _call_or_exit(
+        load_ligand,
+        context.project_dir,
+        validated_id,
+        project_dir=context.project_dir,
+        command="ligand-show",
+    )
+
+    _echo_scientific_input(ligand, label="LIGAND", project_dir=context.project_dir)
+    _record_activity_safely(context.project_dir, command="ligand-show", outcome="success")
 
 
 @ligand_app.command("fetch-pubchem")
@@ -359,6 +533,28 @@ def protein_add(
     )
 
 
+@protein_app.command("show")
+def protein_show(experiment: str, input_id: str):
+    """Show a registered protein's acquisition record and stored artifact
+    path."""
+
+    context = _resolve_experiment_or_exit(experiment)
+    validated_id = _validate_id_or_exit(
+        input_id, project_dir=context.project_dir, command="protein-show"
+    )
+
+    protein = _call_or_exit(
+        load_protein,
+        context.project_dir,
+        validated_id,
+        project_dir=context.project_dir,
+        command="protein-show",
+    )
+
+    _echo_scientific_input(protein, label="PROTEIN", project_dir=context.project_dir)
+    _record_activity_safely(context.project_dir, command="protein-show", outcome="success")
+
+
 def _count_registered_inputs(project_dir: Path, kind: str) -> int:
     """Count registered <kind> inputs: one .yaml file per input, ignoring
     the RAW artifact subdirectories that sit alongside them."""
@@ -443,3 +639,478 @@ def experiment_list():
             f"{len(skipped)} directories skipped (invalid experiment.yaml): "
             f"{', '.join(skipped)}"
         )
+
+
+# --- entity add/show ---
+
+
+@entity_app.command("add")
+def entity_add(
+    experiment: str,
+    entity_id: str,
+    name: str = typer.Option(..., "--name"),
+):
+    """Register a ScientificEntity: the stable scientific identity of a
+    molecular object followed within this experiment, independent of any
+    particular molecular state, conformation, or file format."""
+
+    context = _resolve_experiment_or_exit(experiment)
+
+    try:
+        entity = ScientificEntity(schema_version="1.0", id=entity_id, name=name)
+    except ValidationError as error:
+        typer.echo("CONFIGURATION ERROR")
+        typer.echo(f"Entity '{entity_id}' is invalid.")
+        _echo_validation_errors(error)
+        _record_activity_safely(context.project_dir, command="entity-add", outcome="error")
+        raise typer.Exit(code=1)
+
+    try:
+        registered = register_entity(context.project_dir, entity)
+    except FileExistsError as error:
+        typer.echo("INPUT ERROR")
+        typer.echo(str(error))
+        _record_activity_safely(context.project_dir, command="entity-add", outcome="error")
+        raise typer.Exit(code=1)
+    except OSError as error:
+        typer.echo("STORAGE ERROR")
+        typer.echo(str(error))
+        _record_activity_safely(context.project_dir, command="entity-add", outcome="error")
+        raise typer.Exit(code=1)
+
+    typer.echo(f"Entity '{registered.id}' registered successfully.")
+    _record_activity_safely(context.project_dir, command="entity-add", outcome="success")
+
+
+@entity_app.command("show")
+def entity_show(experiment: str, entity_id: str):
+    """Show a registered ScientificEntity."""
+
+    context = _resolve_experiment_or_exit(experiment)
+    validated_id = _validate_id_or_exit(
+        entity_id, project_dir=context.project_dir, command="entity-show"
+    )
+
+    entity = _call_or_exit(
+        load_entity,
+        context.project_dir,
+        validated_id,
+        project_dir=context.project_dir,
+        command="entity-show",
+    )
+
+    typer.echo("ENTITY")
+    typer.echo()
+    typer.echo(f"Schema version: {entity.schema_version}")
+    typer.echo(f"ID: {entity.id}")
+    typer.echo(f"Name: {entity.name}")
+
+    _record_activity_safely(context.project_dir, command="entity-show", outcome="success")
+
+
+# --- state add/show/list/derive ---
+
+
+@state_app.command("add")
+def state_add(
+    experiment: str,
+    state_id: str,
+    entity_id: str = typer.Option(..., "--entity"),
+    source_file: str = typer.Option(..., "--source-file"),
+    format: str = typer.Option(..., "--format"),
+):
+    """Register a MolecularState and its representation artifact, under an
+    already-registered ScientificEntity."""
+
+    context = _resolve_experiment_or_exit(experiment)
+
+    try:
+        state = register_state(
+            context.project_dir,
+            state_id=state_id,
+            entity_id=entity_id,
+            source_file=Path(source_file),
+            format=format,
+        )
+    except (FileNotFoundError, FileExistsError, ValueError) as error:
+        typer.echo("INPUT ERROR")
+        typer.echo(str(error))
+        _record_activity_safely(context.project_dir, command="state-add", outcome="error")
+        raise typer.Exit(code=1)
+    except OSError as error:
+        typer.echo("STORAGE ERROR")
+        typer.echo(str(error))
+        _record_activity_safely(context.project_dir, command="state-add", outcome="error")
+        raise typer.Exit(code=1)
+
+    typer.echo(f"State '{state.id}' registered successfully.")
+    _record_activity_safely(context.project_dir, command="state-add", outcome="success")
+
+
+@state_app.command("show")
+def state_show(experiment: str, state_id: str):
+    """Show a registered MolecularState."""
+
+    context = _resolve_experiment_or_exit(experiment)
+    validated_id = _validate_id_or_exit(
+        state_id, project_dir=context.project_dir, command="state-show"
+    )
+
+    state = _call_or_exit(
+        load_state,
+        context.project_dir,
+        validated_id,
+        project_dir=context.project_dir,
+        command="state-show",
+    )
+
+    typer.echo("STATE")
+    typer.echo()
+    typer.echo(f"ID: {state.id}")
+    typer.echo(f"Entity: {state.entity_id}")
+    typer.echo(f"Representation path: {state.representation.path}")
+    typer.echo(f"Representation format: {state.representation.format}")
+    typer.echo(f"Representation checksum: {state.representation.checksum}")
+
+    _record_activity_safely(context.project_dir, command="state-show", outcome="success")
+
+
+@state_app.command("list")
+def state_list(
+    experiment: str,
+    entity_id: str = typer.Option(..., "--entity"),
+):
+    """List every registered MolecularState for a given entity.
+
+    A malformed --entity id is rejected before any lookup is attempted. A
+    well-formed but unregistered --entity id is not an error - it simply
+    yields no results, since this is a read-only filter over already-
+    registered states, not a check that the entity itself exists. This
+    command never writes an activity log entry, mirroring `experiment
+    list`.
+    """
+
+    context = _resolve_experiment_or_exit(experiment)
+    validated_entity_id = _validate_id_or_exit(entity_id)
+
+    states = _call_or_exit(list_entity_states, context.project_dir, validated_entity_id)
+
+    typer.echo("STATES")
+    typer.echo()
+
+    if not states:
+        typer.echo(f"No states found for entity '{validated_entity_id}'.")
+        return
+
+    for state in states:
+        typer.echo(f"{state.id}  (entity={state.entity_id})")
+
+
+def _split_param(entry: str) -> Tuple[str, str]:
+    if "=" not in entry:
+        raise ValueError(f"--param must be in the form name=value (got {entry!r})")
+
+    name, _, raw_value = entry.partition("=")
+    return name, raw_value
+
+
+def _coerce_parameter_value(raw_value: str):
+    """Coerce a raw --param value string into the str/int/float/bool shape
+    TransformationParameter.value accepts, in this fixed order: bool
+    literal, then int, then float, then fall back to the original string."""
+
+    lowered = raw_value.lower()
+    if lowered in ("true", "false"):
+        return lowered == "true"
+
+    try:
+        return int(raw_value)
+    except ValueError:
+        pass
+
+    try:
+        return float(raw_value)
+    except ValueError:
+        pass
+
+    return raw_value
+
+
+@state_app.command("derive")
+def state_derive(
+    experiment: str,
+    operation: str = typer.Option(..., "--operation"),
+    parent_state: str = typer.Option(..., "--parent-state"),
+    child_state: str = typer.Option(..., "--child-state"),
+    transformation_id: str = typer.Option(..., "--transformation-id"),
+    source_file: str = typer.Option(..., "--source-file"),
+    format: str = typer.Option(..., "--format"),
+    producer_name: Optional[str] = typer.Option(None, "--producer-name"),
+    producer_version: Optional[str] = typer.Option(None, "--producer-version"),
+    method_description: Optional[str] = typer.Option(None, "--method-description"),
+    param: List[str] = typer.Option([], "--param"),
+):
+    """Register a new molecular state and a StateTransformationRecord
+    showing that it was derived from an already-registered parent state
+    through the named operation, using the supplied artifact as the
+    child's representation.
+
+    This command does not perform protonation or tautomerization itself -
+    it records that the transformation the supplied artifact already
+    represents took place, and how (a named producer tool, a manual
+    method description, or both).
+    """
+
+    context = _resolve_experiment_or_exit(experiment)
+
+    def _preflight_error(message: str) -> None:
+        """Every CLI-side pre-flight check below happens strictly before
+        register_derived_state is ever called, so - unlike the failures
+        below that call - it is always safe to log a command="state-derive"
+        error entry here: register_derived_state's own started/error
+        logging (under command="register-derived-state") never happens for
+        these, so nothing is duplicated."""
+
+        typer.echo("INPUT ERROR")
+        typer.echo(message)
+        _record_activity_safely(context.project_dir, command="state-derive", outcome="error")
+        raise typer.Exit(code=1)
+
+    if operation not in ("protonation", "tautomerization"):
+        _preflight_error(
+            f"'{operation}' is not a supported operation. "
+            "Supported operations: protonation, tautomerization."
+        )
+
+    if producer_version is not None and producer_name is None:
+        _preflight_error("--producer-version requires --producer-name.")
+
+    if producer_name is None and method_description is None:
+        _preflight_error(
+            "Either --producer-name or --method-description is required - "
+            "a transformation must carry some usable provenance."
+        )
+
+    try:
+        parameter_pairs = [_split_param(entry) for entry in param]
+    except ValueError as error:
+        _preflight_error(str(error))
+
+    try:
+        producer = (
+            TransformationProducer(name=producer_name, version=producer_version)
+            if producer_name is not None
+            else None
+        )
+
+        parameters = tuple(
+            TransformationParameter(name=name, value=_coerce_parameter_value(raw_value))
+            for name, raw_value in parameter_pairs
+        )
+    except ValidationError as error:
+        typer.echo("CONFIGURATION ERROR")
+        typer.echo("Transformation provenance is invalid.")
+        _echo_validation_errors(error)
+        _record_activity_safely(context.project_dir, command="state-derive", outcome="error")
+        raise typer.Exit(code=1)
+
+    try:
+        child, transformation = register_derived_state(
+            context.project_dir,
+            parent_state_id=parent_state,
+            child_state_id=child_state,
+            source_file=Path(source_file),
+            format=format,
+            transformation_id=transformation_id,
+            operation=operation,
+            producer=producer,
+            method_description=method_description,
+            parameters=parameters,
+        )
+    except ValidationError as error:
+        # register_derived_state itself already performs its own
+        # started/success/error activity logging under
+        # command="register-derived-state" - no CLI-level log is added
+        # for any failure from this call onward.
+        typer.echo("CONFIGURATION ERROR")
+        typer.echo(f"Transformation '{transformation_id}' is invalid.")
+        _echo_validation_errors(error)
+        raise typer.Exit(code=1)
+    except (FileNotFoundError, FileExistsError, ValueError) as error:
+        typer.echo("INPUT ERROR")
+        typer.echo(str(error))
+        raise typer.Exit(code=1)
+    except OSError as error:
+        typer.echo("STORAGE ERROR")
+        typer.echo(str(error))
+        raise typer.Exit(code=1)
+
+    typer.echo(f"State '{child.id}' registered successfully.")
+    typer.echo(f"Transformation '{transformation.id}' recorded successfully.")
+
+
+# --- conformer add/show/list ---
+
+
+@conformer_app.command("add")
+def conformer_add(
+    experiment: str,
+    conformer_id: str,
+    state_id: str = typer.Option(..., "--state"),
+    source_file: str = typer.Option(..., "--source-file"),
+    format: str = typer.Option(..., "--format"),
+):
+    """Register an existing geometry file as a Conformer of an
+    already-registered MolecularState.
+
+    This command does not generate a conformer - it records a geometry the
+    scientist already has. Conformer generation is not implemented in this
+    increment.
+    """
+
+    context = _resolve_experiment_or_exit(experiment)
+
+    try:
+        conformer = register_conformer(
+            context.project_dir,
+            conformer_id=conformer_id,
+            state_id=state_id,
+            source_file=Path(source_file),
+            format=format,
+        )
+    except (FileNotFoundError, FileExistsError, ValueError) as error:
+        typer.echo("INPUT ERROR")
+        typer.echo(str(error))
+        _record_activity_safely(context.project_dir, command="conformer-add", outcome="error")
+        raise typer.Exit(code=1)
+    except OSError as error:
+        typer.echo("STORAGE ERROR")
+        typer.echo(str(error))
+        _record_activity_safely(context.project_dir, command="conformer-add", outcome="error")
+        raise typer.Exit(code=1)
+
+    typer.echo(f"Conformer '{conformer.id}' registered successfully.")
+    _record_activity_safely(context.project_dir, command="conformer-add", outcome="success")
+
+
+@conformer_app.command("show")
+def conformer_show(experiment: str, conformer_id: str):
+    """Show a registered Conformer."""
+
+    context = _resolve_experiment_or_exit(experiment)
+    validated_id = _validate_id_or_exit(
+        conformer_id, project_dir=context.project_dir, command="conformer-show"
+    )
+
+    conformer = _call_or_exit(
+        load_conformer,
+        context.project_dir,
+        validated_id,
+        project_dir=context.project_dir,
+        command="conformer-show",
+    )
+
+    typer.echo("CONFORMER")
+    typer.echo()
+    typer.echo(f"ID: {conformer.id}")
+    typer.echo(f"State: {conformer.state_id}")
+    typer.echo(f"Representation path: {conformer.representation.path}")
+    typer.echo(f"Representation format: {conformer.representation.format}")
+    typer.echo(f"Representation checksum: {conformer.representation.checksum}")
+
+    _record_activity_safely(context.project_dir, command="conformer-show", outcome="success")
+
+
+@conformer_app.command("list")
+def conformer_list(
+    experiment: str,
+    state_id: str = typer.Option(..., "--state"),
+):
+    """List every registered Conformer for a given state.
+
+    A malformed --state id is rejected before any lookup is attempted. A
+    well-formed but unregistered --state id simply yields no results. This
+    command never writes an activity log entry, mirroring `experiment
+    list`.
+    """
+
+    context = _resolve_experiment_or_exit(experiment)
+    validated_state_id = _validate_id_or_exit(state_id)
+
+    conformers = _call_or_exit(list_state_conformers, context.project_dir, validated_state_id)
+
+    typer.echo("CONFORMERS")
+    typer.echo()
+
+    if not conformers:
+        typer.echo(f"No conformers found for state '{validated_state_id}'.")
+        return
+
+    for conformer in conformers:
+        typer.echo(f"{conformer.id}  (state={conformer.state_id})")
+
+
+# --- provenance show ---
+
+
+@provenance_app.command("show")
+def provenance_show(
+    experiment: str,
+    state_id: str = typer.Option(..., "--state"),
+):
+    """Show StateTransformationRecord provenance for a MolecularState.
+
+    This represents only recorded state-transformation provenance - never
+    a complete provenance trail for the molecule, and never the activity
+    log. Acquisition provenance (see `ligand show`/`protein show`) is
+    tracked separately and is not linked to this MolecularState in the
+    current model.
+    """
+
+    context = _resolve_experiment_or_exit(experiment)
+    validated_state_id = _validate_id_or_exit(
+        state_id, project_dir=context.project_dir, command="provenance-show"
+    )
+
+    transformations = _call_or_exit(
+        list_state_transformations,
+        context.project_dir,
+        child_state_id=validated_state_id,
+        project_dir=context.project_dir,
+        command="provenance-show",
+    )
+
+    typer.echo("PROVENANCE")
+    typer.echo()
+
+    if not transformations:
+        typer.echo(
+            f"No registered state-transformation provenance exists for "
+            f"'{validated_state_id}'. Acquisition provenance is tracked "
+            "separately and is not linked to this MolecularState in the "
+            "current model."
+        )
+        _record_activity_safely(context.project_dir, command="provenance-show", outcome="success")
+        return
+
+    for transformation in transformations:
+        typer.echo(f"Transformation: {transformation.id}")
+        typer.echo(f"Parent state: {transformation.parent_state_id}")
+        typer.echo(f"Child state: {transformation.child_state_id}")
+        typer.echo(f"Operation: {transformation.operation}")
+
+        if transformation.producer is not None:
+            typer.echo(f"Producer: {transformation.producer.name}")
+            if transformation.producer.version is not None:
+                typer.echo(f"Producer version: {transformation.producer.version}")
+
+        if transformation.method_description is not None:
+            typer.echo(f"Method description: {transformation.method_description}")
+
+        for parameter in transformation.parameters:
+            typer.echo(f"Parameter: {parameter.name}={parameter.value}")
+
+        typer.echo(f"Created at: {transformation.created_at.isoformat()}")
+        typer.echo()
+
+    _record_activity_safely(context.project_dir, command="provenance-show", outcome="success")
