@@ -1,8 +1,22 @@
 """Minimal atomic text-file write primitive."""
 
+import hashlib
 import os
 import tempfile
 from pathlib import Path
+
+
+def compute_sha256(path: Path) -> str:
+    """Compute the SHA-256 checksum of a file's contents, streamed in
+    fixed-size chunks so the whole file never has to fit in memory at once."""
+
+    digest = hashlib.sha256()
+
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(65536), b""):
+            digest.update(chunk)
+
+    return digest.hexdigest()
 
 
 def atomic_write_text(path: Path, content: str, *, encoding: str = "utf-8") -> None:
