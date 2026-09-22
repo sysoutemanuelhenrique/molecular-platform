@@ -28,12 +28,16 @@ No filesystem behavior lives here - see scientific_registry.py for
 persistence. No CLI, HTTP, or chemistry-engine imports.
 """
 
+import re
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from molecular.inputs import validate_input_id
+
+_PATH_SEPARATOR_PATTERN = re.compile(r"[\\/]+")
+_TRAVERSAL_COMPONENTS = {".", ".."}
 
 
 class ScientificEntity(BaseModel):
@@ -58,7 +62,11 @@ class MolecularRepresentationRef(BaseModel):
     MolecularState - the scientific representation the state actually uses,
     not the RAW acquisition artifact it may have been derived from. `path`
     is a POSIX-style path relative to the project root; it identifies where
-    the representation is stored, never the chemical identity itself."""
+    the representation is stored, never the chemical identity itself. `path`
+    is rejected outright (never resolved, normalized, or filesystem-checked)
+    if it is absolute in either POSIX or Windows form, or if any of its
+    `/`- or `\\`-separated components is exactly '.' or '..' - a purely
+    lexical check, so no path can traverse outside the project root."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -73,6 +81,14 @@ class MolecularRepresentationRef(BaseModel):
             raise ValueError(
                 f"path must be relative to the project root, not absolute (got {value!r})"
             )
+
+        components = _PATH_SEPARATOR_PATTERN.split(value)
+        if any(component in _TRAVERSAL_COMPONENTS for component in components):
+            raise ValueError(
+                "path must not contain '.' or '..' path traversal components "
+                f"(got {value!r})"
+            )
+
         return value
 
 

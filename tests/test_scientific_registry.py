@@ -4,10 +4,13 @@ already covered by test_scientific.py (field-level model validation) are
 not repeated here - these tests exercise storage behavior: conflicts,
 atomicity, checksum verification, and the entity/state relationship."""
 
+import logging
+
 import pytest
 import yaml
 from pydantic import ValidationError
 
+import molecular.scientific_registry as scientific_registry_module
 from molecular.scientific import MolecularState, ScientificEntity
 from molecular.scientific_registry import (
     EntityIdentityConflictError,
@@ -384,3 +387,181 @@ def test_failed_state_registration_does_not_publish_artifact_twice(tmp_path):
     # the failed attempt's staging directory must have been cleaned up
     staging_root = tmp_path / "scientific" / "artifacts" / "states" / ".staging"
     assert not staging_root.exists() or list(staging_root.iterdir()) == []
+
+
+# --- fault injection: stage -> verify -> publish -> commit, adapted from
+# the equivalent protocol tests in tests/test_registry.py ---
+
+
+def test_register_state_checksum_mismatch_after_staging_leaves_nothing_published(
+    tmp_path, monkeypatch
+):
+    """If the staged copy's checksum doesn't match the source's, nothing is
+    published, no metadata is committed, and the attempt's staging
+    directory is removed."""
+
+    register_entity(tmp_path, _entity())
+    source_file = _write_source_file(tmp_path)
+
+    real_compute_sha256 = scientific_registry_module.compute_sha256
+    call_count = {"n": 0}
+
+    def _flaky_checksum(path):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            # the second call is the staged-file check; force a mismatch
+            return "0" * 64
+        return real_compute_sha256(path)
+
+    monkeypatch.setattr(scientific_registry_module, "compute_sha256", _flaky_checksum)
+
+    with pytest.raises(OSError, match="Checksum mismatch"):
+        register_state(
+            tmp_path,
+            state_id="curcumin-initial",
+            entity_id="curcumin",
+            source_file=source_file,
+            format="sdf",
+        )
+
+    states_dir = tmp_path / "scientific" / "states"
+    assert not (states_dir / "curcumin-initial.yaml").exists()
+
+    final_dir = tmp_path / "scientific" / "artifacts" / "states" / "curcumin-initial"
+    assert not final_dir.exists()
+
+    staging_root = tmp_path / "scientific" / "artifacts" / "states" / ".staging"
+    if staging_root.exists():
+        assert list(staging_root.iterdir()) == []
+
+
+def test_register_state_copy_failure_leaves_no_final_artifact_no_metadata_and_cleans_staging(
+    tmp_path, monkeypatch
+):
+    """A failure while copying into staging must not publish anything, and
+    the specific attempt's staging directory must be cleaned up."""
+
+    register_entity(tmp_path, _entity())
+    source_file = _write_source_file(tmp_path)
+
+    def _raise_copy(*args, **kwargs):
+        raise OSError("simulated copy failure")
+
+    monkeypatch.setattr(scientific_registry_module.shutil, "copyfile", _raise_copy)
+
+    with pytest.raises(OSError):
+        register_state(
+            tmp_path,
+            state_id="curcumin-initial",
+            entity_id="curcumin",
+            source_file=source_file,
+            format="sdf",
+        )
+
+    states_dir = tmp_path / "scientific" / "states"
+    assert not (states_dir / "curcumin-initial.yaml").exists()
+
+    final_dir = tmp_path / "scientific" / "artifacts" / "states" / "curcumin-initial"
+    assert not final_dir.exists()
+
+    staging_root = tmp_path / "scientific" / "artifacts" / "states" / ".staging"
+    if staging_root.exists():
+        assert list(staging_root.iterdir()) == []
+
+
+def test_register_state_publish_failure_creates_no_metadata_and_no_final_and_cleans_staging(
+    tmp_path, monkeypatch
+):
+    """If publish_staged_directory itself fails, metadata must never be
+    created, no final artifact directory exists, and staging cleanup is
+    attempted for this attempt's directory."""
+
+    register_entity(tmp_path, _entity())
+    source_file = _write_source_file(tmp_path)
+
+    def _raise_publish(*args, **kwargs):
+        raise OSError("simulated publish failure")
+
+    monkeypatch.setattr(scientific_registry_module, "publish_staged_directory", _raise_publish)
+
+    with pytest.raises(OSError):
+        register_state(
+            tmp_path,
+            state_id="curcumin-initial",
+            entity_id="curcumin",
+            source_file=source_file,
+            format="sdf",
+        )
+
+    states_dir = tmp_path / "scientific" / "states"
+    assert not (states_dir / "curcumin-initial.yaml").exists()
+
+    final_dir = tmp_path / "scientific" / "artifacts" / "states" / "curcumin-initial"
+    assert not final_dir.exists()
+
+    staging_root = tmp_path / "scientific" / "artifacts" / "states" / ".staging"
+    if staging_root.exists():
+        assert list(staging_root.iterdir()) == []
+
+
+def test_register_state_metadata_commit_failure_after_publish_removes_just_published_artifact(
+    tmp_path, monkeypatch
+):
+    """If the metadata atomic write fails after the representation was
+    already published, the just-published artifact directory must be
+    rolled back (removed), leaving no metadata and no valid registration
+    from this attempt."""
+
+    register_entity(tmp_path, _entity())
+    source_file = _write_source_file(tmp_path)
+
+    def _raise_atomic_write(*args, **kwargs):
+        raise OSError("simulated metadata commit failure")
+
+    monkeypatch.setattr(scientific_registry_module, "atomic_write_text", _raise_atomic_write)
+
+    with pytest.raises(OSError):
+        register_state(
+            tmp_path,
+            state_id="curcumin-initial",
+            entity_id="curcumin",
+            source_file=source_file,
+            format="sdf",
+        )
+
+    states_dir = tmp_path / "scientific" / "states"
+    assert not (states_dir / "curcumin-initial.yaml").exists()
+
+    final_dir = tmp_path / "scientific" / "artifacts" / "states" / "curcumin-initial"
+    assert not final_dir.exists()
+
+
+def test_register_state_cleanup_failure_still_propagates_original_error_and_logs_warning(
+    tmp_path, monkeypatch, caplog
+):
+    """A cleanup failure must never mask the original error, and must be
+    logged as a warning."""
+
+    register_entity(tmp_path, _entity())
+    source_file = _write_source_file(tmp_path)
+
+    def _raise_copy(*args, **kwargs):
+        raise OSError("simulated copy failure")
+
+    def _raise_rmtree(*args, **kwargs):
+        raise OSError("simulated cleanup failure")
+
+    monkeypatch.setattr(scientific_registry_module.shutil, "copyfile", _raise_copy)
+    monkeypatch.setattr(scientific_registry_module.shutil, "rmtree", _raise_rmtree)
+
+    with caplog.at_level(logging.WARNING, logger="molecular.scientific_registry"):
+        with pytest.raises(OSError, match="simulated copy failure"):
+            register_state(
+                tmp_path,
+                state_id="curcumin-initial",
+                entity_id="curcumin",
+                source_file=source_file,
+                format="sdf",
+            )
+
+    assert any("Failed to clean up" in record.getMessage() for record in caplog.records)

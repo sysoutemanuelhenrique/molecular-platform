@@ -147,11 +147,14 @@ def register_state(
     under project_dir/scientific.
 
     entity_id must already be registered - this function never creates or
-    modifies a ScientificEntity. Stage -> publish -> commit, mirroring
-    molecular.registry's registration protocol for scientific inputs: the
-    representation file is copied into a private per-attempt staging
-    directory and verified there; only once that succeeds is it published
-    (renamed) to its final location under
+    modifies a ScientificEntity. Stage -> verify -> publish -> commit,
+    mirroring molecular.registry's registration protocol for scientific
+    inputs: the representation file is copied into a private per-attempt
+    staging directory; its checksum is computed there and compared against
+    the source file's own checksum (computed before the copy), so the
+    published copy is proven to match the original byte-for-byte, not just
+    internally consistent with itself. Only once that succeeds is it
+    published (renamed) to its final location under
     scientific/artifacts/states/<state_id>/; only once that succeeds is the
     state metadata committed atomically. Metadata existing on disk is what
     makes the registration real.
@@ -189,12 +192,20 @@ def register_state(
     final_dir = artifacts_root / state_id
     artifact_published = False
 
+    source_checksum = compute_sha256(source_file)
+
     try:
         attempt_dir.mkdir(parents=True, exist_ok=False)
         staged_file = attempt_dir / source_file.name
         shutil.copyfile(source_file, staged_file)
 
-        checksum = compute_sha256(staged_file)
+        staged_checksum = compute_sha256(staged_file)
+
+        if staged_checksum != source_checksum:
+            raise OSError(
+                f"Checksum mismatch after staging representation for '{state_id}': "
+                f"expected {source_checksum}, got {staged_checksum}"
+            )
 
         state = MolecularState(
             schema_version="1.0",
@@ -203,7 +214,7 @@ def register_state(
             representation=MolecularRepresentationRef(
                 path=relative_path.as_posix(),
                 format=format,
-                checksum=checksum,
+                checksum=staged_checksum,
             ),
         )
 

@@ -92,6 +92,27 @@ def test_molecular_representation_ref_rejects_absolute_windows_path():
         _representation(path="C:/Users/someone/structure.sdf")
 
 
+def test_molecular_representation_ref_rejects_unc_path():
+    with pytest.raises(ValidationError):
+        _representation(path=r"\\server\share\structure.sdf")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "../foo",
+        "foo/../../bar",
+        "foo\\..\\bar",
+        "..",
+        "foo/..",
+        ".",
+    ],
+)
+def test_molecular_representation_ref_rejects_path_traversal(path):
+    with pytest.raises(ValidationError):
+        _representation(path=path)
+
+
 def test_molecular_representation_ref_rejects_empty_format():
     with pytest.raises(ValidationError):
         _representation(format="")
