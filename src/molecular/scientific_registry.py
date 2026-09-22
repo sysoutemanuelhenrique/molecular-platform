@@ -20,7 +20,12 @@ from typing import List
 
 import yaml
 
-from molecular.atomic import atomic_write_text, compute_sha256, publish_staged_directory
+from molecular.atomic import (
+    atomic_write_text,
+    check_storage_identity_conflict,
+    compute_sha256,
+    publish_staged_directory,
+)
 from molecular.inputs import validate_input_id
 from molecular.scientific import MolecularRepresentationRef, MolecularState, ScientificEntity
 
@@ -54,41 +59,24 @@ def _state_artifacts_root(project_dir: Path) -> Path:
 
 def _check_entity_identity_conflict(entities_dir: Path, entity_id: str) -> None:
     """Raise EntityIdentityConflictError on an exact or casefold collision
-    against an already-registered entity's metadata file. Case-insensitive
-    for the same cross-filesystem portability reason as scientific input
-    registration in molecular.registry - not a general-purpose mutex; the
-    same residual TOCTOU window documented there applies here."""
+    against an already-registered entity's metadata file. Delegates to the
+    shared check_storage_identity_conflict primitive in molecular.atomic -
+    see its docstring for the fuller discussion of the residual TOCTOU
+    window against concurrent writers."""
 
-    if not entities_dir.is_dir():
-        return
-
-    folded = entity_id.casefold()
-
-    for entry in entities_dir.iterdir():
-        if entry.is_file() and entry.suffix == ".yaml" and entry.stem.casefold() == folded:
-            raise EntityIdentityConflictError(
-                f"'{entity_id}' is already registered under {entities_dir} "
-                f"(conflicts with existing entry '{entry.stem}'; "
-                "storage identity is case-insensitive)."
-            )
+    check_storage_identity_conflict(
+        entities_dir, entity_id, conflict_error=EntityIdentityConflictError
+    )
 
 
 def _check_state_identity_conflict(states_dir: Path, state_id: str) -> None:
     """Raise StateIdentityConflictError on an exact or casefold collision
-    against an already-registered state's metadata file."""
+    against an already-registered state's metadata file. Delegates to the
+    shared check_storage_identity_conflict primitive in molecular.atomic."""
 
-    if not states_dir.is_dir():
-        return
-
-    folded = state_id.casefold()
-
-    for entry in states_dir.iterdir():
-        if entry.is_file() and entry.suffix == ".yaml" and entry.stem.casefold() == folded:
-            raise StateIdentityConflictError(
-                f"'{state_id}' is already registered under {states_dir} "
-                f"(conflicts with existing entry '{entry.stem}'; "
-                "storage identity is case-insensitive)."
-            )
+    check_storage_identity_conflict(
+        states_dir, state_id, conflict_error=StateIdentityConflictError
+    )
 
 
 def _cleanup_directory_best_effort(path: Path, *, description: str) -> None:
@@ -254,6 +242,39 @@ def load_state(project_dir: Path, state_id: str) -> MolecularState:
     metadata_file = _states_dir(project_dir) / f"{state_id}.yaml"
     data = yaml.safe_load(metadata_file.read_text(encoding="utf-8"))
     return MolecularState.model_validate(data)
+
+
+def _remove_state_best_effort(project_dir: Path, state_id: str) -> None:
+    """Best-effort compensating removal of a MolecularState's metadata and
+    representation artifact directory.
+
+    Not a public delete_state() API: this is a narrowly-scoped internal
+    helper meant to be called only by an orchestrating Application Service
+    to roll back a state it just created within the same call, when a
+    later step of that same operation (e.g. registering a
+    StateTransformationRecord) subsequently fails. It must never be used to
+    remove a preexisting state - callers can only safely reach for it on a
+    state_id they themselves just successfully passed to register_state,
+    since register_state already rejects a preexisting state_id outright.
+
+    Never raises: failures are logged as warnings via
+    _cleanup_directory_best_effort/best-effort unlink, exactly like the
+    cleanup register_state already performs internally on its own failure
+    paths - a compensation failure must never mask whatever error is
+    already propagating from the caller.
+    """
+
+    metadata_file = _states_dir(project_dir) / f"{state_id}.yaml"
+
+    try:
+        metadata_file.unlink(missing_ok=True)
+    except OSError:
+        logger.warning(
+            "Failed to clean up %s at %s", "state metadata", metadata_file, exc_info=True
+        )
+
+    artifact_dir = _state_artifacts_root(project_dir) / state_id
+    _cleanup_directory_best_effort(artifact_dir, description="published representation directory")
 
 
 def list_entity_states(project_dir: Path, entity_id: str) -> List[MolecularState]:
