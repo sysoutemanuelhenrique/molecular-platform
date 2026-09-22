@@ -15,11 +15,13 @@ def record_activity(
 
     project_dir must already exist; this never creates the experiment directory itself.
 
-    `details`, when given, must be a frozen dataclass instance - its fields
-    are appended to the line, in declaration order, as `name=value` tokens
+    `details`, when given, must be a dataclass instance - its fields are
+    appended to the line, in declaration order, as `name=value` tokens
     after `outcome`. This module makes no assumption about which dataclass
-    shape a caller uses; it only knows how to format one generically via
-    `dataclasses.fields`.
+    shape a caller uses, and does not itself enforce immutability on
+    `details` at runtime; it only knows how to format one generically via
+    `dataclasses.fields`. The one shape actually in use today,
+    application.DerivedStateActivityDetails, is itself a frozen dataclass.
 
     Legacy calls (details=None, the default - every call site before this
     parameter existed) produce exactly the historical line shape,

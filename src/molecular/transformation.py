@@ -126,6 +126,14 @@ class StateTransformationRecord(BaseModel):
                 "transformation must carry some usable provenance"
             )
 
+        # Intentionally case-sensitive: "pH" and "ph" are distinct
+        # parameter names here. Parameter names are not storage
+        # identities - unlike the id/parent_state_id/child_state_id
+        # fields above (whose storage-layer conflict checks are
+        # casefold-normalized for cross-filesystem portability), a
+        # parameter name is scoped to this single record and never
+        # addresses anything on disk, so there is no portability reason
+        # to fold its case.
         names = [parameter.name for parameter in self.parameters]
         if len(names) != len(set(names)):
             raise ValueError("parameters must not contain duplicate names")

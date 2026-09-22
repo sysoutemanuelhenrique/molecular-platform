@@ -280,3 +280,22 @@ def test_record_is_immutable():
 
     with pytest.raises(ValidationError):
         record.operation = "tautomerization"
+
+
+# --- parameter name case sensitivity is intentional (F-012-C-05) ---
+
+
+def test_record_accepts_parameter_names_differing_only_by_case():
+    """"pH" and "ph" are distinct parameter names by design - parameter
+    names are not storage identities and are never casefold-normalized,
+    unlike id/parent_state_id/child_state_id."""
+
+    record = _record(
+        parameters=(
+            TransformationParameter(name="pH", value=7.0),
+            TransformationParameter(name="ph", value=7.4),
+        )
+    )
+
+    assert len(record.parameters) == 2
+    assert {parameter.name for parameter in record.parameters} == {"pH", "ph"}

@@ -51,16 +51,17 @@ def _field(line, name):
     return None
 
 
-def _record_activity_raising_only_for(target_outcomes):
-    """Build a record_activity replacement that raises OSError for the
+def _record_activity_raising_only_for(target_outcomes, exc_cls=OSError):
+    """Build a record_activity replacement that raises `exc_cls` for the
     given outcome(s) and otherwise delegates to the real implementation -
-    lets tests fail exactly one of started/success/error independently."""
+    lets tests fail exactly one of started/success/error independently,
+    with whichever exception type the test wants to simulate."""
 
     real_record_activity = record_activity
 
     def _fake(project_dir, command, outcome, *, details=None):
         if outcome in target_outcomes:
-            raise OSError(f"simulated {outcome} log failure")
+            raise exc_cls(f"simulated {outcome} log failure")
         return real_record_activity(project_dir, command, outcome, details=details)
 
     return _fake
@@ -516,3 +517,174 @@ def test_started_without_terminal_event_does_not_trigger_deletion(tmp_path):
 
     assert load_state(tmp_path, "state-a").id == "state-a"
     assert (tmp_path / "scientific" / "states" / "state-a.yaml").exists()
+
+
+# --- C-01: KeyboardInterrupt / SystemExit boundary ---
+
+
+@pytest.mark.parametrize("interrupt_cls", [KeyboardInterrupt, SystemExit])
+def test_interrupt_after_child_created_triggers_compensation(tmp_path, monkeypatch, interrupt_cls):
+    """A KeyboardInterrupt/SystemExit arriving after the child was
+    registered but before the transformation is registered must still
+    trigger compensation and a best-effort error log, then propagate
+    unchanged - proving register_derived_state's compensation boundary is
+    `except BaseException`, not `except Exception`."""
+
+    _setup_entity_with_parent(tmp_path)
+
+    child_metadata_file = tmp_path / "scientific" / "states" / "state-b.yaml"
+    child_existed_at_interrupt_time = {"value": None}
+
+    def _raise_interrupt(*args, **kwargs):
+        # the child must be REAL on disk at this point - not mocked away -
+        # proving it was actually created before the interrupt arrived.
+        child_existed_at_interrupt_time["value"] = child_metadata_file.exists()
+        raise interrupt_cls()
+
+    monkeypatch.setattr(application_module, "register_state_transformation", _raise_interrupt)
+
+    with pytest.raises(interrupt_cls):
+        register_derived_state(
+            tmp_path,
+            parent_state_id="state-a",
+            child_state_id="state-b",
+            source_file=_write_source_file(tmp_path, name="b.sdf"),
+            format="sdf",
+            transformation_id="transformation-1",
+            operation="tautomerization",
+            producer=TransformationProducer(name="ExternalTool"),
+        )
+
+    # the child genuinely existed on disk at the moment of interruption
+    assert child_existed_at_interrupt_time["value"] is True
+
+    # ... and was compensated (removed) afterward
+    assert not child_metadata_file.exists()
+    assert not (tmp_path / "scientific" / "artifacts" / "states" / "state-b").exists()
+
+    # no transformation was ever registered
+    assert not (
+        tmp_path / "scientific" / "transformations" / "transformation-1.yaml"
+    ).exists()
+
+    # the parent remains completely untouched
+    parent = load_state(tmp_path, "state-a")
+    assert parent.id == "state-a"
+
+    # a best-effort error log was attempted with the same attempt_id as started
+    lines = _activity_lines(tmp_path)
+    started_line = next(line for line in lines if "outcome=started" in line)
+    error_line = next(line for line in lines if "outcome=error" in line)
+    assert _field(started_line, "attempt_id") == _field(error_line, "attempt_id")
+
+
+# --- C-02: id validation happens before the started log ---
+
+
+@pytest.mark.parametrize(
+    "bad_id",
+    ["with space", "with=equals", "with\nnewline"],
+)
+@pytest.mark.parametrize(
+    "field_name", ["parent_state_id", "child_state_id", "transformation_id"]
+)
+def test_invalid_ids_fail_before_started_log(tmp_path, field_name, bad_id):
+    """A malformed parent_state_id/child_state_id/transformation_id must be
+    rejected before any activity-log I/O - no attempt_id is generated, no
+    `started` line is written, and no child or transformation is created."""
+
+    _setup_entity_with_parent(tmp_path)
+
+    kwargs = dict(
+        parent_state_id="state-a",
+        child_state_id="state-b",
+        source_file=_write_source_file(tmp_path, name="b.sdf"),
+        format="sdf",
+        transformation_id="transformation-1",
+        operation="tautomerization",
+        producer=TransformationProducer(name="ExternalTool"),
+    )
+    kwargs[field_name] = bad_id
+
+    with pytest.raises(ValueError):
+        register_derived_state(tmp_path, **kwargs)
+
+    assert _activity_lines(tmp_path) == []
+    assert not (tmp_path / "scientific" / "states" / "state-b.yaml").exists()
+    assert not (tmp_path / "scientific" / "transformations" / "transformation-1.yaml").exists()
+
+
+# --- C-03: activity logging failure boundary is Exception, not OSError-only ---
+
+
+def test_started_logging_runtime_error_does_not_block_operation(tmp_path, monkeypatch):
+    _setup_entity_with_parent(tmp_path)
+
+    monkeypatch.setattr(
+        application_module,
+        "record_activity",
+        _record_activity_raising_only_for({"started"}, exc_cls=RuntimeError),
+    )
+
+    child, transformation = register_derived_state(
+        tmp_path,
+        parent_state_id="state-a",
+        child_state_id="state-b",
+        source_file=_write_source_file(tmp_path, name="b.sdf"),
+        format="sdf",
+        transformation_id="transformation-1",
+        operation="tautomerization",
+        producer=TransformationProducer(name="ExternalTool"),
+    )
+
+    assert child.id == "state-b"
+    assert transformation.id == "transformation-1"
+
+
+def test_success_logging_runtime_error_does_not_turn_success_into_failure(tmp_path, monkeypatch):
+    _setup_entity_with_parent(tmp_path)
+
+    monkeypatch.setattr(
+        application_module,
+        "record_activity",
+        _record_activity_raising_only_for({"success"}, exc_cls=RuntimeError),
+    )
+
+    child, transformation = register_derived_state(
+        tmp_path,
+        parent_state_id="state-a",
+        child_state_id="state-b",
+        source_file=_write_source_file(tmp_path, name="b.sdf"),
+        format="sdf",
+        transformation_id="transformation-1",
+        operation="tautomerization",
+        producer=TransformationProducer(name="ExternalTool"),
+    )
+
+    assert child.id == "state-b"
+    assert load_state(tmp_path, "state-b").id == "state-b"
+    assert load_state_transformation(tmp_path, "transformation-1").id == "transformation-1"
+
+
+def test_error_logging_runtime_error_does_not_mask_original_exception(tmp_path, monkeypatch):
+    _setup_entity_with_parent(tmp_path)
+
+    monkeypatch.setattr(
+        application_module,
+        "record_activity",
+        _record_activity_raising_only_for({"error"}, exc_cls=RuntimeError),
+    )
+
+    # the ORIGINAL persistence/scientific exception must still be the one
+    # that propagates, not the RuntimeError from the (failing) error log
+    with pytest.raises(FileNotFoundError):
+        register_derived_state(
+            tmp_path,
+            parent_state_id="state-a",
+            child_state_id="state-b",
+            source_file=tmp_path / "does-not-exist.sdf",
+            format="sdf",
+            transformation_id="transformation-1",
+            operation="tautomerization",
+            producer=TransformationProducer(name="ExternalTool"),
+        )

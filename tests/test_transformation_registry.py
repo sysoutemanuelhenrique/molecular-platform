@@ -13,7 +13,11 @@ import yaml
 import molecular.transformation_registry as transformation_registry_module
 from molecular.scientific import ScientificEntity
 from molecular.scientific_registry import register_entity, register_state
-from molecular.transformation import StateTransformationRecord, TransformationProducer
+from molecular.transformation import (
+    StateTransformationRecord,
+    TransformationParameter,
+    TransformationProducer,
+)
 from molecular.transformation_registry import (
     TransformationIdentityConflictError,
     list_state_transformations,
@@ -287,3 +291,42 @@ def test_child_state_unchanged_after_transformation_registration(tmp_path):
     after = load_state(tmp_path, "state-b")
 
     assert before == after
+
+
+# --- F-012-C-06: bool/int survive the real registry round-trip ---
+
+
+def test_bool_and_int_parameter_values_survive_registry_round_trip(tmp_path):
+    """Exercises the real path - Pydantic -> model_dump(mode="json") ->
+    yaml.safe_dump -> yaml.safe_load -> model_validate - not just direct
+    model construction, to prove bool is never silently coerced to int (or
+    vice versa) once the value has actually been through YAML."""
+
+    _setup_entity_with_states(tmp_path)
+
+    register_state_transformation(
+        tmp_path,
+        _record(
+            parameters=(
+                TransformationParameter(name="enabled", value=True),
+                TransformationParameter(name="disabled", value=False),
+                TransformationParameter(name="count", value=1),
+                TransformationParameter(name="zero_count", value=0),
+            )
+        ),
+    )
+
+    loaded = load_state_transformation(tmp_path, "state-a-to-state-b")
+    by_name = {parameter.name: parameter for parameter in loaded.parameters}
+
+    assert by_name["enabled"].value is True
+    assert type(by_name["enabled"].value) is bool
+
+    assert by_name["disabled"].value is False
+    assert type(by_name["disabled"].value) is bool
+
+    assert by_name["count"].value == 1
+    assert type(by_name["count"].value) is int
+
+    assert by_name["zero_count"].value == 0
+    assert type(by_name["zero_count"].value) is int

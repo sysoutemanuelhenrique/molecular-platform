@@ -23,7 +23,7 @@ from typing import Literal, Optional, Tuple
 from molecular.activity import record_activity
 from molecular.config import load_experiment
 from molecular.context import ExperimentContext, resolve_experiment
-from molecular.inputs import LigandInput
+from molecular.inputs import LigandInput, validate_input_id
 from molecular.pubchem import (
     build_pubchem_sdf_url,
     cleanup_temp_artifact,
@@ -48,11 +48,16 @@ class InvalidPubChemCidError(ValueError):
 
 
 def _record_activity_safely(project_dir: Path, *, outcome: str) -> None:
-    """Best-effort activity logging that must never affect the caller's own outcome."""
+    """Best-effort activity logging that must never affect the caller's own
+    outcome. Catches Exception, not just OSError: any ordinary logging
+    failure is swallowed, but a process interrupt (KeyboardInterrupt,
+    SystemExit - both BaseException, not Exception) is deliberately never
+    caught here, since this helper's only job is to swallow logging
+    failures, never interrupts."""
 
     try:
         record_activity(project_dir, command=_OPERATION, outcome=outcome)
-    except OSError:
+    except Exception:
         pass
 
 
@@ -148,7 +153,11 @@ def _record_derived_state_activity_safely(
     """Best-effort activity logging for register_derived_state - mirrors
     _record_activity_safely above, but carries the typed correlation
     details so an interrupted attempt can later be identified. A failure
-    to write this line must never affect the caller's own outcome."""
+    to write this line must never affect the caller's own outcome.
+    Catches Exception, not just OSError, for the same reason
+    _record_activity_safely does - and, symmetrically, never catches
+    BaseException: a KeyboardInterrupt/SystemExit reaching this helper
+    must propagate, not be swallowed as if it were a logging failure."""
 
     try:
         record_activity(
@@ -157,7 +166,7 @@ def _record_derived_state_activity_safely(
             outcome=outcome,
             details=details,
         )
-    except OSError:
+    except Exception:
         pass
 
 
@@ -220,7 +229,34 @@ def register_derived_state(
     candidate for investigation, never proof of an orphaned state on its
     own - that investigation must confirm against the filesystem via
     child_state_id and transformation_id.
+
+    parent_state_id, child_state_id, and transformation_id are validated
+    (filesystem-safe id format) before anything else happens - including
+    before the started log - so a malformed id fails immediately, without
+    generating an attempt_id, without any activity-log I/O, and without
+    ever reaching the point where an unsafe id string could be written
+    into a `field=value` log line.
+
+    The compensation/error-logging boundary here is `except BaseException`,
+    not `except Exception`: once the child has been created, a
+    KeyboardInterrupt or SystemExit arriving before the transformation is
+    registered must still trigger compensation and a best-effort error
+    log, exactly like any other exception - this mirrors the boundary
+    already used by molecular.registry and molecular.scientific_registry
+    for the same reason (their own cleanup-on-failure paths use
+    `except BaseException`, not `except Exception`). This is deliberately
+    different from the activity-logging helpers' own boundary
+    (`except Exception`, not `except BaseException`): a logging failure is
+    always an ordinary error to swallow best-effort, while a process
+    interrupt must never be caught and discarded by the logging helper
+    itself - only the outer compensation boundary is allowed to observe an
+    interrupt, and only to compensate and re-raise it unchanged, never to
+    swallow it.
     """
+
+    validate_input_id(parent_state_id)
+    validate_input_id(child_state_id)
+    validate_input_id(transformation_id)
 
     attempt_id = uuid.uuid4().hex
 
@@ -261,7 +297,7 @@ def register_derived_state(
 
         register_state_transformation(project_dir, transformation)
 
-    except Exception:
+    except BaseException:
         if child_created:
             _remove_state_best_effort(project_dir, child_state_id)
         _record_derived_state_activity_safely(project_dir, outcome="error", details=details)
