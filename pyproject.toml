@@ -19,6 +19,7 @@ dev = [
 
 [project.scripts]
 molecular = "molecular.cli:app"
+tbohr = "molecular.cli:app"
 
 [tool.setuptools.packages.find]
 where = ["src"]
