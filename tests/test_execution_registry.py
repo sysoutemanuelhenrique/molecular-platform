@@ -49,9 +49,14 @@ def _error(**overrides):
 
 
 def _begin(tmp_path, operation_id="t-future-001", **overrides):
+    """`operation_id` is a convenience for the common single-target case -
+    it is wrapped into a 1-tuple for the real (plural) operation_ids
+    parameter. Pass operation_ids=(...) directly in overrides to exercise
+    a multi-target attempt instead."""
+
     fields = {
         "operation_type": "state-transformation",
-        "operation_id": operation_id,
+        "operation_ids": (operation_id,),
         "requested": _policy(),
     }
     fields.update(overrides)
@@ -70,7 +75,7 @@ def test_begin_creates_started_attempt(tmp_path):
     assert attempt.resolved_at is None
     assert attempt.finished_at is None
     assert attempt.operation_type == "state-transformation"
-    assert attempt.operation_id == "t-future-001"
+    assert attempt.operation_ids == ("t-future-001",)
 
 
 def test_begin_id_is_a_uuid4_hex_string(tmp_path):
@@ -116,10 +121,63 @@ def test_multiple_attempts_may_share_the_same_operation_id(tmp_path):
     second = _begin(tmp_path, operation_id="t-shared")
 
     assert first.id != second.id
-    assert first.operation_id == second.operation_id == "t-shared"
+    assert first.operation_ids == second.operation_ids == ("t-shared",)
 
     assert load_execution_attempt(tmp_path, first.id).id == first.id
     assert load_execution_attempt(tmp_path, second.id).id == second.id
+
+
+def test_begin_supports_multiple_operation_ids_for_a_single_attempt(tmp_path):
+    """One attempt models one engine invocation, which may fan out into
+    several resulting StateTransformationRecords (e.g. tautomer
+    enumeration producing several new states from one parent) - it does
+    not force an artificial 1:1 split across several attempts for what
+    is, physically, a single execution event."""
+
+    attempt = begin_execution_attempt(
+        tmp_path,
+        operation_type="state-transformation",
+        operation_ids=("t1", "t2", "t3"),
+        requested=_policy(),
+    )
+
+    assert attempt.operation_ids == ("t1", "t2", "t3")
+
+
+def test_begin_rejects_empty_operation_ids(tmp_path):
+    with pytest.raises(ValueError):
+        begin_execution_attempt(
+            tmp_path,
+            operation_type="state-transformation",
+            operation_ids=(),
+            requested=_policy(),
+        )
+
+
+def test_begin_rejects_duplicate_operation_ids(tmp_path):
+    with pytest.raises(ValueError):
+        begin_execution_attempt(
+            tmp_path,
+            operation_type="state-transformation",
+            operation_ids=("t1", "t1"),
+            requested=_policy(),
+        )
+
+
+def test_lifecycle_with_multiple_operation_ids_never_creates_any_transformation(tmp_path):
+    """Extends test_lifecycle_never_creates_a_state_transformation_record
+    to the multi-target case: a full begin -> resolve -> succeed
+    lifecycle for an attempt declaring several operation_ids must still
+    never write any of them into scientific/transformations."""
+
+    attempt = _begin(tmp_path, operation_ids=("t-a", "t-b", "t-c"))
+    mark_resolved(tmp_path, attempt.id, resolved=_snapshot())
+    mark_succeeded(tmp_path, attempt.id)
+
+    transformations_dir = tmp_path / "scientific" / "transformations"
+    assert not transformations_dir.exists()
+    for operation_id in ("t-a", "t-b", "t-c"):
+        assert not (transformations_dir / f"{operation_id}.yaml").exists()
 
 
 # --- mark_resolved ---
@@ -315,7 +373,7 @@ def test_transition_preserves_immutable_identity_fields(tmp_path):
     for later in (resolved, succeeded):
         assert later.id == attempt.id
         assert later.operation_type == attempt.operation_type
-        assert later.operation_id == attempt.operation_id
+        assert later.operation_ids == attempt.operation_ids
         assert later.schema_version == attempt.schema_version
         assert later.created_at == attempt.created_at
 
@@ -356,7 +414,7 @@ def test_begin_does_not_require_an_existing_state_transformation_record(tmp_path
 
     attempt = _begin(tmp_path, operation_id="t-does-not-exist-yet")
 
-    assert attempt.operation_id == "t-does-not-exist-yet"
+    assert attempt.operation_ids == ("t-does-not-exist-yet",)
     assert not (transformations_dir / "t-does-not-exist-yet.yaml").exists()
 
 
@@ -374,25 +432,42 @@ def test_lifecycle_never_creates_a_state_transformation_record(tmp_path):
     assert not (transformations_dir / "t-never-created.yaml").exists()
 
 
-def test_mark_succeeded_does_not_verify_operation_id_resolves_to_a_transformation(tmp_path):
+def test_mark_succeeded_does_not_verify_any_declared_operation_id_resolves_to_a_transformation(
+    tmp_path,
+):
     """mark_succeeded records only the platform's own belief that its
     intended operation completed - it never checks that a
-    StateTransformationRecord actually exists at operation_id, since no
-    producer of one exists in this increment. Reconciling that belief
-    with a real StateTransformationRecord (registering it *before* ever
-    calling mark_succeeded) is an obligation this increment deliberately
-    places on Increment 016's future orchestrating Application Service,
-    not something this registry enforces or ever could enforce here
-    without coupling it to a producer that does not yet exist."""
+    StateTransformationRecord actually exists at any of operation_ids,
+    since no producer of one exists in this increment. This is
+    deliberately exercised with *several* declared operation_ids, not
+    just one: D-015-11's original wording read as a per-record guarantee
+    tied to a single target, but the guarantee (or rather, its absence
+    here) is identical no matter how many ids one attempt declares.
+    Reconciling this belief with real StateTransformationRecords
+    (registering every one of them *before* ever calling mark_succeeded)
+    is a caller contract this increment deliberately places on Increment
+    016's future orchestrating Application Service - see the D-015-11
+    amendment in execution_registry.py's module docstring - not
+    something this registry enforces or could enforce without coupling
+    it to a producer that does not yet exist."""
 
-    attempt = _begin(tmp_path, operation_id="t-never-registered")
+    attempt = _begin(
+        tmp_path, operation_ids=("t-never-registered-1", "t-never-registered-2", "t-never-registered-3")
+    )
     mark_resolved(tmp_path, attempt.id, resolved=_snapshot())
 
     succeeded = mark_succeeded(tmp_path, attempt.id)
 
     assert succeeded.status == "succeeded"
+    assert succeeded.operation_ids == (
+        "t-never-registered-1",
+        "t-never-registered-2",
+        "t-never-registered-3",
+    )
+
     transformations_dir = tmp_path / "scientific" / "transformations"
-    assert not (transformations_dir / "t-never-registered.yaml").exists()
+    for operation_id in succeeded.operation_ids:
+        assert not (transformations_dir / f"{operation_id}.yaml").exists()
 
 
 def test_begin_rejects_a_colliding_generated_attempt_id(tmp_path, monkeypatch):
@@ -415,7 +490,7 @@ def test_begin_rejects_a_colliding_generated_attempt_id(tmp_path, monkeypatch):
     # collision - not partially overwritten, not gone.
     reloaded = load_execution_attempt(tmp_path, first.id)
     assert reloaded == first
-    assert reloaded.operation_id == "t-one"
+    assert reloaded.operation_ids == ("t-one",)
 
 
 def test_mark_resolved_still_overwrites_the_same_attempts_own_file_after_collision_guard(

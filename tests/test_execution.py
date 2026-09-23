@@ -44,7 +44,7 @@ def _started_attempt(**overrides):
         "schema_version": "1.0",
         "id": "attempt0001",
         "operation_type": "state-transformation",
-        "operation_id": "t-future-001",
+        "operation_ids": ("t-future-001",),
         "status": "started",
         "requested": _policy(),
         "resolved": None,
@@ -220,9 +220,28 @@ def test_execution_attempt_valid_started():
     assert attempt.error is None
 
 
-def test_execution_attempt_rejects_malformed_operation_id():
+def test_execution_attempt_rejects_malformed_operation_ids_entry():
     with pytest.raises(ValidationError):
-        _started_attempt(operation_id="bad id")
+        _started_attempt(operation_ids=("bad id",))
+
+
+def test_execution_attempt_accepts_multiple_operation_ids():
+    """A single attempt (one engine invocation) may target more than one
+    resulting StateTransformationRecord - e.g. tautomer enumeration
+    fanning out into several new states from one parent."""
+
+    attempt = _started_attempt(operation_ids=("t1", "t2", "t3"))
+    assert attempt.operation_ids == ("t1", "t2", "t3")
+
+
+def test_execution_attempt_rejects_empty_operation_ids():
+    with pytest.raises(ValidationError):
+        _started_attempt(operation_ids=())
+
+
+def test_execution_attempt_rejects_duplicate_operation_ids():
+    with pytest.raises(ValidationError):
+        _started_attempt(operation_ids=("t1", "t1"))
 
 
 def test_execution_attempt_rejects_malformed_id():
@@ -243,7 +262,7 @@ def test_execution_attempt_rejects_extra_field():
             schema_version="1.0",
             id="attempt0001",
             operation_type="state-transformation",
-            operation_id="t-future-001",
+            operation_ids=("t-future-001",),
             status="started",
             requested=_policy(),
             created_at=datetime.now(timezone.utc),
