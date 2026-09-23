@@ -7,78 +7,85 @@ registration and every subsequent transition are single atomic metadata
 writes, the same shape as molecular.scientific_registry.register_entity.
 
 begin_execution_attempt never creates, requires, or checks for a
-StateTransformationRecord at any of operation_ids: an attempt starts
-before the transformation(s) it aims to produce exist, by design. Nothing
-in this module writes to project_dir/scientific/transformations.
-Symmetrically, mark_succeeded never verifies that a StateTransformationRecord
-now exists at any of operation_ids either - see its own docstring below,
-and ExecutionAttempt's docstring in molecular.execution, for the
-obligation this places on whatever future caller (Increment 016's
-orchestrating Application Service) marks an attempt succeeded.
+StateTransformationRecord: an attempt starts before any transformation it
+might eventually produce exists, by design, and before those results are
+even knowable (see the amendment below). Nothing in this module writes to
+project_dir/scientific/transformations. Symmetrically, mark_succeeded
+never verifies that a StateTransformationRecord now exists at any id in
+the operation_ids it is given either - see its own docstring below, and
+ExecutionAttempt's docstring in molecular.execution, for the obligation
+this places on whatever future caller (Increment 016's orchestrating
+Application Service) marks an attempt succeeded.
 
---- AMENDMENT TO D-015-11 (post-freeze) ---
+--- AMENDMENT TO D-015-11 / D-015-12 (post-freeze) ---
 
 Source: 08_INCREMENT_015_FINAL_SPEC.md, Section 12 ("Operation Reference")
 and Decision D-015-11 ("operation_id é referência-alvo, garantida existir
-só quando status=succeeded."). This amendment is recorded here, in the
-code, because the source document lives outside this repository; anyone
-applying it to that document should carry this text over verbatim.
+só quando status=succeeded."). Recorded here because the source document
+lives outside this repository; anyone applying it there should carry this
+text over verbatim. This supersedes an earlier, incomplete revision of
+D-015-11 that renamed the field to a tuple but still declared it at
+begin_execution_attempt time.
 
-Two problems were identified in the original wording, both real tensions
+Three problems were identified in the original wording, all real tensions
 within the frozen spec itself, not implementation bugs:
 
 1. CARDINALITY. Section 12 modeled the target as a single
    `operation_id: str`, presuming one ExecutionAttempt produces exactly
    one StateTransformationRecord. But TautomerEnumerationPolicy already
    allows a single enumeration to yield more than one resulting
-   MolecularState (that is what `max_states` bounds), and
-   StateTransformationRecord (molecular.transformation) is one-child-per-
-   record - so one enumeration attempt may legitimately need to produce
-   several StateTransformationRecords, not one. Splitting that single
-   engine invocation across several independent ExecutionAttempts (one
-   per resulting state) would misrepresent one actual execution event as
-   several, duplicating the same resolved engine configuration across
-   every one of them for no benefit.
+   MolecularState (what `max_states` bounds), and StateTransformationRecord
+   (molecular.transformation) is one-child-per-record - so one
+   enumeration attempt may legitimately need to produce several
+   StateTransformationRecords, not one.
 
-   AMENDED: `operation_id` (singular) is renamed to `operation_ids` (a
-   non-empty tuple of independently-validated, duplicate-free ids). One
-   ExecutionAttempt still models exactly one engine invocation, one
-   resolved configuration, and one success/failure outcome - but now
-   names the complete set of StateTransformationRecord ids that single
-   invocation intends to produce, which may be one or many.
+2. TIMING. A first revision addressed (1) by making operation_ids a
+   tuple declared at begin_execution_attempt time, as the attempt's
+   stated *intent*. That still did not fit: which ids an engine
+   invocation actually produces - indeed, how many - is not knowable
+   until the engine has run and finished. Requiring the caller to
+   pre-declare exact target ids before invoking the engine forces a
+   commitment the real information timeline cannot support.
 
-2. GUARANTEE VS. CONTRACT. D-015-11 states the target becomes "guaranteed
+3. GUARANTEE VS. CONTRACT. D-015-11 states the target becomes "guaranteed
    dereferenceable" once status=="succeeded" - read literally, an
    invariant of the persisted record itself. But this increment has no
    engine and, by its own scope decision, no orchestrating Application
    Service (see the "NO APPLICATION SERVICE" section of the frozen
    spec) - so nothing in this module can check, compute, or enforce that
-   guarantee. Enforcing it here would require importing
-   molecular.transformation_registry into this minimal state machine,
-   coupling it to a producer this increment deliberately does not have.
-   As implemented and tested, mark_succeeded permits status=="succeeded"
-   with zero of the declared operation_ids resolving to anything.
+   guarantee without coupling this minimal state machine to
+   molecular.transformation_registry, a producer this increment
+   deliberately does not have.
 
-   AMENDED: the guarantee is reclassified from a system-enforced
-   invariant to a CALLER CONTRACT. Every id in operation_ids is *intended*
-   to be dereferenceable once status=="succeeded", but ensuring that is
-   the responsibility of whoever calls mark_succeeded - in Increment 016,
-   the orchestrating Application Service, which MUST register every
-   StateTransformationRecord named in operation_ids (e.g. via
-   register_state_transformation) strictly BEFORE calling mark_succeeded,
-   never after. This module neither verifies nor can verify that
-   ordering. Until Increment 016's Application Service exists and is
-   exercised, status=="succeeded" on a persisted ExecutionAttempt asserts
-   only the platform's own belief that its intended operation completed,
-   not a fact this repository has checked.
+AMENDED (D-015-12, superseding the tuple-at-begin revision of D-015-11):
+operation_ids moves from begin-time declared intent to succeeded-time
+declared result. begin_execution_attempt no longer accepts it at all - a
+new attempt always starts with operation_ids=None, and it stays None
+through every non-terminal-success status (started, resolved,
+resolution_failed, execution_failed; ExecutionAttempt's own invariants
+enforce this). Only mark_succeeded assigns it, as an explicit required
+argument: a tuple, independently validated per entry and duplicate-free,
+which MAY be empty (meaning the operation completed but produced no new
+transformations). This matches the real timeline - the field exists only
+once the information it carries actually exists - and, together with
+D-015-11's original point 2, the guarantee it carries remains a CALLER
+CONTRACT, not a system-enforced fact: every id mark_succeeded is given is
+*intended* to be dereferenceable, but ensuring that is true - registering
+every named StateTransformationRecord *before* calling mark_succeeded,
+never after - is Increment 016's orchestrating Application Service's
+responsibility, never verified here. A consequence of this timing fix:
+retries are simply independent ExecutionAttempts, each with its own id
+and its own None-until-succeeded operation_ids; there is no notion of two
+attempts "sharing" a pre-declared target anymore, since no attempt
+declares a target before it succeeds.
 
 This amendment does not walk back the "no engine, no Application Service
 in 015" scope decision - it makes explicit what that decision already
-implied about what "succeeded" can and cannot mean here, and it does not
+implied about when "succeeded" can mean anything at all, and it does not
 add any existence check, import molecular.transformation_registry, or
 otherwise couple this module to a transformation producer. No filesystem
-layout, YAML shape (beyond the operation_id -> operation_ids field
-rename), or persisted schema_version changes as a result.
+layout or persisted schema_version changes as a result; the YAML shape's
+operation_ids field simply reads null until an attempt succeeds.
 
 --- end amendment ---
 
@@ -137,22 +144,15 @@ def begin_execution_attempt(
     project_dir: Path,
     *,
     operation_type: str,
-    operation_ids: tuple[str, ...],
     requested: TautomerEnumerationPolicy,
 ) -> ExecutionAttempt:
     """Begin a new ExecutionAttempt in status 'started'.
 
-    operation_ids names the complete set of StateTransformationRecord ids
-    this one attempt intends to produce - one for a single-output
-    operation, more than one for an operation whose engine invocation can
-    fan out into several results (e.g. tautomer enumeration; see the
-    D-015-11 amendment in this module's docstring). Each id is validated
-    only for filesystem-safe format - none is ever checked against an
-    existing StateTransformationRecord, and this function never creates
-    one. This is intentional: the attempt exists before the
-    transformation(s) it targets exist. Multiple attempts may share one
-    or more operation_ids (independent retries); each attempt still gets
-    its own generated id.
+    Does not accept operation_ids: which StateTransformationRecords (if
+    any) this attempt actually produces is only known once execution
+    succeeds - see mark_succeeded and the D-015-11/D-015-12 amendment in
+    this module's docstring. The new attempt always starts with
+    operation_ids=None.
     """
 
     if operation_type not in _SUPPORTED_OPERATION_TYPES:
@@ -160,17 +160,6 @@ def begin_execution_attempt(
             f"'{operation_type}' is not a supported operation_type "
             f"(supported: {', '.join(_SUPPORTED_OPERATION_TYPES)})"
         )
-
-    if not operation_ids:
-        raise ValueError(
-            "operation_ids must name at least one intended StateTransformationRecord id"
-        )
-
-    for candidate in operation_ids:
-        validate_input_id(candidate)
-
-    if len(set(operation_ids)) != len(operation_ids):
-        raise ValueError("operation_ids must not contain duplicate entries")
 
     attempts_dir = _execution_attempts_dir(project_dir)
     attempt_id = uuid.uuid4().hex
@@ -188,7 +177,7 @@ def begin_execution_attempt(
         schema_version="1.0",
         id=attempt_id,
         operation_type=operation_type,
-        operation_ids=tuple(operation_ids),
+        operation_ids=None,
         status="started",
         requested=requested,
         resolved=None,
@@ -242,7 +231,7 @@ def mark_resolved(
         schema_version=current.schema_version,
         id=current.id,
         operation_type=current.operation_type,
-        operation_ids=current.operation_ids,
+        operation_ids=None,
         status="resolved",
         requested=current.requested,
         resolved=resolved,
@@ -282,7 +271,7 @@ def mark_resolution_failed(
         schema_version=current.schema_version,
         id=current.id,
         operation_type=current.operation_type,
-        operation_ids=current.operation_ids,
+        operation_ids=None,
         status="resolution_failed",
         requested=current.requested,
         resolved=None,
@@ -322,7 +311,7 @@ def mark_execution_failed(
         schema_version=current.schema_version,
         id=current.id,
         operation_type=current.operation_type,
-        operation_ids=current.operation_ids,
+        operation_ids=None,
         status="execution_failed",
         requested=current.requested,
         resolved=current.resolved,
@@ -337,26 +326,39 @@ def mark_execution_failed(
     return updated
 
 
-def mark_succeeded(project_dir: Path, attempt_id: str) -> ExecutionAttempt:
+def mark_succeeded(
+    project_dir: Path,
+    attempt_id: str,
+    *,
+    operation_ids: tuple[str, ...],
+) -> ExecutionAttempt:
     """Transition an attempt from 'resolved' to 'succeeded', preserving
-    its resolved snapshot and resolved_at.
+    its resolved snapshot and resolved_at, and assigning operation_ids -
+    the StateTransformationRecord ids this attempt actually produced.
 
-    Only a 'resolved' attempt may succeed.
+    Only a 'resolved' attempt may succeed. operation_ids is required: it
+    may be an empty tuple (the operation completed but produced no new
+    transformations), but never omitted - this is the only point in the
+    state machine where operation_ids is assigned, since which ids (if
+    any) an engine invocation produces is only known once it has finished
+    (see the D-015-12 amendment in this module's docstring). Each entry
+    is independently validated for filesystem-safe format and duplicates
+    are rejected, by ExecutionAttempt's own field validator.
 
-    IMPORTANT (see the D-015-11 amendment in this module's docstring):
-    this function does not check, and cannot check without coupling this
-    module to a StateTransformationRecord producer that does not exist in
-    this increment, whether every id in operation_ids actually resolves
-    to a real StateTransformationRecord. Calling mark_succeeded only
-    records the platform's own belief that its intended operation
-    completed. Ensuring that belief is true - registering every
-    StateTransformationRecord named in operation_ids (e.g. via
-    register_state_transformation) *before* ever calling mark_succeeded,
-    never after - is a caller contract this increment places on whatever
-    future caller orchestrates that ordering: in Increment 016, the
-    Application Service that resolves an adapter, executes the engine,
-    registers the resulting transformation(s), and only then marks the
-    attempt succeeded.
+    IMPORTANT: this function does not check, and cannot check without
+    coupling this module to a StateTransformationRecord producer that
+    does not exist in this increment, whether any id in operation_ids
+    actually resolves to a real StateTransformationRecord. Calling
+    mark_succeeded only records the platform's own belief that its
+    intended operation completed with these results. Ensuring that
+    belief is true - registering every StateTransformationRecord named in
+    operation_ids (e.g. via register_state_transformation) *before* ever
+    calling mark_succeeded, never after - is a caller contract this
+    increment places on whatever future caller orchestrates that
+    ordering: in Increment 016, the Application Service that resolves an
+    adapter, executes the engine, determines the results, registers the
+    resulting transformation(s), and only then marks the attempt
+    succeeded with their ids.
     """
 
     current = load_execution_attempt(project_dir, attempt_id)
@@ -371,7 +373,7 @@ def mark_succeeded(project_dir: Path, attempt_id: str) -> ExecutionAttempt:
         schema_version=current.schema_version,
         id=current.id,
         operation_type=current.operation_type,
-        operation_ids=current.operation_ids,
+        operation_ids=tuple(operation_ids),
         status="succeeded",
         requested=current.requested,
         resolved=current.resolved,

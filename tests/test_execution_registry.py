@@ -1,7 +1,14 @@
 """Persistence and state-machine tests for execution attempts: begin/load,
 every valid transition, every rejected transition, and the central
 semantic guarantee that an attempt never creates or requires a
-StateTransformationRecord."""
+StateTransformationRecord.
+
+operation_ids timing (D-015-12): a new attempt always starts with
+operation_ids=None and stays None through every non-terminal-success
+status; only mark_succeeded assigns it, as a required argument that may
+be an empty tuple. Tests below exercise this explicitly - there is no
+notion of "declaring" or "sharing" operation_ids at begin time anymore.
+"""
 
 import uuid
 
@@ -48,15 +55,9 @@ def _error(**overrides):
     return ExecutionAttemptError(**fields)
 
 
-def _begin(tmp_path, operation_id="t-future-001", **overrides):
-    """`operation_id` is a convenience for the common single-target case -
-    it is wrapped into a 1-tuple for the real (plural) operation_ids
-    parameter. Pass operation_ids=(...) directly in overrides to exercise
-    a multi-target attempt instead."""
-
+def _begin(tmp_path, **overrides):
     fields = {
         "operation_type": "state-transformation",
-        "operation_ids": (operation_id,),
         "requested": _policy(),
     }
     fields.update(overrides)
@@ -75,7 +76,21 @@ def test_begin_creates_started_attempt(tmp_path):
     assert attempt.resolved_at is None
     assert attempt.finished_at is None
     assert attempt.operation_type == "state-transformation"
-    assert attempt.operation_ids == ("t-future-001",)
+    assert attempt.operation_ids is None
+
+
+def test_begin_does_not_accept_operation_ids(tmp_path):
+    """begin_execution_attempt has no operation_ids parameter at all -
+    which ids (if any) an attempt produces is only knowable once it
+    succeeds, so declaring them at begin time is not a valid call."""
+
+    with pytest.raises(TypeError):
+        begin_execution_attempt(
+            tmp_path,
+            operation_type="state-transformation",
+            operation_ids=("t1",),
+            requested=_policy(),
+        )
 
 
 def test_begin_id_is_a_uuid4_hex_string(tmp_path):
@@ -98,11 +113,6 @@ def test_begin_rejects_unsupported_operation_type(tmp_path):
         _begin(tmp_path, operation_type="docking-run")
 
 
-def test_begin_rejects_malformed_operation_id(tmp_path):
-    with pytest.raises(ValueError):
-        _begin(tmp_path, operation_id="bad id")
-
-
 def test_load_round_trips(tmp_path):
     attempt = _begin(tmp_path)
 
@@ -116,68 +126,21 @@ def test_load_missing_attempt_raises_file_not_found(tmp_path):
         load_execution_attempt(tmp_path, "does-not-exist")
 
 
-def test_multiple_attempts_may_share_the_same_operation_id(tmp_path):
-    first = _begin(tmp_path, operation_id="t-shared")
-    second = _begin(tmp_path, operation_id="t-shared")
+def test_multiple_independent_attempts_each_start_with_no_operation_ids(tmp_path):
+    """Retries are independent ExecutionAttempts, each with its own
+    generated id - there is no notion of two attempts "sharing" a
+    pre-declared operation_ids anymore, since no attempt declares one
+    before it succeeds."""
+
+    first = _begin(tmp_path)
+    second = _begin(tmp_path)
 
     assert first.id != second.id
-    assert first.operation_ids == second.operation_ids == ("t-shared",)
+    assert first.operation_ids is None
+    assert second.operation_ids is None
 
     assert load_execution_attempt(tmp_path, first.id).id == first.id
     assert load_execution_attempt(tmp_path, second.id).id == second.id
-
-
-def test_begin_supports_multiple_operation_ids_for_a_single_attempt(tmp_path):
-    """One attempt models one engine invocation, which may fan out into
-    several resulting StateTransformationRecords (e.g. tautomer
-    enumeration producing several new states from one parent) - it does
-    not force an artificial 1:1 split across several attempts for what
-    is, physically, a single execution event."""
-
-    attempt = begin_execution_attempt(
-        tmp_path,
-        operation_type="state-transformation",
-        operation_ids=("t1", "t2", "t3"),
-        requested=_policy(),
-    )
-
-    assert attempt.operation_ids == ("t1", "t2", "t3")
-
-
-def test_begin_rejects_empty_operation_ids(tmp_path):
-    with pytest.raises(ValueError):
-        begin_execution_attempt(
-            tmp_path,
-            operation_type="state-transformation",
-            operation_ids=(),
-            requested=_policy(),
-        )
-
-
-def test_begin_rejects_duplicate_operation_ids(tmp_path):
-    with pytest.raises(ValueError):
-        begin_execution_attempt(
-            tmp_path,
-            operation_type="state-transformation",
-            operation_ids=("t1", "t1"),
-            requested=_policy(),
-        )
-
-
-def test_lifecycle_with_multiple_operation_ids_never_creates_any_transformation(tmp_path):
-    """Extends test_lifecycle_never_creates_a_state_transformation_record
-    to the multi-target case: a full begin -> resolve -> succeed
-    lifecycle for an attempt declaring several operation_ids must still
-    never write any of them into scientific/transformations."""
-
-    attempt = _begin(tmp_path, operation_ids=("t-a", "t-b", "t-c"))
-    mark_resolved(tmp_path, attempt.id, resolved=_snapshot())
-    mark_succeeded(tmp_path, attempt.id)
-
-    transformations_dir = tmp_path / "scientific" / "transformations"
-    assert not transformations_dir.exists()
-    for operation_id in ("t-a", "t-b", "t-c"):
-        assert not (transformations_dir / f"{operation_id}.yaml").exists()
 
 
 # --- mark_resolved ---
@@ -204,6 +167,14 @@ def test_mark_resolved_sets_resolved_at(tmp_path):
     assert resolved.resolved_at is not None
 
 
+def test_mark_resolved_preserves_operation_ids_as_none(tmp_path):
+    attempt = _begin(tmp_path)
+
+    resolved = mark_resolved(tmp_path, attempt.id, resolved=_snapshot())
+
+    assert resolved.operation_ids is None
+
+
 # --- mark_resolution_failed ---
 
 
@@ -219,6 +190,14 @@ def test_mark_resolution_failed_transitions_started_to_resolution_failed(tmp_pat
     assert failed.error.phase == "resolution"
     assert failed.resolved_at is None
     assert failed.finished_at is not None
+
+
+def test_mark_resolution_failed_ends_with_operation_ids_none(tmp_path):
+    attempt = _begin(tmp_path)
+
+    failed = mark_resolution_failed(tmp_path, attempt.id, error=_error(phase="resolution"))
+
+    assert failed.operation_ids is None
 
 
 def test_mark_resolution_failed_rejects_execution_phase_error(tmp_path):
@@ -246,6 +225,19 @@ def test_mark_execution_failed_transitions_resolved_to_execution_failed(tmp_path
     assert failed.finished_at is not None
 
 
+def test_mark_execution_failed_ends_with_operation_ids_none(tmp_path):
+    """This increment declares no partial results on execution failure -
+    operation_ids stays None even though the attempt did reach
+    'resolved' along the way."""
+
+    attempt = _begin(tmp_path)
+    mark_resolved(tmp_path, attempt.id, resolved=_snapshot())
+
+    failed = mark_execution_failed(tmp_path, attempt.id, error=_error(phase="execution"))
+
+    assert failed.operation_ids is None
+
+
 def test_mark_execution_failed_rejects_resolution_phase_error(tmp_path):
     attempt = _begin(tmp_path)
     mark_resolved(tmp_path, attempt.id, resolved=_snapshot())
@@ -257,25 +249,113 @@ def test_mark_execution_failed_rejects_resolution_phase_error(tmp_path):
 # --- mark_succeeded ---
 
 
-def test_mark_succeeded_transitions_resolved_to_succeeded(tmp_path):
+def test_mark_succeeded_requires_operation_ids_argument(tmp_path):
     attempt = _begin(tmp_path)
-    resolved = mark_resolved(tmp_path, attempt.id, resolved=_snapshot())
+    mark_resolved(tmp_path, attempt.id, resolved=_snapshot())
 
-    succeeded = mark_succeeded(tmp_path, attempt.id)
+    with pytest.raises(TypeError):
+        mark_succeeded(tmp_path, attempt.id)
 
-    assert succeeded.status == "succeeded"
-    assert succeeded.error is None
-    assert succeeded.resolved == resolved.resolved
-    assert succeeded.resolved_at == resolved.resolved_at
+
+def test_mark_succeeded_rejects_none_operation_ids(tmp_path):
+    attempt = _begin(tmp_path)
+    mark_resolved(tmp_path, attempt.id, resolved=_snapshot())
+
+    with pytest.raises(TypeError):
+        mark_succeeded(tmp_path, attempt.id, operation_ids=None)
+
+
+def test_mark_succeeded_accepts_a_single_operation_id(tmp_path):
+    attempt = _begin(tmp_path)
+    mark_resolved(tmp_path, attempt.id, resolved=_snapshot())
+
+    succeeded = mark_succeeded(tmp_path, attempt.id, operation_ids=("t1",))
+
+    assert succeeded.operation_ids == ("t1",)
+
+
+def test_mark_succeeded_accepts_multiple_operation_ids(tmp_path):
+    """One attempt (one engine invocation) may report more than one
+    resulting StateTransformationRecord id - e.g. tautomer enumeration
+    fanning out into several new states from one parent."""
+
+    attempt = _begin(tmp_path)
+    mark_resolved(tmp_path, attempt.id, resolved=_snapshot())
+
+    succeeded = mark_succeeded(tmp_path, attempt.id, operation_ids=("t1", "t2", "t3"))
+
+    assert succeeded.operation_ids == ("t1", "t2", "t3")
+
+
+def test_mark_succeeded_accepts_an_empty_tuple(tmp_path):
+    """An empty tuple is a valid, meaningful result: the operation
+    completed but produced no new transformations."""
+
+    attempt = _begin(tmp_path)
+    mark_resolved(tmp_path, attempt.id, resolved=_snapshot())
+
+    succeeded = mark_succeeded(tmp_path, attempt.id, operation_ids=())
+
+    assert succeeded.operation_ids == ()
 
 
 def test_mark_succeeded_sets_finished_at(tmp_path):
     attempt = _begin(tmp_path)
     mark_resolved(tmp_path, attempt.id, resolved=_snapshot())
 
-    succeeded = mark_succeeded(tmp_path, attempt.id)
+    succeeded = mark_succeeded(tmp_path, attempt.id, operation_ids=())
 
     assert succeeded.finished_at is not None
+
+
+def test_mark_succeeded_preserves_resolved_snapshot_and_resolved_at(tmp_path):
+    attempt = _begin(tmp_path)
+    resolved = mark_resolved(tmp_path, attempt.id, resolved=_snapshot())
+
+    succeeded = mark_succeeded(tmp_path, attempt.id, operation_ids=())
+
+    assert succeeded.error is None
+    assert succeeded.resolved == resolved.resolved
+    assert succeeded.resolved_at == resolved.resolved_at
+
+
+def test_mark_succeeded_rejects_malformed_operation_id(tmp_path):
+    attempt = _begin(tmp_path)
+    mark_resolved(tmp_path, attempt.id, resolved=_snapshot())
+
+    with pytest.raises(ValidationError):
+        mark_succeeded(tmp_path, attempt.id, operation_ids=("bad id",))
+
+
+def test_mark_succeeded_rejects_duplicate_operation_ids(tmp_path):
+    attempt = _begin(tmp_path)
+    mark_resolved(tmp_path, attempt.id, resolved=_snapshot())
+
+    with pytest.raises(ValidationError):
+        mark_succeeded(tmp_path, attempt.id, operation_ids=("t1", "t1"))
+
+
+def test_mark_succeeded_validation_failure_does_not_alter_the_previous_yaml(tmp_path):
+    """A rejected mark_succeeded call must leave the attempt's persisted
+    file exactly as it was: ExecutionAttempt construction (which raises
+    on a malformed/duplicate id) always happens before _persist, so a
+    validation failure here can never have written anything."""
+
+    attempt = _begin(tmp_path)
+    mark_resolved(tmp_path, attempt.id, resolved=_snapshot())
+
+    metadata_file = tmp_path / "scientific" / "execution_attempts" / f"{attempt.id}.yaml"
+    before = metadata_file.read_text(encoding="utf-8")
+
+    with pytest.raises(ValidationError):
+        mark_succeeded(tmp_path, attempt.id, operation_ids=("bad id",))
+
+    after = metadata_file.read_text(encoding="utf-8")
+    assert after == before
+
+    # the attempt itself must still load as 'resolved', unaffected
+    reloaded = load_execution_attempt(tmp_path, attempt.id)
+    assert reloaded.status == "resolved"
 
 
 # --- rejected transitions ---
@@ -285,7 +365,7 @@ def test_started_to_succeeded_is_rejected(tmp_path):
     attempt = _begin(tmp_path)
 
     with pytest.raises(ValueError):
-        mark_succeeded(tmp_path, attempt.id)
+        mark_succeeded(tmp_path, attempt.id, operation_ids=())
 
 
 def test_started_to_execution_failed_is_rejected(tmp_path):
@@ -311,7 +391,7 @@ def test_resolved_to_resolution_failed_is_rejected(tmp_path):
         ),
         lambda tmp_path, attempt_id: (
             mark_resolved(tmp_path, attempt_id, resolved=_snapshot()),
-            mark_succeeded(tmp_path, attempt_id),
+            mark_succeeded(tmp_path, attempt_id, operation_ids=()),
         ),
     ],
     ids=["resolution_failed", "succeeded"],
@@ -332,7 +412,7 @@ def test_terminal_attempt_rejects_mark_resolved(tmp_path, terminal_transition):
         ),
         lambda tmp_path, attempt_id: (
             mark_resolved(tmp_path, attempt_id, resolved=_snapshot()),
-            mark_succeeded(tmp_path, attempt_id),
+            mark_succeeded(tmp_path, attempt_id, operation_ids=()),
         ),
     ],
     ids=["resolution_failed", "succeeded"],
@@ -342,7 +422,7 @@ def test_terminal_attempt_rejects_mark_succeeded(tmp_path, terminal_transition):
     terminal_transition(tmp_path, attempt.id)
 
     with pytest.raises(ValueError):
-        mark_succeeded(tmp_path, attempt.id)
+        mark_succeeded(tmp_path, attempt.id, operation_ids=())
 
 
 def test_resolved_to_resolved_again_is_rejected(tmp_path):
@@ -358,7 +438,7 @@ def test_unknown_attempt_transition_raises_file_not_found(tmp_path):
         mark_resolved(tmp_path, "does-not-exist", resolved=_snapshot())
 
     with pytest.raises(FileNotFoundError):
-        mark_succeeded(tmp_path, "does-not-exist")
+        mark_succeeded(tmp_path, "does-not-exist", operation_ids=())
 
 
 # --- transition preserves identity/requested/atomicity ---
@@ -368,14 +448,19 @@ def test_transition_preserves_immutable_identity_fields(tmp_path):
     attempt = _begin(tmp_path)
 
     resolved = mark_resolved(tmp_path, attempt.id, resolved=_snapshot())
-    succeeded = mark_succeeded(tmp_path, attempt.id)
+    succeeded = mark_succeeded(tmp_path, attempt.id, operation_ids=("t1",))
 
     for later in (resolved, succeeded):
         assert later.id == attempt.id
         assert later.operation_type == attempt.operation_type
-        assert later.operation_ids == attempt.operation_ids
         assert later.schema_version == attempt.schema_version
         assert later.created_at == attempt.created_at
+
+    # operation_ids itself is the one field that legitimately changes -
+    # None through 'started'/'resolved', only assigned at 'succeeded'.
+    assert attempt.operation_ids is None
+    assert resolved.operation_ids is None
+    assert succeeded.operation_ids == ("t1",)
 
 
 def test_transition_preserves_requested_policy(tmp_path):
@@ -402,20 +487,43 @@ def test_transition_overwrites_the_same_file_atomically(tmp_path):
     assert data["status"] == "resolved"
 
 
+def test_serialization_distinguishes_none_from_empty_tuple(tmp_path):
+    """None (not yet known) and an empty tuple (known: no results) must
+    round-trip as distinguishable YAML values, not collapse into the
+    same on-disk representation."""
+
+    attempt = _begin(tmp_path)
+    started_file = tmp_path / "scientific" / "execution_attempts" / f"{attempt.id}.yaml"
+    started_data = yaml.safe_load(started_file.read_text(encoding="utf-8"))
+    assert started_data["operation_ids"] is None
+
+    mark_resolved(tmp_path, attempt.id, resolved=_snapshot())
+    succeeded = mark_succeeded(tmp_path, attempt.id, operation_ids=())
+
+    succeeded_data = yaml.safe_load(started_file.read_text(encoding="utf-8"))
+    assert succeeded_data["operation_ids"] == []
+
+    reloaded = load_execution_attempt(tmp_path, attempt.id)
+    assert reloaded.operation_ids == ()
+    assert reloaded.operation_ids is not None
+    assert reloaded == succeeded
+
+
 # --- central semantic guarantee: attempts never touch transformations ---
 
 
-def test_begin_does_not_require_an_existing_state_transformation_record(tmp_path):
-    """The whole point of an attempt: it may target an operation_id that
-    no StateTransformationRecord has ever been registered under."""
+def test_begin_does_not_require_or_create_any_state_transformation_record(tmp_path):
+    """The whole point of an attempt: it targets no id at all until it
+    succeeds, and even then, none of those ids need to pre-exist as a
+    StateTransformationRecord."""
 
     transformations_dir = tmp_path / "scientific" / "transformations"
     assert not transformations_dir.exists()
 
-    attempt = _begin(tmp_path, operation_id="t-does-not-exist-yet")
+    attempt = _begin(tmp_path)
 
-    assert attempt.operation_ids == ("t-does-not-exist-yet",)
-    assert not (transformations_dir / "t-does-not-exist-yet.yaml").exists()
+    assert attempt.operation_ids is None
+    assert not transformations_dir.exists()
 
 
 def test_lifecycle_never_creates_a_state_transformation_record(tmp_path):
@@ -423,13 +531,29 @@ def test_lifecycle_never_creates_a_state_transformation_record(tmp_path):
     scientific/transformations - Increment 015 registers intent and a
     state machine only, never a transformation."""
 
-    attempt = _begin(tmp_path, operation_id="t-never-created")
+    attempt = _begin(tmp_path)
     mark_resolved(tmp_path, attempt.id, resolved=_snapshot())
-    mark_succeeded(tmp_path, attempt.id)
+    mark_succeeded(tmp_path, attempt.id, operation_ids=("t-never-created",))
 
     transformations_dir = tmp_path / "scientific" / "transformations"
     assert not transformations_dir.exists()
     assert not (transformations_dir / "t-never-created.yaml").exists()
+
+
+def test_lifecycle_with_multiple_operation_ids_never_creates_any_transformation(tmp_path):
+    """Extends the single-id lifecycle test to the multi-target case: a
+    full begin -> resolve -> succeed lifecycle reporting several
+    operation_ids must still never write any of them into
+    scientific/transformations."""
+
+    attempt = _begin(tmp_path)
+    mark_resolved(tmp_path, attempt.id, resolved=_snapshot())
+    mark_succeeded(tmp_path, attempt.id, operation_ids=("t-a", "t-b", "t-c"))
+
+    transformations_dir = tmp_path / "scientific" / "transformations"
+    assert not transformations_dir.exists()
+    for operation_id in ("t-a", "t-b", "t-c"):
+        assert not (transformations_dir / f"{operation_id}.yaml").exists()
 
 
 def test_mark_succeeded_does_not_verify_any_declared_operation_id_resolves_to_a_transformation(
@@ -439,24 +563,25 @@ def test_mark_succeeded_does_not_verify_any_declared_operation_id_resolves_to_a_
     intended operation completed - it never checks that a
     StateTransformationRecord actually exists at any of operation_ids,
     since no producer of one exists in this increment. This is
-    deliberately exercised with *several* declared operation_ids, not
-    just one: D-015-11's original wording read as a per-record guarantee
-    tied to a single target, but the guarantee (or rather, its absence
-    here) is identical no matter how many ids one attempt declares.
-    Reconciling this belief with real StateTransformationRecords
-    (registering every one of them *before* ever calling mark_succeeded)
-    is a caller contract this increment deliberately places on Increment
-    016's future orchestrating Application Service - see the D-015-11
-    amendment in execution_registry.py's module docstring - not
-    something this registry enforces or could enforce without coupling
-    it to a producer that does not yet exist."""
+    deliberately exercised with *several* ids, not just one: the
+    guarantee (or rather, its absence here) is identical no matter how
+    many ids one attempt reports. Reconciling this belief with real
+    StateTransformationRecords (registering every one of them *before*
+    ever calling mark_succeeded) is a caller contract this increment
+    deliberately places on Increment 016's future orchestrating
+    Application Service - see the D-015-11/D-015-12 amendment in
+    execution_registry.py's module docstring - not something this
+    registry enforces or could enforce without coupling it to a producer
+    that does not yet exist."""
 
-    attempt = _begin(
-        tmp_path, operation_ids=("t-never-registered-1", "t-never-registered-2", "t-never-registered-3")
-    )
+    attempt = _begin(tmp_path)
     mark_resolved(tmp_path, attempt.id, resolved=_snapshot())
 
-    succeeded = mark_succeeded(tmp_path, attempt.id)
+    succeeded = mark_succeeded(
+        tmp_path,
+        attempt.id,
+        operation_ids=("t-never-registered-1", "t-never-registered-2", "t-never-registered-3"),
+    )
 
     assert succeeded.status == "succeeded"
     assert succeeded.operation_ids == (
@@ -481,16 +606,16 @@ def test_begin_rejects_a_colliding_generated_attempt_id(tmp_path, monkeypatch):
     fixed_uuid = uuid.uuid4()
     monkeypatch.setattr(uuid, "uuid4", lambda: fixed_uuid)
 
-    first = _begin(tmp_path, operation_id="t-one")
+    first = _begin(tmp_path)
 
     with pytest.raises(ExecutionAttemptIdentityConflictError):
-        _begin(tmp_path, operation_id="t-two")
+        _begin(tmp_path)
 
     # the original attempt must be completely unaffected by the rejected
     # collision - not partially overwritten, not gone.
     reloaded = load_execution_attempt(tmp_path, first.id)
     assert reloaded == first
-    assert reloaded.operation_ids == ("t-one",)
+    assert reloaded.operation_ids is None
 
 
 def test_mark_resolved_still_overwrites_the_same_attempts_own_file_after_collision_guard(

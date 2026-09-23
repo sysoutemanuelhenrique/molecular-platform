@@ -44,7 +44,7 @@ def _started_attempt(**overrides):
         "schema_version": "1.0",
         "id": "attempt0001",
         "operation_type": "state-transformation",
-        "operation_ids": ("t-future-001",),
+        "operation_ids": None,
         "status": "started",
         "requested": _policy(),
         "resolved": None,
@@ -218,30 +218,7 @@ def test_execution_attempt_valid_started():
     assert attempt.status == "started"
     assert attempt.resolved is None
     assert attempt.error is None
-
-
-def test_execution_attempt_rejects_malformed_operation_ids_entry():
-    with pytest.raises(ValidationError):
-        _started_attempt(operation_ids=("bad id",))
-
-
-def test_execution_attempt_accepts_multiple_operation_ids():
-    """A single attempt (one engine invocation) may target more than one
-    resulting StateTransformationRecord - e.g. tautomer enumeration
-    fanning out into several new states from one parent."""
-
-    attempt = _started_attempt(operation_ids=("t1", "t2", "t3"))
-    assert attempt.operation_ids == ("t1", "t2", "t3")
-
-
-def test_execution_attempt_rejects_empty_operation_ids():
-    with pytest.raises(ValidationError):
-        _started_attempt(operation_ids=())
-
-
-def test_execution_attempt_rejects_duplicate_operation_ids():
-    with pytest.raises(ValidationError):
-        _started_attempt(operation_ids=("t1", "t1"))
+    assert attempt.operation_ids is None
 
 
 def test_execution_attempt_rejects_malformed_id():
@@ -262,7 +239,6 @@ def test_execution_attempt_rejects_extra_field():
             schema_version="1.0",
             id="attempt0001",
             operation_type="state-transformation",
-            operation_ids=("t-future-001",),
             status="started",
             requested=_policy(),
             created_at=datetime.now(timezone.utc),
@@ -296,6 +272,11 @@ def test_started_invariants_enforced():
     with pytest.raises(ValidationError):
         _started_attempt(finished_at=datetime.now(timezone.utc))
 
+    # operation_ids is only ever assigned by mark_succeeded - a 'started'
+    # attempt declaring it is a timing violation, not a valid state.
+    with pytest.raises(ValidationError):
+        _started_attempt(operation_ids=("t1",))
+
 
 def test_resolution_failed_invariants_enforced():
     from datetime import datetime, timezone
@@ -308,6 +289,7 @@ def test_resolution_failed_invariants_enforced():
         finished_at=now,
     )
     assert valid.status == "resolution_failed"
+    assert valid.operation_ids is None
 
     # resolved must be None
     with pytest.raises(ValidationError):
@@ -343,6 +325,15 @@ def test_resolution_failed_invariants_enforced():
     with pytest.raises(ValidationError):
         _started_attempt(status="resolution_failed", error=_error(phase="resolution"))
 
+    # operation_ids never applies to a failure that never resolved
+    with pytest.raises(ValidationError):
+        _started_attempt(
+            status="resolution_failed",
+            error=_error(phase="resolution"),
+            finished_at=now,
+            operation_ids=("t1",),
+        )
+
 
 def test_resolved_invariants_enforced():
     from datetime import datetime, timezone
@@ -351,6 +342,7 @@ def test_resolved_invariants_enforced():
 
     valid = _started_attempt(status="resolved", resolved=_snapshot(), resolved_at=now)
     assert valid.status == "resolved"
+    assert valid.operation_ids is None
 
     # resolved is required
     with pytest.raises(ValidationError):
@@ -372,6 +364,13 @@ def test_resolved_invariants_enforced():
             status="resolved", resolved=_snapshot(), resolved_at=now, finished_at=now
         )
 
+    # operation_ids is not yet knowable at 'resolved' - execution has not
+    # run yet, only its configuration has been determined.
+    with pytest.raises(ValidationError):
+        _started_attempt(
+            status="resolved", resolved=_snapshot(), resolved_at=now, operation_ids=("t1",)
+        )
+
 
 def test_execution_failed_invariants_enforced():
     from datetime import datetime, timezone
@@ -386,6 +385,7 @@ def test_execution_failed_invariants_enforced():
         finished_at=now,
     )
     assert valid.status == "execution_failed"
+    assert valid.operation_ids is None
 
     # resolved is required
     with pytest.raises(ValidationError):
@@ -430,6 +430,17 @@ def test_execution_failed_invariants_enforced():
             resolved_at=now,
         )
 
+    # this increment declares no partial results on execution failure
+    with pytest.raises(ValidationError):
+        _started_attempt(
+            status="execution_failed",
+            resolved=_snapshot(),
+            error=_error(phase="execution"),
+            resolved_at=now,
+            finished_at=now,
+            operation_ids=("t1",),
+        )
+
 
 def test_succeeded_invariants_enforced():
     from datetime import datetime, timezone
@@ -437,13 +448,20 @@ def test_succeeded_invariants_enforced():
     now = datetime.now(timezone.utc)
 
     valid = _started_attempt(
-        status="succeeded", resolved=_snapshot(), resolved_at=now, finished_at=now
+        status="succeeded",
+        resolved=_snapshot(),
+        resolved_at=now,
+        finished_at=now,
+        operation_ids=(),
     )
     assert valid.status == "succeeded"
+    assert valid.operation_ids == ()
 
     # resolved is required
     with pytest.raises(ValidationError):
-        _started_attempt(status="succeeded", resolved_at=now, finished_at=now)
+        _started_attempt(
+            status="succeeded", resolved_at=now, finished_at=now, operation_ids=()
+        )
 
     # error must be None
     with pytest.raises(ValidationError):
@@ -452,13 +470,104 @@ def test_succeeded_invariants_enforced():
             resolved=_snapshot(),
             resolved_at=now,
             finished_at=now,
+            operation_ids=(),
             error=_error(),
         )
 
     # resolved_at is required
     with pytest.raises(ValidationError):
-        _started_attempt(status="succeeded", resolved=_snapshot(), finished_at=now)
+        _started_attempt(
+            status="succeeded", resolved=_snapshot(), finished_at=now, operation_ids=()
+        )
 
     # finished_at is required
     with pytest.raises(ValidationError):
-        _started_attempt(status="succeeded", resolved=_snapshot(), resolved_at=now)
+        _started_attempt(
+            status="succeeded", resolved=_snapshot(), resolved_at=now, operation_ids=()
+        )
+
+    # operation_ids is required - this is the one status where it must be
+    # set, precisely because it is the one status where the result is
+    # actually known.
+    with pytest.raises(ValidationError):
+        _started_attempt(status="succeeded", resolved=_snapshot(), resolved_at=now, finished_at=now)
+
+
+# --- ExecutionAttempt: operation_ids only exists once succeeded ---
+
+
+def test_succeeded_accepts_empty_operation_ids():
+    """An empty tuple is a valid, meaningful result: the operation
+    completed but produced no new transformations."""
+
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    attempt = _started_attempt(
+        status="succeeded",
+        resolved=_snapshot(),
+        resolved_at=now,
+        finished_at=now,
+        operation_ids=(),
+    )
+    assert attempt.operation_ids == ()
+
+
+def test_succeeded_accepts_single_operation_id():
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    attempt = _started_attempt(
+        status="succeeded",
+        resolved=_snapshot(),
+        resolved_at=now,
+        finished_at=now,
+        operation_ids=("t1",),
+    )
+    assert attempt.operation_ids == ("t1",)
+
+
+def test_succeeded_accepts_multiple_operation_ids():
+    """One attempt (one engine invocation) may report more than one
+    resulting StateTransformationRecord id - e.g. tautomer enumeration
+    fanning out into several new states from one parent."""
+
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    attempt = _started_attempt(
+        status="succeeded",
+        resolved=_snapshot(),
+        resolved_at=now,
+        finished_at=now,
+        operation_ids=("t1", "t2", "t3"),
+    )
+    assert attempt.operation_ids == ("t1", "t2", "t3")
+
+
+def test_succeeded_rejects_malformed_operation_ids_entry():
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    with pytest.raises(ValidationError):
+        _started_attempt(
+            status="succeeded",
+            resolved=_snapshot(),
+            resolved_at=now,
+            finished_at=now,
+            operation_ids=("bad id",),
+        )
+
+
+def test_succeeded_rejects_duplicate_operation_ids():
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    with pytest.raises(ValidationError):
+        _started_attempt(
+            status="succeeded",
+            resolved=_snapshot(),
+            resolved_at=now,
+            finished_at=now,
+            operation_ids=("t1", "t1"),
+        )
