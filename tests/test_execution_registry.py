@@ -15,6 +15,7 @@ from molecular.execution import (
     TautomerEnumerationPolicy,
 )
 from molecular.execution_registry import (
+    ExecutionAttemptIdentityConflictError,
     begin_execution_attempt,
     load_execution_attempt,
     mark_execution_failed,
@@ -371,3 +372,62 @@ def test_lifecycle_never_creates_a_state_transformation_record(tmp_path):
     transformations_dir = tmp_path / "scientific" / "transformations"
     assert not transformations_dir.exists()
     assert not (transformations_dir / "t-never-created.yaml").exists()
+
+
+def test_mark_succeeded_does_not_verify_operation_id_resolves_to_a_transformation(tmp_path):
+    """mark_succeeded records only the platform's own belief that its
+    intended operation completed - it never checks that a
+    StateTransformationRecord actually exists at operation_id, since no
+    producer of one exists in this increment. Reconciling that belief
+    with a real StateTransformationRecord (registering it *before* ever
+    calling mark_succeeded) is an obligation this increment deliberately
+    places on Increment 016's future orchestrating Application Service,
+    not something this registry enforces or ever could enforce here
+    without coupling it to a producer that does not yet exist."""
+
+    attempt = _begin(tmp_path, operation_id="t-never-registered")
+    mark_resolved(tmp_path, attempt.id, resolved=_snapshot())
+
+    succeeded = mark_succeeded(tmp_path, attempt.id)
+
+    assert succeeded.status == "succeeded"
+    transformations_dir = tmp_path / "scientific" / "transformations"
+    assert not (transformations_dir / "t-never-registered.yaml").exists()
+
+
+def test_begin_rejects_a_colliding_generated_attempt_id(tmp_path, monkeypatch):
+    """A uuid4 collision is astronomically unlikely in practice, but
+    begin_execution_attempt must never silently overwrite a pre-existing
+    attempt file if it happens: atomic_write_text's underlying
+    os.replace() replaces an existing destination unconditionally, with
+    no existence check of its own, so this registry must guard its own
+    create path explicitly."""
+
+    fixed_uuid = uuid.uuid4()
+    monkeypatch.setattr(uuid, "uuid4", lambda: fixed_uuid)
+
+    first = _begin(tmp_path, operation_id="t-one")
+
+    with pytest.raises(ExecutionAttemptIdentityConflictError):
+        _begin(tmp_path, operation_id="t-two")
+
+    # the original attempt must be completely unaffected by the rejected
+    # collision - not partially overwritten, not gone.
+    reloaded = load_execution_attempt(tmp_path, first.id)
+    assert reloaded == first
+    assert reloaded.operation_id == "t-one"
+
+
+def test_mark_resolved_still_overwrites_the_same_attempts_own_file_after_collision_guard(
+    tmp_path,
+):
+    """The create-only collision guard in begin_execution_attempt must
+    never interfere with a transition's own, expected overwrite of that
+    same attempt's file."""
+
+    attempt = _begin(tmp_path)
+
+    resolved = mark_resolved(tmp_path, attempt.id, resolved=_snapshot())
+
+    assert resolved.id == attempt.id
+    assert resolved.status == "resolved"

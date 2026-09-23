@@ -9,7 +9,12 @@ writes, the same shape as molecular.scientific_registry.register_entity.
 begin_execution_attempt never creates, requires, or checks for a
 StateTransformationRecord at operation_id: an attempt starts before the
 transformation it aims to produce exists, by design. Nothing in this
-module writes to project_dir/scientific/transformations.
+module writes to project_dir/scientific/transformations. Symmetrically,
+mark_succeeded never verifies that a StateTransformationRecord now exists
+at operation_id either - see its own docstring below, and
+ExecutionAttempt's docstring in molecular.execution, for the obligation
+this places on whatever future caller (Increment 016's orchestrating
+Application Service) marks an attempt succeeded.
 
 Every transition (mark_resolved, mark_resolution_failed,
 mark_execution_failed, mark_succeeded) follows the same protocol: load the
@@ -27,7 +32,7 @@ from pathlib import Path
 
 import yaml
 
-from molecular.atomic import atomic_write_text
+from molecular.atomic import atomic_write_text, check_storage_identity_conflict
 from molecular.execution import (
     ExecutionAttempt,
     ExecutionAttemptError,
@@ -37,6 +42,19 @@ from molecular.execution import (
 from molecular.inputs import validate_input_id
 
 _SUPPORTED_OPERATION_TYPES = ("state-transformation",)
+
+
+class ExecutionAttemptIdentityConflictError(FileExistsError):
+    """Raised if a freshly generated attempt id (a uuid4 hex) collides
+    with an already-persisted attempt - astronomically unlikely given
+    uuid4's randomness, but begin_execution_attempt must never silently
+    overwrite a pre-existing attempt file the way an unguarded
+    atomic_write_text call would (os.replace() replaces its destination
+    unconditionally, with no existence check of its own). This is a
+    create-only guard: it applies solely to begin_execution_attempt's own
+    initial write. The four mark_* transitions are expected, intended
+    overwrites of that same attempt's own file and are not - and must
+    not be - guarded by this check."""
 
 
 def _execution_attempts_dir(project_dir: Path) -> Path:
@@ -74,9 +92,21 @@ def begin_execution_attempt(
 
     validate_input_id(operation_id)
 
+    attempts_dir = _execution_attempts_dir(project_dir)
+    attempt_id = uuid.uuid4().hex
+
+    # Guard the create path only: refuse to silently clobber a
+    # pre-existing attempt file on the astronomically unlikely event of a
+    # uuid4 collision. atomic_write_text's underlying os.replace() would
+    # otherwise overwrite an existing destination unconditionally, with
+    # no existence check of its own.
+    check_storage_identity_conflict(
+        attempts_dir, attempt_id, conflict_error=ExecutionAttemptIdentityConflictError
+    )
+
     attempt = ExecutionAttempt(
         schema_version="1.0",
-        id=uuid.uuid4().hex,
+        id=attempt_id,
         operation_type=operation_type,
         operation_id=operation_id,
         status="started",
@@ -232,6 +262,20 @@ def mark_succeeded(project_dir: Path, attempt_id: str) -> ExecutionAttempt:
     its resolved snapshot and resolved_at.
 
     Only a 'resolved' attempt may succeed.
+
+    IMPORTANT: this function does not check, and cannot check without
+    coupling this module to a StateTransformationRecord producer that
+    does not exist in this increment, whether operation_id actually
+    resolves to a real StateTransformationRecord. Calling mark_succeeded
+    only records the platform's own belief that its intended operation
+    completed. Ensuring that belief is true - registering the
+    StateTransformationRecord at operation_id (e.g. via
+    register_state_transformation) *before* ever calling mark_succeeded,
+    never after - is an obligation this increment places on whatever
+    future caller orchestrates that ordering: in Increment 016, the
+    Application Service that resolves an adapter, executes the engine,
+    registers the resulting transformation, and only then marks the
+    attempt succeeded.
     """
 
     current = load_execution_attempt(project_dir, attempt_id)

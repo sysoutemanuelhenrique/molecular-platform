@@ -134,6 +134,53 @@ def test_resolved_execution_snapshot_is_immutable():
         snapshot.engine_name = "other"
 
 
+def test_resolved_execution_snapshot_parameters_cannot_be_mutated_in_place():
+    """model_config frozen=True only blocks reassigning the `parameters`
+    field itself (snapshot.parameters = {...}); it does nothing to stop
+    mutating a mutable dict already sitting in that field. `parameters`
+    must be a read-only MappingProxyType precisely to close that gap -
+    this is a distinct guarantee from test_..._is_immutable above, which
+    only proves top-level field reassignment is blocked."""
+
+    snapshot = _snapshot(parameters={"count": 5})
+
+    with pytest.raises(TypeError):
+        snapshot.parameters["count"] = 999
+
+    assert snapshot.parameters["count"] == 5
+
+
+def test_resolved_execution_snapshot_default_parameters_are_also_frozen():
+    """The empty default (no parameters passed at all) must be frozen
+    too, not just an explicitly-supplied dict."""
+
+    snapshot = ResolvedExecutionSnapshot(
+        schema_version="1.0", engine_name="rdkit", engine_version="2024.03"
+    )
+
+    with pytest.raises(TypeError):
+        snapshot.parameters["x"] = 1
+
+
+def test_resolved_execution_snapshot_parameters_round_trip_via_model_dump():
+    """Freezing parameters into a MappingProxyType must not change the
+    persisted shape: model_dump still produces a plain JSON-safe dict,
+    and re-validating it reconstructs an equal, still-frozen snapshot."""
+
+    snapshot = _snapshot(parameters={"count": 5, "flag": True, "label": "x", "ratio": 1.5})
+
+    dumped = snapshot.model_dump(mode="json")
+    assert dumped["parameters"] == {"count": 5, "flag": True, "label": "x", "ratio": 1.5}
+    assert isinstance(dumped["parameters"], dict)
+
+    reloaded = ResolvedExecutionSnapshot.model_validate(dumped)
+
+    assert reloaded == snapshot
+    assert dict(reloaded.parameters) == dict(snapshot.parameters)
+    with pytest.raises(TypeError):
+        reloaded.parameters["count"] = 0
+
+
 # --- ExecutionAttemptError ---
 
 
