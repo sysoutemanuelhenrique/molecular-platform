@@ -145,14 +145,28 @@ def begin_execution_attempt(
     *,
     operation_type: str,
     requested: TautomerEnumerationPolicy,
+    input_state_id: str,
 ) -> ExecutionAttempt:
-    """Begin a new ExecutionAttempt in status 'started'.
+    """Begin a new ExecutionAttempt in status 'started', schema_version
+    "1.1", declaring input_state_id as the MolecularState this attempt
+    operates on. input_state_id is validated via validate_input_id before
+    any I/O - including before attempt_id generation - exactly like
+    operation_type is validated today. This function never checks that
+    input_state_id resolves to an actually-registered MolecularState: that
+    check belongs to the Application Service's resolution phase (Section
+    15, step 2 of the frozen spec), which runs strictly after this
+    function returns.
 
-    Does not accept operation_ids: which StateTransformationRecords (if
-    any) this attempt actually produces is only known once execution
-    succeeds - see mark_succeeded and the D-015-11/D-015-12 amendment in
-    this module's docstring. The new attempt always starts with
+    Does not accept operation_ids, for the same D-015-11/D-015-12 timing
+    reason already documented in this module: which StateTransformationRecords
+    (if any) this attempt produces is only known once execution succeeds -
+    see mark_succeeded. The new attempt always starts with
     operation_ids=None.
+
+    This supersedes the Increment 015 signature, which accepted no
+    input_state_id at all and always produced schema_version="1.0". Every
+    new attempt created by this function is schema_version="1.1"; this
+    function never constructs a "1.0" attempt.
     """
 
     if operation_type not in _SUPPORTED_OPERATION_TYPES:
@@ -160,6 +174,8 @@ def begin_execution_attempt(
             f"'{operation_type}' is not a supported operation_type "
             f"(supported: {', '.join(_SUPPORTED_OPERATION_TYPES)})"
         )
+
+    validate_input_id(input_state_id)
 
     attempts_dir = _execution_attempts_dir(project_dir)
     attempt_id = uuid.uuid4().hex
@@ -174,9 +190,10 @@ def begin_execution_attempt(
     )
 
     attempt = ExecutionAttempt(
-        schema_version="1.0",
+        schema_version="1.1",
         id=attempt_id,
         operation_type=operation_type,
+        input_state_id=input_state_id,
         operation_ids=None,
         status="started",
         requested=requested,
@@ -231,6 +248,7 @@ def mark_resolved(
         schema_version=current.schema_version,
         id=current.id,
         operation_type=current.operation_type,
+        input_state_id=current.input_state_id,
         operation_ids=None,
         status="resolved",
         requested=current.requested,
@@ -271,6 +289,7 @@ def mark_resolution_failed(
         schema_version=current.schema_version,
         id=current.id,
         operation_type=current.operation_type,
+        input_state_id=current.input_state_id,
         operation_ids=None,
         status="resolution_failed",
         requested=current.requested,
@@ -311,6 +330,7 @@ def mark_execution_failed(
         schema_version=current.schema_version,
         id=current.id,
         operation_type=current.operation_type,
+        input_state_id=current.input_state_id,
         operation_ids=None,
         status="execution_failed",
         requested=current.requested,
@@ -373,6 +393,7 @@ def mark_succeeded(
         schema_version=current.schema_version,
         id=current.id,
         operation_type=current.operation_type,
+        input_state_id=current.input_state_id,
         operation_ids=tuple(operation_ids),
         status="succeeded",
         requested=current.requested,

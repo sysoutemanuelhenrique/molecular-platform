@@ -48,6 +48,8 @@ ExecutionStatus = Literal[
     "succeeded",
 ]
 
+ExecutionAttemptSchemaVersion = Literal["1.0", "1.1"]
+
 
 class TautomerEnumerationPolicy(BaseModel):
     """A scientist's declared policy for tautomer enumeration.
@@ -64,6 +66,16 @@ class TautomerEnumerationPolicy(BaseModel):
 
     schema_version: Literal["1.0"]
     max_states: Optional[int] = None
+    """max_states é o teto opcional de novos MolecularStates publicados
+    após a enumeração ter concluído (status=Completed), a sanitização e a
+    verificação de invariantes químicos de cada candidato, a deduplicação
+    por SMILES canônico isomérico, a exclusão do estado equivalente à
+    entrada, e a ordenação determinística. Ele não limita a busca interna
+    do motor e não é mapeado para maxTautomers ou maxTransforms do RDKit.
+    None significa que o cientista não declarou teto algum - não que algum
+    default numérico da plataforma se aplica; este módulo não carrega
+    nenhum default científico para quantos tautômeros enumerar, e nenhum é
+    inventado aqui."""
     source: Literal["scientist"]
 
     @field_validator("max_states")
@@ -147,15 +159,32 @@ class ResolvedExecutionSnapshot(BaseModel):
 
 class ExecutionAttemptError(BaseModel):
     """The provenance of a failure at one specific phase of an execution
-    attempt. Deliberately carries only a phase and a human-readable
-    message - no traceback or exception object, matching the level of
-    detail already carried by other provenance records in this domain
-    (e.g. StateTransformationRecord's method_description)."""
+    attempt. Carries a phase and a human-readable message - no traceback
+    or exception object, matching the level of detail already carried by
+    other provenance records in this domain (e.g.
+    StateTransformationRecord's method_description) - plus, since
+    Increment 016, two residual-id tuples (Section 10.4 of the frozen
+    spec) recording ids that best-effort compensation (Section 17.3)
+    attempted to remove but could not confirm as removed.
+
+    residual_state_ids/residual_operation_ids are permitted only when
+    phase == "execution" (nothing can have been published before
+    resolution, so a 'resolution'-phase error can never carry residuals);
+    every id is independently validated and duplicate-free within its own
+    tuple. This model has no access to the enclosing ExecutionAttempt's
+    schema_version - it validates only its own internal content. The
+    cross-check that a schema_version="1.0" attempt's error must never
+    carry residuals at all belongs to ExecutionAttempt._validate_status_
+    invariants (Section 13 of the frozen spec), not here - see that
+    validator's own docstring for the full separation of responsibilities.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     phase: Literal["resolution", "execution"]
     message: str = Field(min_length=1)
+    residual_state_ids: tuple[str, ...] = ()
+    residual_operation_ids: tuple[str, ...] = ()
 
     @field_validator("message")
     @classmethod
@@ -164,9 +193,43 @@ class ExecutionAttemptError(BaseModel):
             raise ValueError("message must not be blank")
         return value
 
+    @model_validator(mode="after")
+    def _validate_residuals(self) -> "ExecutionAttemptError":
+        for id_value in (*self.residual_state_ids, *self.residual_operation_ids):
+            validate_input_id(id_value)
+
+        if len(set(self.residual_state_ids)) != len(self.residual_state_ids):
+            raise ValueError("residual_state_ids must not contain duplicate entries")
+        if len(set(self.residual_operation_ids)) != len(self.residual_operation_ids):
+            raise ValueError("residual_operation_ids must not contain duplicate entries")
+
+        if self.phase == "resolution":
+            if self.residual_state_ids or self.residual_operation_ids:
+                raise ValueError(
+                    "a 'resolution'-phase error must not carry any residual ids "
+                    "(nothing can have been published before resolution)"
+                )
+
+        return self
+
 
 class ExecutionAttempt(BaseModel):
     """One attempt by the platform to execute a named scientific operation.
+
+    schema_version accepts "1.0" or "1.1" (Increment 016, Section 10.1 of
+    the frozen spec). Only this model is versioned by that change -
+    TautomerEnumerationPolicy and ResolvedExecutionSnapshot remain
+    exclusively schema_version="1.0", unaffected. Every new attempt this
+    codebase creates is schema_version="1.1"; "1.0" documents persisted by
+    Increment 015 remain readable, unmigrated, forever.
+
+    input_state_id (new in "1.1") declares, from the moment the attempt is
+    created (status "started"), which MolecularState the operation acts
+    upon - a sujeito auditável even for an attempt that never reaches the
+    engine. It is None for every "1.0" attempt (the field predates it) and
+    non-None, identical across every status, for every "1.1" attempt - see
+    _validate_status_invariants below for the enforced cross-check
+    (Section 10.3 of the frozen spec).
 
     operation_ids names the StateTransformationRecord ids this attempt
     actually produced. It is `None` for every status except "succeeded":
@@ -201,17 +264,25 @@ class ExecutionAttempt(BaseModel):
     previous one, never by mutating this object.
 
     The `_validate_status_invariants` model validator below is this
-    model's only enforcement of the state machine's per-status shape; the
-    state *machine* itself (which transitions are reachable from which)
-    is enforced by execution_registry.py, not here - this model only ever
-    validates that one given snapshot is internally consistent.
+    model's only enforcement of the state machine's per-status shape, PLUS
+    (since Increment 016) the schema_version x status x input_state_id
+    cross-check (Section 10.3) and the schema_version x residuals
+    cross-check (Section 12) - both necessarily live here, not on
+    ExecutionAttemptError, because both depend on schema_version, a field
+    ExecutionAttemptError does not have and must never be given just to
+    duplicate a check that belongs at this level (Section 13 of the frozen
+    spec). The state *machine* itself (which transitions are reachable
+    from which) is enforced by execution_registry.py, not here - this
+    model only ever validates that one given snapshot is internally
+    consistent.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal["1.0"]
+    schema_version: ExecutionAttemptSchemaVersion
     id: str = Field(min_length=1)
     operation_type: Literal["state-transformation"]
+    input_state_id: Optional[str] = None
     operation_ids: Optional[tuple[str, ...]] = None
     status: ExecutionStatus
     requested: TautomerEnumerationPolicy
@@ -224,6 +295,13 @@ class ExecutionAttempt(BaseModel):
     @field_validator("id")
     @classmethod
     def _validate_id_format(cls, value: str) -> str:
+        return validate_input_id(value)
+
+    @field_validator("input_state_id")
+    @classmethod
+    def _validate_input_state_id_format(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
         return validate_input_id(value)
 
     @field_validator("operation_ids")
@@ -241,6 +319,28 @@ class ExecutionAttempt(BaseModel):
 
     @model_validator(mode="after")
     def _validate_status_invariants(self) -> "ExecutionAttempt":
+        # --- schema_version x input_state_id (Section 10.3) ---
+        if self.schema_version == "1.0":
+            if self.input_state_id is not None:
+                raise ValueError(
+                    "a schema_version '1.0' attempt must not carry input_state_id "
+                    "(it predates this field)"
+                )
+        else:  # "1.1"
+            if self.input_state_id is None:
+                raise ValueError(
+                    "a schema_version '1.1' attempt must carry a non-null "
+                    "input_state_id in every status"
+                )
+
+        # --- schema_version x residuals (Section 12) ---
+        if self.schema_version == "1.0" and self.error is not None:
+            if self.error.residual_state_ids or self.error.residual_operation_ids:
+                raise ValueError(
+                    "a schema_version '1.0' attempt's error must not carry "
+                    "residual ids (residuals did not exist in this schema)"
+                )
+
         if self.status == "started":
             if self.resolved is not None:
                 raise ValueError("a 'started' attempt must not have a resolved snapshot")

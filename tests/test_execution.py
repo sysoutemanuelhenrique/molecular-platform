@@ -571,3 +571,339 @@ def test_succeeded_rejects_duplicate_operation_ids():
             finished_at=now,
             operation_ids=("t1", "t1"),
         )
+
+
+# --- Increment 016: schema_version 1.1, input_state_id, residuals ---
+
+
+def _started_attempt_11(**overrides):
+    """Same shape as _started_attempt, but schema_version="1.1" with a
+    valid input_state_id - the shape every new attempt actually uses."""
+
+    fields = {"schema_version": "1.1", "input_state_id": "state0001"}
+    fields.update(overrides)
+    return _started_attempt(**fields)
+
+
+def _error_with_residuals(**overrides):
+    fields = {
+        "phase": "execution",
+        "message": "compensation could not confirm removal",
+        "residual_state_ids": ("state0002",),
+        "residual_operation_ids": ("transform0002",),
+    }
+    fields.update(overrides)
+    return ExecutionAttemptError(**fields)
+
+
+# --- ExecutionAttemptError: residuals (Section 10.4/10.5) ---
+
+
+def test_execution_attempt_error_resolution_phase_accepts_empty_residuals():
+    error = _error(phase="resolution")
+    assert error.residual_state_ids == ()
+    assert error.residual_operation_ids == ()
+
+
+def test_execution_attempt_error_resolution_phase_rejects_residual_state_ids():
+    with pytest.raises(ValidationError):
+        ExecutionAttemptError(
+            phase="resolution", message="x", residual_state_ids=("state0001",)
+        )
+
+
+def test_execution_attempt_error_resolution_phase_rejects_residual_operation_ids():
+    with pytest.raises(ValidationError):
+        ExecutionAttemptError(
+            phase="resolution", message="x", residual_operation_ids=("t1",)
+        )
+
+
+def test_execution_attempt_error_execution_phase_accepts_empty_residuals():
+    error = _error(phase="execution")
+    assert error.residual_state_ids == ()
+    assert error.residual_operation_ids == ()
+
+
+def test_execution_attempt_error_execution_phase_accepts_nonempty_residuals():
+    error = _error_with_residuals()
+    assert error.residual_state_ids == ("state0002",)
+    assert error.residual_operation_ids == ("transform0002",)
+
+
+def test_execution_attempt_error_rejects_malformed_residual_state_id():
+    with pytest.raises(ValidationError):
+        _error_with_residuals(residual_state_ids=("bad id",))
+
+
+def test_execution_attempt_error_rejects_malformed_residual_operation_id():
+    with pytest.raises(ValidationError):
+        _error_with_residuals(residual_operation_ids=("bad id",))
+
+
+def test_execution_attempt_error_rejects_duplicate_residual_state_ids():
+    with pytest.raises(ValidationError):
+        _error_with_residuals(residual_state_ids=("state0002", "state0002"))
+
+
+def test_execution_attempt_error_rejects_duplicate_residual_operation_ids():
+    with pytest.raises(ValidationError):
+        _error_with_residuals(residual_operation_ids=("transform0002", "transform0002"))
+
+
+def test_execution_attempt_error_legacy_dict_without_residual_fields_defaults_empty():
+    """A dict shaped like a pre-016 error (no residual fields at all) must
+    still validate, with both tuples defaulting empty - no migration or
+    reshaping is required to read a legacy record."""
+
+    error = ExecutionAttemptError.model_validate(
+        {"phase": "resolution", "message": "no engine available"}
+    )
+    assert error.residual_state_ids == ()
+    assert error.residual_operation_ids == ()
+
+
+# --- schema_version x status x input_state_id matrix (Section 10.3) ---
+
+
+@pytest.mark.parametrize("status", ["started", "resolution_failed", "resolved", "execution_failed", "succeeded"])
+def test_schema_1_0_accepts_none_input_state_id_in_every_status(status):
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    kwargs = {"schema_version": "1.0", "status": status}
+    if status in ("resolution_failed",):
+        kwargs.update(error=_error(phase="resolution"), finished_at=now)
+    elif status == "resolved":
+        kwargs.update(resolved=_snapshot(), resolved_at=now)
+    elif status == "execution_failed":
+        kwargs.update(
+            resolved=_snapshot(), error=_error(phase="execution"), resolved_at=now, finished_at=now
+        )
+    elif status == "succeeded":
+        kwargs.update(resolved=_snapshot(), resolved_at=now, finished_at=now, operation_ids=())
+
+    attempt = _started_attempt(**kwargs)
+    assert attempt.input_state_id is None
+
+
+@pytest.mark.parametrize("status", ["started", "resolution_failed", "resolved", "execution_failed", "succeeded"])
+def test_schema_1_0_rejects_non_none_input_state_id_in_every_status(status):
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    kwargs = {"schema_version": "1.0", "status": status, "input_state_id": "state0001"}
+    if status in ("resolution_failed",):
+        kwargs.update(error=_error(phase="resolution"), finished_at=now)
+    elif status == "resolved":
+        kwargs.update(resolved=_snapshot(), resolved_at=now)
+    elif status == "execution_failed":
+        kwargs.update(
+            resolved=_snapshot(), error=_error(phase="execution"), resolved_at=now, finished_at=now
+        )
+    elif status == "succeeded":
+        kwargs.update(resolved=_snapshot(), resolved_at=now, finished_at=now, operation_ids=())
+
+    with pytest.raises(ValidationError):
+        _started_attempt(**kwargs)
+
+
+@pytest.mark.parametrize("status", ["started", "resolution_failed", "resolved", "execution_failed", "succeeded"])
+def test_schema_1_1_requires_input_state_id_in_every_status(status):
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    kwargs = {"schema_version": "1.1", "status": status, "input_state_id": "state0001"}
+    if status in ("resolution_failed",):
+        kwargs.update(error=_error(phase="resolution"), finished_at=now)
+    elif status == "resolved":
+        kwargs.update(resolved=_snapshot(), resolved_at=now)
+    elif status == "execution_failed":
+        kwargs.update(
+            resolved=_snapshot(), error=_error(phase="execution"), resolved_at=now, finished_at=now
+        )
+    elif status == "succeeded":
+        kwargs.update(resolved=_snapshot(), resolved_at=now, finished_at=now, operation_ids=())
+
+    attempt = _started_attempt(**kwargs)
+    assert attempt.input_state_id == "state0001"
+
+
+@pytest.mark.parametrize("status", ["started", "resolution_failed", "resolved", "execution_failed", "succeeded"])
+def test_schema_1_1_rejects_none_input_state_id_in_every_status(status):
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    kwargs = {"schema_version": "1.1", "status": status, "input_state_id": None}
+    if status in ("resolution_failed",):
+        kwargs.update(error=_error(phase="resolution"), finished_at=now)
+    elif status == "resolved":
+        kwargs.update(resolved=_snapshot(), resolved_at=now)
+    elif status == "execution_failed":
+        kwargs.update(
+            resolved=_snapshot(), error=_error(phase="execution"), resolved_at=now, finished_at=now
+        )
+    elif status == "succeeded":
+        kwargs.update(resolved=_snapshot(), resolved_at=now, finished_at=now, operation_ids=())
+
+    with pytest.raises(ValidationError):
+        _started_attempt(**kwargs)
+
+
+def test_input_state_id_rejects_malformed_value():
+    with pytest.raises(ValidationError):
+        _started_attempt_11(input_state_id="bad id")
+
+
+# --- schema_version x residuals matrix (Section 12) ---
+
+
+def test_schema_1_0_execution_failed_rejects_residuals_on_error():
+    """schema_version='1.0' predates residuals entirely - even though
+    ExecutionAttemptError itself would accept them for an execution-phase
+    error in isolation, ExecutionAttempt._validate_status_invariants must
+    reject them when the enclosing attempt is schema '1.0'."""
+
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    with pytest.raises(ValidationError):
+        _started_attempt(
+            schema_version="1.0",
+            status="execution_failed",
+            resolved=_snapshot(),
+            error=_error_with_residuals(),
+            resolved_at=now,
+            finished_at=now,
+        )
+
+
+def test_schema_1_1_execution_failed_accepts_empty_residuals():
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    attempt = _started_attempt_11(
+        status="execution_failed",
+        resolved=_snapshot(),
+        error=_error(phase="execution"),
+        resolved_at=now,
+        finished_at=now,
+    )
+    assert attempt.error.residual_state_ids == ()
+    assert attempt.error.residual_operation_ids == ()
+
+
+def test_schema_1_1_execution_failed_accepts_nonempty_residuals():
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    attempt = _started_attempt_11(
+        status="execution_failed",
+        resolved=_snapshot(),
+        error=_error_with_residuals(),
+        resolved_at=now,
+        finished_at=now,
+    )
+    assert attempt.error.residual_state_ids == ("state0002",)
+    assert attempt.error.residual_operation_ids == ("transform0002",)
+
+
+@pytest.mark.parametrize("status", ["started", "resolved", "succeeded"])
+def test_error_free_statuses_reject_any_error_including_with_residuals(status):
+    """started/resolved/succeeded reject any error at all - including one
+    that would otherwise be a valid execution-phase error with residuals -
+    because these statuses require error=None outright."""
+
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    kwargs = {"status": status}
+    if status == "resolved":
+        kwargs.update(resolved=_snapshot(), resolved_at=now)
+    elif status == "succeeded":
+        kwargs.update(resolved=_snapshot(), resolved_at=now, finished_at=now, operation_ids=())
+
+    with pytest.raises(ValidationError):
+        _started_attempt_11(error=_error_with_residuals(), **kwargs)
+
+
+def test_succeeded_never_carries_residuals_because_error_is_none():
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    attempt = _started_attempt_11(
+        status="succeeded", resolved=_snapshot(), resolved_at=now, finished_at=now, operation_ids=()
+    )
+    assert attempt.error is None
+
+
+# --- round-trip and regression guards ---
+
+
+def test_round_trip_preserves_schema_version_input_state_id_and_residuals():
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    attempt = _started_attempt_11(
+        status="execution_failed",
+        resolved=_snapshot(),
+        error=_error_with_residuals(
+            residual_state_ids=("state0003", "state0002"),
+            residual_operation_ids=("transform0003", "transform0002"),
+        ),
+        resolved_at=now,
+        finished_at=now,
+    )
+
+    dumped = attempt.model_dump(mode="json")
+    reloaded = ExecutionAttempt.model_validate(dumped)
+
+    assert reloaded == attempt
+    assert reloaded.schema_version == "1.1"
+    assert reloaded.input_state_id == "state0001"
+    assert reloaded.error.residual_state_ids == ("state0003", "state0002")
+    assert reloaded.error.residual_operation_ids == ("transform0003", "transform0002")
+
+
+def test_load_legacy_1_0_attempt_without_input_state_id():
+    """A dict shaped like a pre-016 attempt (no input_state_id key at
+    all) must still validate as schema_version='1.0' with
+    input_state_id=None - no migration or reshaping required to read a
+    legacy record."""
+
+    from datetime import datetime, timezone
+
+    data = {
+        "schema_version": "1.0",
+        "id": "attempt0001",
+        "operation_type": "state-transformation",
+        "operation_ids": None,
+        "status": "started",
+        "requested": {"schema_version": "1.0", "max_states": None, "source": "scientist"},
+        "resolved": None,
+        "error": None,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "resolved_at": None,
+        "finished_at": None,
+    }
+    attempt = ExecutionAttempt.model_validate(data)
+    assert attempt.schema_version == "1.0"
+    assert attempt.input_state_id is None
+
+
+def test_tautomer_enumeration_policy_rejects_schema_version_1_1():
+    """Regression guard for D-016-DRAFT-01/Section 10.1: only
+    ExecutionAttempt is versioned by Increment 016."""
+
+    with pytest.raises(ValidationError):
+        TautomerEnumerationPolicy(schema_version="1.1", max_states=None, source="scientist")
+
+
+def test_resolved_execution_snapshot_rejects_schema_version_1_1():
+    """Regression guard for D-016-DRAFT-01/Section 10.1: only
+    ExecutionAttempt is versioned by Increment 016."""
+
+    with pytest.raises(ValidationError):
+        ResolvedExecutionSnapshot(
+            schema_version="1.1", engine_name="rdkit", engine_version="2026.03.6", parameters={}
+        )

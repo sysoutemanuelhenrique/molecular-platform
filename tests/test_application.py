@@ -1,23 +1,51 @@
-"""Direct tests for the PubChem ligand acquisition application service.
+"""Direct tests for the application services.
 
-These tests exercise register_ligand_from_pubchem directly - no CliRunner,
-no typer - to prove the orchestration itself: resolution order, activity
-logging counts, and cleanup guarantees. Business rules already covered by
+register_ligand_from_pubchem tests exercise the orchestration directly -
+no CliRunner, no typer - proving resolution order, activity logging
+counts, and cleanup guarantees. Business rules already covered by
 test_pubchem.py (HTTP/acquisition behavior) and test_registry.py
 (registration/identity-conflict behavior) are not repeated here.
+
+enumerate_state_tautomers tests (Increment 016, Section 20.4 of the frozen
+spec) use the private _resolve_engine/_enumerate injection seams with fake
+implementations - never real RDKit - to exercise orchestration, ordering,
+and compensation; the real RDKit adapter is covered separately, in
+test_rdkit_tautomer.py.
 """
+
+import importlib.util
+import subprocess
+import sys
 
 import pytest
 import yaml
 
 import molecular.application as application_module
-from molecular.application import InvalidPubChemCidError, register_ligand_from_pubchem
+from molecular.application import (
+    InvalidPubChemCidError,
+    enumerate_state_tautomers,
+    register_ligand_from_pubchem,
+)
 from molecular.context import (
     AmbiguousExperimentError,
     ExperimentNotFoundError,
     InvalidExperimentConfigError,
 )
+from molecular.execution import TautomerEnumerationPolicy
 from molecular.pubchem import PubChemAcquisitionError, PubChemNotFoundError
+from molecular.rdkit_tautomer import (
+    IncompleteEnumerationError,
+    InvalidSDFError,
+    MultipleMoleculesError,
+    RDKitEngineResolution,
+    RDKitTautomerCandidate,
+    RDKitTautomerEnumerationResult,
+    RDKitUnavailableError,
+)
+from molecular.execution_registry import load_execution_attempt
+from molecular.scientific import ScientificEntity
+from molecular.scientific_registry import load_state, register_entity, register_state
+from molecular.transformation_registry import list_state_transformations
 
 
 def _init_valid_experiment(tmp_path, experiment_id="exp001", dirname=None):
@@ -374,3 +402,649 @@ def test_register_ligand_from_pubchem_resolves_by_experiment_id_not_directory_na
     assert ligand.id == "curcumin"
     assert (project / "inputs" / "ligands" / "curcumin.yaml").exists()
     assert not (tmp_path / "exp001").exists()
+
+
+# ==========================================================================
+# enumerate_state_tautomers (Increment 016, Section 20.4)
+# ==========================================================================
+
+
+def _entity(entity_id="curcumin", name="Curcumin"):
+    return ScientificEntity(schema_version="1.0", id=entity_id, name=name)
+
+
+def _write_sdf_source(tmp_path, name="structure.sdf", content=b"fake-sdf-bytes"):
+    source_file = tmp_path / name
+    source_file.write_bytes(content)
+    return source_file
+
+
+def _setup_input_state(tmp_path, entity_id="curcumin", state_id="state-a", file_format="sdf"):
+    register_entity(tmp_path, _entity(entity_id=entity_id))
+    return register_state(
+        tmp_path,
+        state_id=state_id,
+        entity_id=entity_id,
+        source_file=_write_sdf_source(tmp_path),
+        format=file_format,
+    )
+
+
+def _policy(**overrides):
+    fields = {"schema_version": "1.0", "max_states": None, "source": "scientist"}
+    fields.update(overrides)
+    return TautomerEnumerationPolicy(**fields)
+
+
+_TWELVE_PARAMETERS = {
+    "algorithm": "rdkit.MolStandardize.TautomerEnumerator",
+    "input_format": "sdf",
+    "output_format": "smiles",
+    "max_tautomers": 1000,
+    "max_transforms": 1000,
+    "remove_bond_stereo": True,
+    "remove_sp3_stereo": True,
+    "reassign_stereo": True,
+    "remove_isotopic_hs": False,
+    "deduplication": "canonical-isomeric-smiles",
+    "ordering": "canonical-isomeric-smiles-lexicographic",
+    "selection": "complete-then-policy-limit",
+}
+
+
+def _fake_resolve_engine(**overrides):
+    fields = dict(engine_name="rdkit", engine_version="2026.03.6", parameters=_TWELVE_PARAMETERS)
+    fields.update(overrides)
+
+    def _resolve():
+        return RDKitEngineResolution(**fields)
+
+    return _resolve
+
+
+def _fake_resolve_engine_raising(exc):
+    def _resolve():
+        raise exc
+
+    return _resolve
+
+
+def _fake_enumerate_returning(smiles_list, enumerated_unique_count=None):
+    unique = enumerated_unique_count if enumerated_unique_count is not None else len(smiles_list)
+
+    def _enumerate(*, source_path, source_format):
+        return RDKitTautomerEnumerationResult(
+            enumerated_unique_count=unique,
+            new_unique_count=len(smiles_list),
+            candidates=tuple(
+                RDKitTautomerCandidate(canonical_isomeric_smiles=smiles) for smiles in smiles_list
+            ),
+        )
+
+    return _enumerate
+
+
+def _fake_enumerate_raising(exc):
+    def _enumerate(*, source_path, source_format):
+        raise exc
+
+    return _enumerate
+
+
+def _fail_nth_call(real_fn, n, exception_factory):
+    """Wraps real_fn so the n-th call (1-indexed) raises instead of
+    delegating - every other call behaves exactly like real_fn."""
+
+    state = {"count": 0}
+
+    def _wrapper(*args, **kwargs):
+        state["count"] += 1
+        if state["count"] == n:
+            raise exception_factory()
+        return real_fn(*args, **kwargs)
+
+    return _wrapper
+
+
+def _rdkit_extra_is_installed():
+    return importlib.util.find_spec("rdkit") is not None
+
+
+def _attempt_ids(tmp_path):
+    attempts_dir = tmp_path / "scientific" / "execution_attempts"
+    if not attempts_dir.is_dir():
+        return set()
+    return {p.stem for p in attempts_dir.glob("*.yaml")}
+
+
+def _new_attempt(tmp_path, before_ids):
+    """enumerate_state_tautomers raises the original exception after
+    recording it against its attempt (mirroring register_derived_state's
+    convention) - so a failure test must catch that exception, then load
+    the persisted attempt back by diffing the execution_attempts
+    directory, rather than inspecting a return value."""
+
+    new_ids = _attempt_ids(tmp_path) - before_ids
+    assert len(new_ids) == 1, f"expected exactly one new attempt, got {new_ids}"
+    return load_execution_attempt(tmp_path, next(iter(new_ids)))
+
+
+# --- full success cycle ---
+
+
+def test_enumerate_state_tautomers_full_success_cycle(tmp_path):
+    _setup_input_state(tmp_path)
+
+    attempt = enumerate_state_tautomers(
+        tmp_path,
+        input_state_id="state-a",
+        policy=_policy(),
+        _resolve_engine=_fake_resolve_engine(),
+        _enumerate=_fake_enumerate_returning(["C1", "C2", "C3"]),
+    )
+
+    assert attempt.status == "succeeded"
+    assert attempt.input_state_id == "state-a"
+    assert attempt.schema_version == "1.1"
+    assert len(attempt.operation_ids) == 3
+
+    transformations = list_state_transformations(tmp_path, parent_state_id="state-a")
+    assert len(transformations) == 3
+    assert set(t.id for t in transformations) == set(attempt.operation_ids)
+
+
+def test_enumerate_state_tautomers_operation_ids_in_deterministic_publication_order(tmp_path):
+    _setup_input_state(tmp_path)
+
+    attempt = enumerate_state_tautomers(
+        tmp_path,
+        input_state_id="state-a",
+        policy=_policy(),
+        _resolve_engine=_fake_resolve_engine(),
+        _enumerate=_fake_enumerate_returning(["Ca", "Cb", "Cc", "Cd"]),
+    )
+
+    transformations = [
+        t
+        for t in list_state_transformations(tmp_path, parent_state_id="state-a")
+    ]
+    by_id = {t.id: t for t in transformations}
+    ranks_in_operation_id_order = [
+        next(p.value for p in by_id[op_id].parameters if p.name == "candidate_rank")
+        for op_id in attempt.operation_ids
+    ]
+    assert ranks_in_operation_id_order == [0, 1, 2, 3]
+
+
+def test_enumerate_state_tautomers_published_states_inherit_parent_entity_id(tmp_path):
+    parent = _setup_input_state(tmp_path)
+
+    attempt = enumerate_state_tautomers(
+        tmp_path,
+        input_state_id="state-a",
+        policy=_policy(),
+        _resolve_engine=_fake_resolve_engine(),
+        _enumerate=_fake_enumerate_returning(["C1", "C2", "C3"]),
+    )
+
+    transformations = list_state_transformations(tmp_path, parent_state_id="state-a")
+    assert len(transformations) == 3
+    for transformation in transformations:
+        child = load_state(tmp_path, transformation.child_state_id)
+        assert child.entity_id == parent.entity_id
+
+
+# --- resolution-phase failures ---
+
+
+def test_enumerate_state_tautomers_engine_resolution_failure(tmp_path):
+    _setup_input_state(tmp_path)
+    before = _attempt_ids(tmp_path)
+
+    with pytest.raises(RDKitUnavailableError):
+        enumerate_state_tautomers(
+            tmp_path,
+            input_state_id="state-a",
+            policy=_policy(),
+            _resolve_engine=_fake_resolve_engine_raising(RDKitUnavailableError("no engine")),
+            _enumerate=_fake_enumerate_returning([]),
+        )
+
+    attempt = _new_attempt(tmp_path, before)
+    assert attempt.status == "resolution_failed"
+    assert attempt.error.phase == "resolution"
+
+
+def test_enumerate_state_tautomers_missing_input_state(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        enumerate_state_tautomers(
+            tmp_path,
+            input_state_id="does-not-exist",
+            policy=_policy(),
+            _resolve_engine=_fake_resolve_engine(),
+            _enumerate=_fake_enumerate_returning([]),
+        )
+
+    attempt = _new_attempt(tmp_path, set())
+    assert attempt.status == "resolution_failed"
+    assert attempt.error.phase == "resolution"
+
+
+def test_enumerate_state_tautomers_rejects_non_sdf_format(tmp_path):
+    _setup_input_state(tmp_path, file_format="smiles")
+    before = _attempt_ids(tmp_path)
+
+    with pytest.raises(ValueError):
+        enumerate_state_tautomers(
+            tmp_path,
+            input_state_id="state-a",
+            policy=_policy(),
+            _resolve_engine=_fake_resolve_engine(),
+            _enumerate=_fake_enumerate_returning([]),
+        )
+
+    attempt = _new_attempt(tmp_path, before)
+    assert attempt.status == "resolution_failed"
+    assert attempt.error.phase == "resolution"
+
+
+def test_enumerate_state_tautomers_rejects_checksum_mismatch(tmp_path):
+    _setup_input_state(tmp_path)
+
+    metadata_file = tmp_path / "scientific" / "states" / "state-a.yaml"
+    data = yaml.safe_load(metadata_file.read_text(encoding="utf-8"))
+    data["representation"]["checksum"] = "0" * 64
+    metadata_file.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+    before = _attempt_ids(tmp_path)
+
+    with pytest.raises(ValueError):
+        enumerate_state_tautomers(
+            tmp_path,
+            input_state_id="state-a",
+            policy=_policy(),
+            _resolve_engine=_fake_resolve_engine(),
+            _enumerate=_fake_enumerate_returning([]),
+        )
+
+    attempt = _new_attempt(tmp_path, before)
+    assert attempt.status == "resolution_failed"
+    assert attempt.error.phase == "resolution"
+
+
+# --- execution-phase engine failures ---
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        InvalidSDFError("empty SDF"),
+        MultipleMoleculesError(3),
+        IncompleteEnumerationError(status="max-tautomers-reached", tautomer_count=2),
+    ],
+    ids=["invalid-sdf", "multiple-molecules", "incomplete-enumeration"],
+)
+def test_enumerate_state_tautomers_engine_execution_failure(tmp_path, exc):
+    _setup_input_state(tmp_path)
+    before = _attempt_ids(tmp_path)
+
+    with pytest.raises(type(exc)):
+        enumerate_state_tautomers(
+            tmp_path,
+            input_state_id="state-a",
+            policy=_policy(),
+            _resolve_engine=_fake_resolve_engine(),
+            _enumerate=_fake_enumerate_raising(exc),
+        )
+
+    attempt = _new_attempt(tmp_path, before)
+    assert attempt.status == "execution_failed"
+    assert attempt.error.phase == "execution"
+    assert list_state_transformations(tmp_path, parent_state_id="state-a") == []
+
+
+# --- zero new states is a valid success ---
+
+
+def test_enumerate_state_tautomers_zero_new_states_is_success(tmp_path):
+    _setup_input_state(tmp_path)
+
+    attempt = enumerate_state_tautomers(
+        tmp_path,
+        input_state_id="state-a",
+        policy=_policy(),
+        _resolve_engine=_fake_resolve_engine(),
+        _enumerate=_fake_enumerate_returning([], enumerated_unique_count=0),
+    )
+
+    assert attempt.status == "succeeded"
+    assert attempt.operation_ids == ()
+    assert list_state_transformations(tmp_path, parent_state_id="state-a") == []
+    assert not (tmp_path / "scientific" / "states" / "state-a-child.yaml").exists()
+
+
+# --- max_states truncation ---
+
+
+@pytest.mark.parametrize("max_states,expected_published,expected_truncated", [
+    (None, 4, False),
+    (1, 1, True),
+    (2, 2, True),
+])
+def test_enumerate_state_tautomers_max_states_truncation(
+    tmp_path, max_states, expected_published, expected_truncated
+):
+    _setup_input_state(tmp_path)
+
+    attempt = enumerate_state_tautomers(
+        tmp_path,
+        input_state_id="state-a",
+        policy=_policy(max_states=max_states),
+        _resolve_engine=_fake_resolve_engine(),
+        _enumerate=_fake_enumerate_returning(["Ca", "Cb", "Cc", "Cd"]),
+    )
+
+    assert len(attempt.operation_ids) == expected_published
+
+    transformations = list_state_transformations(tmp_path, parent_state_id="state-a")
+    assert len(transformations) == expected_published
+    for transformation in transformations:
+        truncated_param = next(p.value for p in transformation.parameters if p.name == "truncated_by_policy")
+        published_count_param = next(
+            p.value for p in transformation.parameters if p.name == "published_count"
+        )
+        assert truncated_param == expected_truncated
+        assert published_count_param == expected_published
+
+
+# --- rollback / compensation ---
+
+
+def test_enumerate_state_tautomers_rollback_on_kth_register_state_failure(tmp_path, monkeypatch):
+    _setup_input_state(tmp_path)
+    before = _attempt_ids(tmp_path)
+
+    real_register_state = application_module.register_state
+    monkeypatch.setattr(
+        application_module,
+        "register_state",
+        _fail_nth_call(real_register_state, 3, lambda: OSError("simulated failure")),
+    )
+
+    with pytest.raises(OSError):
+        enumerate_state_tautomers(
+            tmp_path,
+            input_state_id="state-a",
+            policy=_policy(),
+            _resolve_engine=_fake_resolve_engine(),
+            _enumerate=_fake_enumerate_returning(["Ca", "Cb", "Cc", "Cd"]),
+        )
+
+    attempt = _new_attempt(tmp_path, before)
+    assert attempt.status == "execution_failed"
+    assert attempt.error.residual_state_ids == ()
+    assert attempt.error.residual_operation_ids == ()
+    assert list_state_transformations(tmp_path, parent_state_id="state-a") == []
+
+    states_dir = tmp_path / "scientific" / "states"
+    remaining = [p for p in states_dir.glob("*.yaml")] if states_dir.exists() else []
+    assert remaining == [] or all(p.stem == "state-a" for p in remaining)
+
+
+def test_enumerate_state_tautomers_rollback_preserves_prior_calls_records(tmp_path, monkeypatch):
+    """A rollback triggered by a second, later call must never remove
+    records published by an earlier, already-succeeded call."""
+
+    _setup_input_state(tmp_path)
+
+    first = enumerate_state_tautomers(
+        tmp_path,
+        input_state_id="state-a",
+        policy=_policy(),
+        _resolve_engine=_fake_resolve_engine(),
+        _enumerate=_fake_enumerate_returning(["Cfirst1", "Cfirst2"]),
+    )
+    assert first.status == "succeeded"
+    first_transformations = list_state_transformations(tmp_path, parent_state_id="state-a")
+    assert len(first_transformations) == 2
+
+    real_register_state = application_module.register_state
+    monkeypatch.setattr(
+        application_module,
+        "register_state",
+        _fail_nth_call(real_register_state, 2, lambda: OSError("simulated failure")),
+    )
+
+    before = _attempt_ids(tmp_path)
+    with pytest.raises(OSError):
+        enumerate_state_tautomers(
+            tmp_path,
+            input_state_id="state-a",
+            policy=_policy(),
+            _resolve_engine=_fake_resolve_engine(),
+            _enumerate=_fake_enumerate_returning(["Csecond1", "Csecond2"]),
+        )
+
+    second = _new_attempt(tmp_path, before)
+    assert second.status == "execution_failed"
+
+    remaining_transformations = list_state_transformations(tmp_path, parent_state_id="state-a")
+    assert {t.id for t in remaining_transformations} == {t.id for t in first_transformations}
+
+
+def test_enumerate_state_tautomers_rollback_on_kth_register_transformation_failure(
+    tmp_path, monkeypatch
+):
+    _setup_input_state(tmp_path)
+    before = _attempt_ids(tmp_path)
+
+    real_register_transformation = application_module.register_state_transformation
+    monkeypatch.setattr(
+        application_module,
+        "register_state_transformation",
+        _fail_nth_call(real_register_transformation, 2, lambda: OSError("simulated failure")),
+    )
+
+    with pytest.raises(OSError):
+        enumerate_state_tautomers(
+            tmp_path,
+            input_state_id="state-a",
+            policy=_policy(),
+            _resolve_engine=_fake_resolve_engine(),
+            _enumerate=_fake_enumerate_returning(["Ca", "Cb", "Cc"]),
+        )
+
+    attempt = _new_attempt(tmp_path, before)
+    assert attempt.status == "execution_failed"
+    assert list_state_transformations(tmp_path, parent_state_id="state-a") == []
+
+    states_dir = tmp_path / "scientific" / "states"
+    remaining = [p.stem for p in states_dir.glob("*.yaml")] if states_dir.exists() else []
+    assert remaining == ["state-a"]
+
+
+def test_enumerate_state_tautomers_rollback_on_mark_succeeded_failure(tmp_path, monkeypatch):
+    _setup_input_state(tmp_path)
+
+    real_mark_succeeded = application_module.mark_succeeded
+
+    def _raise_mark_succeeded(*args, **kwargs):
+        raise OSError("simulated mark_succeeded failure")
+
+    monkeypatch.setattr(application_module, "mark_succeeded", _raise_mark_succeeded)
+
+    with pytest.raises(OSError):
+        enumerate_state_tautomers(
+            tmp_path,
+            input_state_id="state-a",
+            policy=_policy(),
+            _resolve_engine=_fake_resolve_engine(),
+            _enumerate=_fake_enumerate_returning(["Ca", "Cb", "Cc"]),
+        )
+
+    assert list_state_transformations(tmp_path, parent_state_id="state-a") == []
+    states_dir = tmp_path / "scientific" / "states"
+    remaining = [p.stem for p in states_dir.glob("*.yaml")] if states_dir.exists() else []
+    assert remaining == ["state-a"]
+
+
+def test_enumerate_state_tautomers_residual_ids_recorded_when_rollback_cannot_confirm_removal(
+    tmp_path, monkeypatch
+):
+    _setup_input_state(tmp_path)
+    before = _attempt_ids(tmp_path)
+
+    real_register_state = application_module.register_state
+    monkeypatch.setattr(
+        application_module,
+        "register_state",
+        _fail_nth_call(real_register_state, 2, lambda: OSError("simulated failure")),
+    )
+    # The first candidate's state was fully published before the failure;
+    # simulate compensation being unable to confirm its removal.
+    monkeypatch.setattr(application_module, "_remove_state_best_effort", lambda *a, **k: None)
+
+    with pytest.raises(OSError):
+        enumerate_state_tautomers(
+            tmp_path,
+            input_state_id="state-a",
+            policy=_policy(),
+            _resolve_engine=_fake_resolve_engine(),
+            _enumerate=_fake_enumerate_returning(["Ca", "Cb", "Cc"]),
+        )
+
+    attempt = _new_attempt(tmp_path, before)
+    assert attempt.status == "execution_failed"
+    assert len(attempt.error.residual_state_ids) == 1
+
+    states_dir = tmp_path / "scientific" / "states"
+    remaining = {p.stem for p in states_dir.glob("*.yaml")}
+    assert attempt.error.residual_state_ids[0] in remaining
+
+
+# --- independence of successive attempts ---
+
+
+def test_enumerate_state_tautomers_repeated_call_creates_independent_attempt(tmp_path):
+    _setup_input_state(tmp_path)
+
+    first = enumerate_state_tautomers(
+        tmp_path,
+        input_state_id="state-a",
+        policy=_policy(),
+        _resolve_engine=_fake_resolve_engine(),
+        _enumerate=_fake_enumerate_returning(["C1"]),
+    )
+    second = enumerate_state_tautomers(
+        tmp_path,
+        input_state_id="state-a",
+        policy=_policy(),
+        _resolve_engine=_fake_resolve_engine(),
+        _enumerate=_fake_enumerate_returning(["C2"]),
+    )
+
+    assert first.id != second.id
+    assert first.status == "succeeded"
+    assert second.status == "succeeded"
+    assert first.operation_ids != second.operation_ids
+
+
+# --- packaging: no rdkit extra installed ---
+
+
+@pytest.mark.skipif(
+    _rdkit_extra_is_installed(), reason="only meaningful in a base install without the rdkit extra"
+)
+def test_enumerate_state_tautomers_without_rdkit_extra_produces_resolution_failed(tmp_path):
+    """No monkeypatch, real defaults (Section 6.2/20.5 packaging test) -
+    only runs for real in an environment where rdkit is genuinely absent."""
+
+    _setup_input_state(tmp_path)
+
+    before = _attempt_ids(tmp_path)
+
+    with pytest.raises(RDKitUnavailableError):
+        enumerate_state_tautomers(tmp_path, input_state_id="state-a", policy=_policy())
+
+    attempt = _new_attempt(tmp_path, before)
+    assert attempt.status == "resolution_failed"
+    assert attempt.error.phase == "resolution"
+    assert attempt.error.message
+
+
+# --- packaging and dependency tests (Section 20.5) ---
+
+
+def test_base_installation_surface_imports_cleanly():
+    """Regression guard for Section 6.2/20.5: the pre-existing module
+    surface must always import without error, whether or not the rdkit
+    extra happens to be installed in this environment."""
+
+    import molecular.application  # noqa: F401
+    import molecular.cli  # noqa: F401
+    import molecular.execution  # noqa: F401
+    import molecular.execution_registry  # noqa: F401
+
+
+@pytest.mark.skipif(
+    _rdkit_extra_is_installed(),
+    reason=(
+        "only meaningful in a base install without the rdkit extra - when rdkit is "
+        "genuinely installed, molecular.cli's existing import of molecular.application "
+        "legitimately (and correctly) pulls rdkit into sys.modules on a real import, "
+        "which is not the same thing as this codebase's own modules writing `import "
+        "rdkit` outside rdkit_tautomer.py"
+    ),
+)
+def test_cli_help_never_imports_rdkit():
+    """Section 20.5: no chemistry-unrelated CLI command may import rdkit.
+    Run in a fresh subprocess - sys.modules is shared, process-wide state,
+    so an in-process check would be corrupted by any earlier test in this
+    same pytest session that already imported rdkit (e.g.
+    test_rdkit_tautomer.py)."""
+
+    probe = (
+        "import sys\n"
+        "from typer.testing import CliRunner\n"
+        "from molecular.cli import app\n"
+        "CliRunner().invoke(app, ['--help'])\n"
+        "print('rdkit' in sys.modules)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "False"
+
+
+@pytest.mark.skipif(not _rdkit_extra_is_installed(), reason="requires the rdkit extra")
+def test_real_resolved_snapshot_engine_version_matches_rdbase_version(tmp_path):
+    """Section 20.5: the version reported by the environment
+    (rdBase.rdkitVersion) must coincide with engine_version persisted in
+    a real ResolvedExecutionSnapshot from an integration run - the full
+    pipeline, using enumerate_state_tautomers' real defaults, not fakes."""
+
+    from rdkit import rdBase
+
+    parent = _setup_input_state(tmp_path)
+    # register_state's fake-SDF-bytes fixture is not valid chemistry -
+    # replace it with a minimal real SDF so the real adapter can parse it.
+    from rdkit import Chem
+
+    real_sdf = tmp_path / "real.sdf"
+    mol = Chem.MolFromSmiles("CC(=O)CC(C)=O")
+    writer = Chem.SDWriter(str(real_sdf))
+    writer.write(mol)
+    writer.close()
+
+    register_state(
+        tmp_path, state_id="state-real", entity_id=parent.entity_id, source_file=real_sdf, format="sdf"
+    )
+
+    attempt = enumerate_state_tautomers(tmp_path, input_state_id="state-real", policy=_policy())
+
+    assert attempt.status == "succeeded"
+    assert attempt.resolved.engine_version == rdBase.rdkitVersion

@@ -20,6 +20,7 @@ from molecular.transformation import (
 )
 from molecular.transformation_registry import (
     TransformationIdentityConflictError,
+    _remove_state_transformation_best_effort,
     list_state_transformations,
     load_state_transformation,
     register_state_transformation,
@@ -330,3 +331,40 @@ def test_bool_and_int_parameter_values_survive_registry_round_trip(tmp_path):
 
     assert by_name["zero_count"].value == 0
     assert type(by_name["zero_count"].value) is int
+
+
+# --- _remove_state_transformation_best_effort (Increment 016, Section 17.4) ---
+
+
+def test_remove_state_transformation_best_effort_removes_metadata_file(tmp_path):
+    _setup_entity_with_states(tmp_path)
+    register_state_transformation(tmp_path, _record())
+
+    metadata_file = tmp_path / "scientific" / "transformations" / "state-a-to-state-b.yaml"
+    assert metadata_file.exists()
+
+    _remove_state_transformation_best_effort(tmp_path, "state-a-to-state-b")
+
+    assert not metadata_file.exists()
+
+
+def test_remove_state_transformation_best_effort_is_idempotent_when_already_absent(tmp_path):
+    """Never raises, even when the metadata file never existed at all -
+    mirrors _remove_state_best_effort's own idempotency contract."""
+
+    _remove_state_transformation_best_effort(tmp_path, "never-registered")
+
+
+def test_remove_state_transformation_best_effort_never_touches_states(tmp_path):
+    _setup_entity_with_states(tmp_path)
+    register_state_transformation(tmp_path, _record())
+
+    from molecular.scientific_registry import load_state
+
+    before_a = load_state(tmp_path, "state-a")
+    before_b = load_state(tmp_path, "state-b")
+
+    _remove_state_transformation_best_effort(tmp_path, "state-a-to-state-b")
+
+    assert load_state(tmp_path, "state-a") == before_a
+    assert load_state(tmp_path, "state-b") == before_b

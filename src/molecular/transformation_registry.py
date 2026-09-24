@@ -14,6 +14,7 @@ parent_state_id and child_state_id must both already be registered, loaded
 and cross-checked before any write occurs.
 """
 
+import logging
 from pathlib import Path
 from typing import List, Optional
 
@@ -22,6 +23,8 @@ import yaml
 from molecular.atomic import atomic_write_text, check_storage_identity_conflict
 from molecular.scientific_registry import load_state
 from molecular.transformation import StateTransformationRecord
+
+logger = logging.getLogger(__name__)
 
 
 class TransformationIdentityConflictError(FileExistsError):
@@ -103,6 +106,36 @@ def register_state_transformation(
     atomic_write_text(metadata_file, serialized_yaml)
 
     return transformation
+
+
+def _remove_state_transformation_best_effort(project_dir: Path, transformation_id: str) -> None:
+    """Best-effort compensating removal of a StateTransformationRecord's
+    metadata file - mirrors _remove_state_best_effort in
+    molecular.scientific_registry exactly, including its scoping
+    contract: this is not a public delete function, and must only ever be
+    called by an orchestrating Application Service to roll back a
+    transformation it just registered within the same call, when a later
+    step of that same operation subsequently fails. A
+    StateTransformationRecord has no artifact of its own (see this
+    module's own docstring), so there is no artifact directory to clean
+    up alongside the metadata file - unlike _remove_state_best_effort,
+    which also removes a representation directory.
+
+    Never raises: failures are logged as warnings and swallowed, never
+    masking whatever error is already propagating from the caller.
+    """
+
+    metadata_file = _transformations_dir(project_dir) / f"{transformation_id}.yaml"
+
+    try:
+        metadata_file.unlink(missing_ok=True)
+    except OSError:
+        logger.warning(
+            "Failed to clean up %s at %s",
+            "transformation metadata",
+            metadata_file,
+            exc_info=True,
+        )
 
 
 def load_state_transformation(project_dir: Path, transformation_id: str) -> StateTransformationRecord:
