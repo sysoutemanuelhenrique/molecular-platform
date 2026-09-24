@@ -16,6 +16,9 @@ dependencies = [
 dev = [
     "pytest>=8",
 ]
+rdkit = [
+    "rdkit==2026.3.6",
+]
 
 [project.scripts]
 molecular = "molecular.cli:app"

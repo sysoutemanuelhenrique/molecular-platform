@@ -59,6 +59,7 @@ def _begin(tmp_path, **overrides):
     fields = {
         "operation_type": "state-transformation",
         "requested": _policy(),
+        "input_state_id": "state0001",
     }
     fields.update(overrides)
     return begin_execution_attempt(tmp_path, **fields)
@@ -631,3 +632,112 @@ def test_mark_resolved_still_overwrites_the_same_attempts_own_file_after_collisi
 
     assert resolved.id == attempt.id
     assert resolved.status == "resolved"
+
+
+# --- Increment 016: input_state_id / schema_version 1.1 ---
+
+
+def test_begin_requires_input_state_id_argument(tmp_path):
+    with pytest.raises(TypeError):
+        begin_execution_attempt(
+            tmp_path, operation_type="state-transformation", requested=_policy()
+        )
+
+
+def test_begin_always_produces_schema_version_1_1(tmp_path):
+    attempt = _begin(tmp_path)
+    assert attempt.schema_version == "1.1"
+
+
+def test_begin_never_constructs_schema_version_1_0(tmp_path):
+    for _ in range(5):
+        attempt = _begin(tmp_path, input_state_id=f"state{uuid.uuid4().hex[:8]}")
+        assert attempt.schema_version == "1.1"
+
+
+def test_begin_sets_input_state_id(tmp_path):
+    attempt = _begin(tmp_path, input_state_id="state0042")
+    assert attempt.input_state_id == "state0042"
+
+
+def test_begin_rejects_malformed_input_state_id_before_any_io(tmp_path):
+    attempts_dir = tmp_path / "scientific" / "execution_attempts"
+
+    with pytest.raises(ValueError):
+        _begin(tmp_path, input_state_id="bad id")
+
+    assert not attempts_dir.exists()
+
+
+def test_mark_resolved_preserves_input_state_id_and_schema_version(tmp_path):
+    attempt = _begin(tmp_path, input_state_id="state0042")
+
+    resolved = mark_resolved(tmp_path, attempt.id, resolved=_snapshot())
+
+    assert resolved.input_state_id == "state0042"
+    assert resolved.schema_version == "1.1"
+
+
+def test_mark_resolution_failed_preserves_input_state_id_and_schema_version(tmp_path):
+    attempt = _begin(tmp_path, input_state_id="state0042")
+
+    failed = mark_resolution_failed(tmp_path, attempt.id, error=_error(phase="resolution"))
+
+    assert failed.input_state_id == "state0042"
+    assert failed.schema_version == "1.1"
+
+
+def test_mark_execution_failed_preserves_input_state_id_and_schema_version(tmp_path):
+    attempt = _begin(tmp_path, input_state_id="state0042")
+    mark_resolved(tmp_path, attempt.id, resolved=_snapshot())
+
+    failed = mark_execution_failed(tmp_path, attempt.id, error=_error(phase="execution"))
+
+    assert failed.input_state_id == "state0042"
+    assert failed.schema_version == "1.1"
+
+
+def test_mark_succeeded_preserves_input_state_id_and_schema_version(tmp_path):
+    attempt = _begin(tmp_path, input_state_id="state0042")
+    mark_resolved(tmp_path, attempt.id, resolved=_snapshot())
+
+    succeeded = mark_succeeded(tmp_path, attempt.id, operation_ids=())
+
+    assert succeeded.input_state_id == "state0042"
+    assert succeeded.schema_version == "1.1"
+
+
+def test_load_legacy_schema_1_0_attempt_without_input_state_id(tmp_path):
+    """A real 1.0-shaped YAML document (no input_state_id key at all, as
+    Increment 015 would have written it) must load without error and
+    without rewriting the file - no migration on read."""
+
+    attempts_dir = tmp_path / "scientific" / "execution_attempts"
+    attempts_dir.mkdir(parents=True)
+    legacy_yaml = (
+        "schema_version: '1.0'\n"
+        "id: legacyattempt1\n"
+        "operation_type: state-transformation\n"
+        "operation_ids: null\n"
+        "status: started\n"
+        "requested:\n"
+        "  schema_version: '1.0'\n"
+        "  max_states: null\n"
+        "  source: scientist\n"
+        "resolved: null\n"
+        "error: null\n"
+        "created_at: '2024-01-01T00:00:00+00:00'\n"
+        "resolved_at: null\n"
+        "finished_at: null\n"
+    )
+    metadata_file = attempts_dir / "legacyattempt1.yaml"
+    metadata_file.write_text(legacy_yaml, encoding="utf-8")
+    before = metadata_file.read_text(encoding="utf-8")
+
+    loaded = load_execution_attempt(tmp_path, "legacyattempt1")
+
+    assert loaded.schema_version == "1.0"
+    assert loaded.input_state_id is None
+
+    after = metadata_file.read_text(encoding="utf-8")
+    assert after == before
