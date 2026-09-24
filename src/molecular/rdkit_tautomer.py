@@ -349,13 +349,20 @@ def enumerate_tautomers_rdkit(
 
         valid_smiles.append(Chem.MolToSmiles(candidate, isomericSmiles=True))
 
-    enumerated_unique = sorted(set(valid_smiles))
-    new_unique = [smiles for smiles in enumerated_unique if smiles != entry_smiles]
+    # Section 15, steps 14-16, in this exact order: deduplicate, THEN
+    # exclude the entry-equivalent representation, THEN sort the
+    # remainder lexicographically - the code must follow the same order
+    # this function's own docstring describes, not merely produce an
+    # equivalent result via a different order.
+    enumerated_unique = set(valid_smiles)
+    new_unique = {smiles for smiles in enumerated_unique if smiles != entry_smiles}
+    sorted_new_unique = sorted(new_unique)
 
     return RDKitTautomerEnumerationResult(
         enumerated_unique_count=len(enumerated_unique),
-        new_unique_count=len(new_unique),
+        new_unique_count=len(sorted_new_unique),
         candidates=tuple(
-            RDKitTautomerCandidate(canonical_isomeric_smiles=smiles) for smiles in new_unique
+            RDKitTautomerCandidate(canonical_isomeric_smiles=smiles)
+            for smiles in sorted_new_unique
         ),
     )

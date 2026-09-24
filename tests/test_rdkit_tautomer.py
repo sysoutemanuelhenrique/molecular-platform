@@ -378,6 +378,33 @@ def test_candidates_are_sorted_lexicographically(tmp_path):
     assert len(smiles_list) > 1  # a non-trivial ordering check
 
 
+def test_candidates_are_deduplicated_entry_excluded_and_sorted_in_that_order(tmp_path):
+    """Section 15, steps 14-16 (frozen spec): deduplicate, THEN exclude
+    the entry-equivalent representation, THEN sort lexicographically -
+    the adapter's code must follow this exact order, not merely produce
+    an observably equivalent result via a different order (MINOR-1,
+    Increment 016 adversarial code review reconciliation)."""
+
+    sdf_path = _write_sdf(tmp_path, "enol-od.sdf", "[2H]OC(C)=CC(C)=O")
+    input_mol = Chem.MolFromSmiles("[2H]OC(C)=CC(C)=O")
+    entry_smiles = Chem.MolToSmiles(input_mol, isomericSmiles=True)
+
+    result = enumerate_tautomers_rdkit(source_path=sdf_path, source_format="sdf")
+
+    smiles_list = [candidate.canonical_isomeric_smiles for candidate in result.candidates]
+
+    # deduplication: no canonical SMILES appears more than once.
+    assert len(smiles_list) == len(set(smiles_list))
+    assert len(smiles_list) == result.new_unique_count
+
+    # entry exclusion: the input's own representation never appears.
+    assert entry_smiles not in smiles_list
+
+    # final ordering: strictly lexicographic.
+    assert smiles_list == sorted(smiles_list)
+    assert len(smiles_list) > 1  # a non-trivial check on all three properties at once
+
+
 # --- No RDKit object ever escapes a public function's return (Section 20.2) ---
 
 

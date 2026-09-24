@@ -346,7 +346,23 @@ class TautomerEnumerationActivityDetails:
     DerivedStateActivityDetails exactly in spirit: every field is a
     specific, known correlation id, never arbitrary metadata. attempt_id
     is opaque and operational only, exactly as in
-    DerivedStateActivityDetails."""
+    DerivedStateActivityDetails.
+
+    published_state_ids/published_transformation_ids carry the SAME
+    meaning on every outcome ("started", "success", or "error"): every id
+    that this specific execution actually registered before it ended -
+    never ids that were only staged/planned, and never the residual ids
+    left behind by a failed best-effort compensation. On the error
+    outcome this may therefore include ids that compensation went on to
+    remove (successfully or not) after this snapshot of the local
+    publication lists was taken - that is expected and intentional: this
+    log line records what the execution itself did, not the post-
+    compensation state of the filesystem. The authoritative record of
+    which ids, if any, compensation could NOT confirm removed lives
+    exclusively in ExecutionAttemptError.residual_state_ids/
+    residual_operation_ids (Section 10.4 of the frozen spec) - this
+    best-effort activity log is never the source of truth for that fact,
+    and never redefines "published" as "residual"."""
 
     attempt_id: str
     input_state_id: str
@@ -696,8 +712,8 @@ def enumerate_state_tautomers(
             details=TautomerEnumerationActivityDetails(
                 attempt_id=attempt.id,
                 input_state_id=input_state_id,
-                published_state_ids=residual_state_ids,
-                published_transformation_ids=residual_operation_ids,
+                published_state_ids=tuple(published_state_ids),
+                published_transformation_ids=tuple(published_transformation_ids),
             ),
         )
         raise

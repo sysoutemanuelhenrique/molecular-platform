@@ -506,6 +506,40 @@ def _fail_nth_call(real_fn, n, exception_factory):
     return _wrapper
 
 
+def _noop_nth_call(real_fn, n):
+    """Wraps real_fn so the n-th call (1-indexed) silently does nothing
+    (simulating a best-effort removal that fails to confirm, exactly like
+    _remove_state_best_effort/_remove_state_transformation_best_effort
+    behave when the underlying OSError is swallowed) - every other call
+    behaves exactly like real_fn."""
+
+    state = {"count": 0}
+
+    def _wrapper(*args, **kwargs):
+        state["count"] += 1
+        if state["count"] == n:
+            return None
+        return real_fn(*args, **kwargs)
+
+    return _wrapper
+
+
+def _capture_activity_calls(monkeypatch):
+    """Monkeypatches application_module.record_activity to capture every
+    call's (command, outcome, details) instead of writing to the log
+    file - lets a test assert directly on the typed
+    TautomerEnumerationActivityDetails instance actually passed, rather
+    than parsing the text log line."""
+
+    calls = []
+
+    def _capture(project_dir, command, outcome, *, details=None):
+        calls.append({"command": command, "outcome": outcome, "details": details})
+
+    monkeypatch.setattr(application_module, "record_activity", _capture)
+    return calls
+
+
 def _rdkit_extra_is_installed():
     return importlib.util.find_spec("rdkit") is not None
 
@@ -920,6 +954,174 @@ def test_enumerate_state_tautomers_residual_ids_recorded_when_rollback_cannot_co
     states_dir = tmp_path / "scientific" / "states"
     remaining = {p.stem for p in states_dir.glob("*.yaml")}
     assert attempt.error.residual_state_ids[0] in remaining
+
+
+# --- activity log semantics: published_*_ids means "actually registered by
+# this execution", identically on success and error - never residual ids
+# (Increment 016 adversarial code review reconciliation, MINOR-2) ---
+
+
+def test_activity_log_success_records_exactly_the_published_ids(tmp_path, monkeypatch):
+    _setup_input_state(tmp_path)
+    calls = _capture_activity_calls(monkeypatch)
+
+    attempt = enumerate_state_tautomers(
+        tmp_path,
+        input_state_id="state-a",
+        policy=_policy(),
+        _resolve_engine=_fake_resolve_engine(),
+        _enumerate=_fake_enumerate_returning(["Ca", "Cb", "Cc"]),
+    )
+
+    success_calls = [c for c in calls if c["outcome"] == "success"]
+    assert len(success_calls) == 1
+    details = success_calls[0]["details"]
+
+    transformations = list_state_transformations(tmp_path, parent_state_id="state-a")
+    expected_state_ids = {t.child_state_id for t in transformations}
+
+    assert set(details.published_state_ids) == expected_state_ids
+    assert set(details.published_transformation_ids) == set(attempt.operation_ids)
+    assert details.attempt_id == attempt.id
+    assert details.input_state_id == "state-a"
+
+
+def test_activity_log_error_after_partial_publication_records_everything_actually_registered(
+    tmp_path, monkeypatch
+):
+    """Failure after partial publication (candidate 0 fully published,
+    candidate 1's state created but its transformation registration
+    fails): the error-outcome activity log must record BOTH ids that were
+    actually registered by this execution before it ended - the same
+    meaning the success path already gives these field names - never just
+    the residual/unconfirmed-removal subset."""
+
+    _setup_input_state(tmp_path)
+    calls = _capture_activity_calls(monkeypatch)
+
+    real_register_state_transformation = application_module.register_state_transformation
+    monkeypatch.setattr(
+        application_module,
+        "register_state_transformation",
+        _fail_nth_call(real_register_state_transformation, 2, lambda: OSError("simulated failure")),
+    )
+
+    before = _attempt_ids(tmp_path)
+    with pytest.raises(OSError):
+        enumerate_state_tautomers(
+            tmp_path,
+            input_state_id="state-a",
+            policy=_policy(),
+            _resolve_engine=_fake_resolve_engine(),
+            _enumerate=_fake_enumerate_returning(["Ca", "Cb", "Cc"]),
+        )
+
+    attempt = _new_attempt(tmp_path, before)
+    assert attempt.status == "execution_failed"
+
+    error_calls = [c for c in calls if c["outcome"] == "error"]
+    assert len(error_calls) == 1
+    details = error_calls[0]["details"]
+
+    # candidate 0: state + transformation both registered; candidate 1:
+    # only its state was registered before the transformation call failed.
+    assert len(details.published_state_ids) == 2
+    assert len(details.published_transformation_ids) == 1
+
+
+def test_activity_log_still_shows_published_ids_when_compensation_removes_everything(
+    tmp_path, monkeypatch
+):
+    """When compensation successfully confirms removal of everything it
+    touched, residuals are empty - but the activity log must still show
+    what was actually published during execution, not an empty set."""
+
+    _setup_input_state(tmp_path)
+    calls = _capture_activity_calls(monkeypatch)
+
+    real_register_state_transformation = application_module.register_state_transformation
+    monkeypatch.setattr(
+        application_module,
+        "register_state_transformation",
+        _fail_nth_call(real_register_state_transformation, 2, lambda: OSError("simulated failure")),
+    )
+
+    before = _attempt_ids(tmp_path)
+    with pytest.raises(OSError):
+        enumerate_state_tautomers(
+            tmp_path,
+            input_state_id="state-a",
+            policy=_policy(),
+            _resolve_engine=_fake_resolve_engine(),
+            _enumerate=_fake_enumerate_returning(["Ca", "Cb", "Cc"]),
+        )
+
+    attempt = _new_attempt(tmp_path, before)
+    assert attempt.error.residual_state_ids == ()
+    assert attempt.error.residual_operation_ids == ()
+
+    error_calls = [c for c in calls if c["outcome"] == "error"]
+    details = error_calls[0]["details"]
+    assert len(details.published_state_ids) == 2
+    assert len(details.published_transformation_ids) == 1
+
+
+def test_activity_log_does_not_redefine_published_as_residual_when_residuals_exist(
+    tmp_path, monkeypatch
+):
+    """With 4 fully-published candidates rolled back by a mark_succeeded
+    failure, and compensation unable to confirm removal of exactly one
+    transformation: the authoritative residual set (1 id) must differ
+    from - and be strictly smaller than - what the activity log reports
+    as published (4 ids). The log must never collapse "published" down to
+    just "residual"."""
+
+    _setup_input_state(tmp_path)
+    calls = _capture_activity_calls(monkeypatch)
+
+    def _raise_mark_succeeded(*args, **kwargs):
+        raise OSError("simulated mark_succeeded failure")
+
+    monkeypatch.setattr(application_module, "mark_succeeded", _raise_mark_succeeded)
+
+    real_remove_transformation = application_module._remove_state_transformation_best_effort
+    monkeypatch.setattr(
+        application_module,
+        "_remove_state_transformation_best_effort",
+        _noop_nth_call(real_remove_transformation, 1),
+    )
+
+    before = _attempt_ids(tmp_path)
+    with pytest.raises(OSError):
+        enumerate_state_tautomers(
+            tmp_path,
+            input_state_id="state-a",
+            policy=_policy(),
+            _resolve_engine=_fake_resolve_engine(),
+            _enumerate=_fake_enumerate_returning(["Ca", "Cb", "Cc", "Cd"]),
+        )
+
+    attempt = _new_attempt(tmp_path, before)
+    assert attempt.status == "execution_failed"
+
+    # exactly one transformation's removal could not be confirmed; every
+    # state's removal succeeded (removing a state never depends on its
+    # transformation's own removal having been confirmed first).
+    assert len(attempt.error.residual_operation_ids) == 1
+    assert attempt.error.residual_state_ids == ()
+
+    error_calls = [c for c in calls if c["outcome"] == "error"]
+    assert len(error_calls) == 1
+    details = error_calls[0]["details"]
+
+    # all 4 candidates were fully published before mark_succeeded failed.
+    assert len(details.published_state_ids) == 4
+    assert len(details.published_transformation_ids) == 4
+
+    # the residual set is a strict subset of what was published - the log
+    # never redefines "published" as "residual".
+    assert set(attempt.error.residual_operation_ids) < set(details.published_transformation_ids)
+    assert len(details.published_transformation_ids) > len(attempt.error.residual_operation_ids)
 
 
 # --- independence of successive attempts ---
