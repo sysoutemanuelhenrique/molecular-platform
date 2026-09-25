@@ -857,37 +857,151 @@ def _echo_unconfirmed_removals(
         typer.echo(f"  Transformation '{operation_id}'")
 
 
-_TAUTOMER_WINDOWS_DRIVE_PATH_RE = re.compile(
-    r"(?i)(?<![A-Za-z0-9_])"
-    r"[A-Z]:(?:\\+|/)"
-    r"(?:[^\\/\r\n'\"<>|?*]+(?:\\+|/))*"
-    r"[^\\/\r\n'\"<>|?*]*?\.[A-Za-z0-9]{1,12}"
-    r"(?:\.[A-Za-z0-9]{1,12})*"
+_TAUTOMER_URL_RE = re.compile(r"(?i)\bhttps?://[^\s'\"<>]+")
+_TAUTOMER_FILE_SUFFIX_RE = re.compile(
+    r"\.[A-Za-z0-9]{1,12}(?:\.[A-Za-z0-9]{1,12})*"
 )
-_TAUTOMER_UNC_PATH_RE = re.compile(
-    r"(?i)(?<![A-Za-z0-9_])"
-    r"\\{2,}"
-    r"[^\\/\r\n'\"<>|?*]+\\+"
-    r"(?:[^\\/\r\n'\"<>|?*]+\\+)*"
-    r"[^\\/\r\n'\"<>|?*]*?\.[A-Za-z0-9]{1,12}"
-    r"(?:\.[A-Za-z0-9]{1,12})*"
-)
-_TAUTOMER_POSIX_FILE_PATH_RE = re.compile(
-    r"(?i)(?<![A-Za-z0-9_+)\]])"
-    r"/(?!/)"
-    r"(?:[^/\r\n'\"<>]+/)+"
-    r"[^/\r\n'\"<>]*?\.[A-Za-z0-9]{1,12}"
-    r"(?:\.[A-Za-z0-9]{1,12})*"
-)
+_TAUTOMER_PATH_CONNECTORS = (" and ", " then ")
+
+
+def _tautomer_path_start(text: str, index: int):
+    """Return (kind, content_start) for an unambiguous absolute-path prefix."""
+
+    if (
+        index + 2 < len(text)
+        and text[index].isalpha()
+        and text[index + 1] == ":"
+        and text[index + 2] in "\\/"
+        and (index == 0 or not (text[index - 1].isalnum() or text[index - 1] == "_"))
+    ):
+        return "windows", index + 2
+
+    if text.startswith("\\\\", index):
+        cursor = index
+        while cursor < len(text) and text[cursor] == "\\":
+            cursor += 1
+        if (
+            cursor - index >= 2
+            and (index == 0 or not (text[index - 1].isalnum() or text[index - 1] == "_"))
+        ):
+            return "unc", cursor
+
+    if text[index] == "/":
+        previous = text[index - 1] if index else ""
+        if (
+            not text.startswith("//", index)
+            and (index == 0 or not (previous.isalnum() or previous in "_+)]"))
+        ):
+            return "posix", index + 1
+
+    return None
+
+
+def _tautomer_is_path_separator(character: str, kind: str) -> bool:
+    if kind == "windows":
+        return character in "\\/"
+    if kind == "unc":
+        return character == "\\"
+    return character == "/"
+
+
+def _tautomer_path_end(
+    text: str,
+    *,
+    content_start: int,
+    kind: str,
+):
+    """Find one path's first file-like endpoint without crossing text boundaries."""
+
+    cursor = content_start
+    while cursor < len(text):
+        character = text[cursor]
+
+        if character in "\r\n'\"<>":
+            return None
+
+        if character in ",;)}]":
+            return None
+
+        if any(text.startswith(connector, cursor) for connector in _TAUTOMER_PATH_CONNECTORS):
+            return None
+
+        if _tautomer_is_path_separator(character, kind):
+            while (
+                cursor < len(text)
+                and _tautomer_is_path_separator(text[cursor], kind)
+            ):
+                cursor += 1
+            continue
+
+        if cursor > content_start and _tautomer_path_start(text, cursor) is not None:
+            return None
+
+        suffix = _TAUTOMER_FILE_SUFFIX_RE.match(text, cursor)
+        if suffix is None:
+            cursor += 1
+            continue
+
+        endpoint = suffix.end()
+        if endpoint < len(text) and _tautomer_is_path_separator(text[endpoint], kind):
+            cursor = endpoint
+            continue
+
+        following = text[endpoint] if endpoint < len(text) else ""
+        if (
+            not following
+            or following.isspace()
+            or following in "'\",;:)]}!?#."
+        ):
+            return endpoint
+
+        cursor = endpoint
+
+    return None
+
+
+def _redact_tautomer_paths_outside_urls(text: str) -> str:
+    pieces = []
+    cursor = 0
+
+    while cursor < len(text):
+        path = _tautomer_path_start(text, cursor)
+        if path is None:
+            pieces.append(text[cursor])
+            cursor += 1
+            continue
+
+        kind, content_start = path
+        endpoint = _tautomer_path_end(
+            text,
+            content_start=content_start,
+            kind=kind,
+        )
+        if endpoint is None:
+            pieces.append(text[cursor])
+            cursor += 1
+            continue
+
+        pieces.append("[redacted-path]")
+        cursor = endpoint
+
+    return "".join(pieces)
 
 
 def _sanitize_tautomer_error_text(value: object) -> str:
-    """Redact only lexically unambiguous absolute paths for this command."""
+    """Redact absolute paths while preserving URLs and chemistry verbatim."""
 
     text = str(value)
-    text = _TAUTOMER_WINDOWS_DRIVE_PATH_RE.sub("[redacted-path]", text)
-    text = _TAUTOMER_UNC_PATH_RE.sub("[redacted-path]", text)
-    return _TAUTOMER_POSIX_FILE_PATH_RE.sub("[redacted-path]", text)
+    pieces = []
+    cursor = 0
+
+    for url in _TAUTOMER_URL_RE.finditer(text):
+        pieces.append(_redact_tautomer_paths_outside_urls(text[cursor : url.start()]))
+        pieces.append(url.group(0))
+        cursor = url.end()
+
+    pieces.append(_redact_tautomer_paths_outside_urls(text[cursor:]))
+    return "".join(pieces)
 
 
 def _echo_tautomer_validation_errors(error: ValidationError) -> None:

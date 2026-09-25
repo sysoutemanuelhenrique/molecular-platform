@@ -5275,3 +5275,217 @@ def test_tautomer_cli_mixed_message_redacts_only_path_and_preserves_chemistry(
         assert "private data" not in stream
         assert "ligand.sdf" not in stream
         assert chemical_text in stream or stream == ""
+
+
+# =====================================================================
+# Increment 017 URL and multi-path sanitizer boundary review
+# =====================================================================
+
+
+@pytest.mark.parametrize(
+    "message,expected",
+    [
+        (
+            "https://example.org/path/ligand.sdf",
+            "https://example.org/path/ligand.sdf",
+        ),
+        (
+            "https://example.org/path/ligand.sdf?download=1",
+            "https://example.org/path/ligand.sdf?download=1",
+        ),
+        (
+            "https://example.org/path/ligand.sdf#record",
+            "https://example.org/path/ligand.sdf#record",
+        ),
+        (
+            "http://example.org/a/b/file.sdf",
+            "http://example.org/a/b/file.sdf",
+        ),
+        (
+            "https://example.org/path/ligand.sdf and /home/jane/a.sdf",
+            "https://example.org/path/ligand.sdf and [redacted-path]",
+        ),
+        (
+            r"C:\Data\a.sdf then https://example.org/path/ligand.sdf",
+            "[redacted-path] then https://example.org/path/ligand.sdf",
+        ),
+        (
+            r"C:\Data\a.sdf then https://example.org/path/ligand.sdf and /home/jane/b.sdf",
+            "[redacted-path] then https://example.org/path/ligand.sdf and [redacted-path]",
+        ),
+    ],
+    ids=[
+        "https",
+        "https-query",
+        "https-fragment",
+        "http",
+        "url-before-path",
+        "url-after-path",
+        "url-between-paths",
+    ],
+)
+def test_tautomer_path_sanitizer_preserves_urls_exactly(message, expected):
+    sanitized = cli_module._sanitize_tautomer_error_text(message)
+
+    assert sanitized == expected
+
+    for token in message.split():
+        if token.startswith(("http://", "https://")):
+            assert token in sanitized
+
+
+@pytest.mark.parametrize(
+    "message,expected,original_paths,sensitive_fragments",
+    [
+        (
+            "/home/jane/a.sdf and /opt/data/b.sdf",
+            "[redacted-path] and [redacted-path]",
+            ("/home/jane/a.sdf", "/opt/data/b.sdf"),
+            ("jane", "a.sdf", "data", "b.sdf"),
+        ),
+        (
+            r"C:\Users\Jane\a.sdf and D:\Data\b.sdf",
+            "[redacted-path] and [redacted-path]",
+            (r"C:\Users\Jane\a.sdf", r"D:\Data\b.sdf"),
+            ("Jane", "a.sdf", "Data", "b.sdf"),
+        ),
+        (
+            "C:/Users/Jane/a.sdf and /home/jane/b.sdf",
+            "[redacted-path] and [redacted-path]",
+            ("C:/Users/Jane/a.sdf", "/home/jane/b.sdf"),
+            ("Jane", "a.sdf", "jane", "b.sdf"),
+        ),
+        (
+            r"\\server\share\a.sdf, then C:\Data\b.sdf",
+            "[redacted-path], then [redacted-path]",
+            (r"\\server\share\a.sdf", r"C:\Data\b.sdf"),
+            ("server", "share", "a.sdf", "Data", "b.sdf"),
+        ),
+        (
+            r"C:\Users\Jane Doe\a sample.sdf and /home/jane/private data/b sample.sdf",
+            "[redacted-path] and [redacted-path]",
+            (
+                r"C:\Users\Jane Doe\a sample.sdf",
+                "/home/jane/private data/b sample.sdf",
+            ),
+            ("Jane Doe", "a sample.sdf", "jane", "private data", "b sample.sdf"),
+        ),
+        (
+            r"C:\A\a.sdf; /opt/b.sdf and \\server\share\c.sdf",
+            "[redacted-path]; [redacted-path] and [redacted-path]",
+            (r"C:\A\a.sdf", "/opt/b.sdf", r"\\server\share\c.sdf"),
+            ("a.sdf", "b.sdf", "server", "share", "c.sdf"),
+        ),
+        (
+            "/home/jane/a.sdf then /opt/data/b.sdf",
+            "[redacted-path] then [redacted-path]",
+            ("/home/jane/a.sdf", "/opt/data/b.sdf"),
+            ("jane", "a.sdf", "data", "b.sdf"),
+        ),
+        (
+            "/home/jane/a.sdf, /opt/data/b.sdf",
+            "[redacted-path], [redacted-path]",
+            ("/home/jane/a.sdf", "/opt/data/b.sdf"),
+            ("jane", "a.sdf", "data", "b.sdf"),
+        ),
+        (
+            "/home/jane/a.sdf; /opt/data/b.sdf",
+            "[redacted-path]; [redacted-path]",
+            ("/home/jane/a.sdf", "/opt/data/b.sdf"),
+            ("jane", "a.sdf", "data", "b.sdf"),
+        ),
+        (
+            "(/home/jane/a.sdf) (/opt/data/b.sdf)",
+            "([redacted-path]) ([redacted-path])",
+            ("/home/jane/a.sdf", "/opt/data/b.sdf"),
+            ("jane", "a.sdf", "data", "b.sdf"),
+        ),
+        (
+            "/home/jane/a.sdf\n/opt/data/b.sdf",
+            "[redacted-path]\n[redacted-path]",
+            ("/home/jane/a.sdf", "/opt/data/b.sdf"),
+            ("jane", "a.sdf", "data", "b.sdf"),
+        ),
+    ],
+    ids=[
+        "two-posix-and",
+        "two-windows-and",
+        "windows-posix-and",
+        "unc-windows-comma-then",
+        "paths-with-spaces",
+        "three-paths",
+        "separator-then",
+        "separator-comma",
+        "separator-semicolon",
+        "separator-parentheses",
+        "separator-newline",
+    ],
+)
+def test_tautomer_cli_redacts_multiple_paths_one_occurrence_at_a_time(
+    tmp_path,
+    monkeypatch,
+    message,
+    expected,
+    original_paths,
+    sensitive_fragments,
+):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    _patch_tautomer_failure(
+        monkeypatch,
+        InvalidSDFError(message),
+        attempt_id="attempt-multiple-paths",
+    )
+
+    result = runner.invoke(app, _tautomer_cli_args())
+
+    assert result.exit_code == 1
+    assert "EXECUTION ERROR" in result.output
+    assert "Attempt ID: attempt-multiple-paths" in result.output
+    assert "Input state: state-a" in result.output
+    assert f"Error: {expected}" in result.output
+    assert result.output.count("[redacted-path]") == expected.count("[redacted-path]")
+    assert "Traceback" not in result.output
+
+    for stream in _result_streams(result):
+        for absolute_path in original_paths:
+            assert absolute_path not in stream
+        for fragment in sensitive_fragments:
+            assert fragment not in stream
+
+
+@pytest.mark.parametrize(
+    "message,expected",
+    [
+        (
+            "C(=O)/N=C/C at /home/jane/a.sdf then H+/OH- equilibrium",
+            "C(=O)/N=C/C at [redacted-path] then H+/OH- equilibrium",
+        ),
+        (
+            "https://example.org/a.sdf and /home/jane/b.sdf with SMILES C/C=C/C",
+            "https://example.org/a.sdf and [redacted-path] with SMILES C/C=C/C",
+        ),
+        (
+            r"C:\Data\a.sdf then https://example.org/a.sdf and /home/jane/b.sdf",
+            "[redacted-path] then https://example.org/a.sdf and [redacted-path]",
+        ),
+        (
+            "https://example.org/a.sdf and http://example.org/b.sdf?x=1#record",
+            "https://example.org/a.sdf and http://example.org/b.sdf?x=1#record",
+        ),
+        (
+            "ratio H2O/EtOH remains unchanged",
+            "ratio H2O/EtOH remains unchanged",
+        ),
+    ],
+    ids=[
+        "chemistry-path-chemistry",
+        "url-path-chemistry",
+        "path-url-path",
+        "two-urls-no-path",
+        "no-path",
+    ],
+)
+def test_tautomer_path_sanitizer_preserves_mixed_message_boundaries(message, expected):
+    sanitized = cli_module._sanitize_tautomer_error_text(message)
+
+    assert sanitized == expected
