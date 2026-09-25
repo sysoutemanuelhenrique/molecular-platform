@@ -5104,3 +5104,174 @@ def test_tautomer_cli_resolves_all_children_before_printing_success(tmp_path, mo
     assert "Traceback" not in result.output
     assert attempt.status == "succeeded"
     _assert_path_redacted(result, failure_path)
+
+
+# =====================================================================
+# Increment 017 final sanitizer precision review
+# =====================================================================
+
+
+@pytest.mark.parametrize(
+    "case_id,absolute_path,rendered_path,sensitive_fragments",
+    [
+        (
+            "windows-drive",
+            r"C:\Users\Jane\private\ligand.sdf",
+            r"C:\Users\Jane\private\ligand.sdf",
+            ("Jane", "private", "ligand.sdf"),
+        ),
+        (
+            "windows-drive-spaces",
+            r"C:\Users\Jane Doe\private data\ligand.sdf",
+            r"C:\Users\Jane Doe\private data\ligand.sdf",
+            ("Jane Doe", "private data", "ligand.sdf"),
+        ),
+        (
+            "windows-forward-slashes",
+            "C:/Users/Jane Doe/private data/ligand.sdf",
+            "C:/Users/Jane Doe/private data/ligand.sdf",
+            ("Jane Doe", "private data", "ligand.sdf"),
+        ),
+        (
+            "unc",
+            r"\\server\share\patient\record.sdf",
+            r"\\server\share\patient\record.sdf",
+            ("server", "share", "patient", "record.sdf"),
+        ),
+        (
+            "unc-spaces",
+            r"\\server\clinical data\Jane Doe\record.sdf",
+            r"\\server\clinical data\Jane Doe\record.sdf",
+            ("server", "clinical data", "Jane Doe", "record.sdf"),
+        ),
+        (
+            "posix",
+            "/home/jane/private/ligand.sdf",
+            "/home/jane/private/ligand.sdf",
+            ("jane", "private", "ligand.sdf"),
+        ),
+        (
+            "posix-spaces",
+            "/home/jane/private data/ligand sample.sdf",
+            "/home/jane/private data/ligand sample.sdf",
+            ("jane", "private data", "ligand sample.sdf"),
+        ),
+        (
+            "single-quoted",
+            "/home/jane/private data/ligand sample.sdf",
+            "'/home/jane/private data/ligand sample.sdf'",
+            ("jane", "private data", "ligand sample.sdf"),
+        ),
+        (
+            "double-quoted",
+            r"C:\Users\Jane Doe\private data\ligand.sdf",
+            '"C:\\Users\\Jane Doe\\private data\\ligand.sdf"',
+            ("Jane Doe", "private data", "ligand.sdf"),
+        ),
+        (
+            "repr-escaped",
+            r"C:\Users\Jane Doe\private data\ligand.sdf",
+            repr(r"C:\Users\Jane Doe\private data\ligand.sdf"),
+            ("Jane Doe", "private data", "ligand.sdf"),
+        ),
+        (
+            "trailing-punctuation",
+            "/home/jane/private data/ligand sample.sdf",
+            "/home/jane/private data/ligand sample.sdf,",
+            ("jane", "private data", "ligand sample.sdf"),
+        ),
+    ],
+    ids=lambda value: value if isinstance(value, str) and value in {
+        "windows-drive",
+        "windows-drive-spaces",
+        "windows-forward-slashes",
+        "unc",
+        "unc-spaces",
+        "posix",
+        "posix-spaces",
+        "single-quoted",
+        "double-quoted",
+        "repr-escaped",
+        "trailing-punctuation",
+    } else None,
+)
+def test_tautomer_cli_precise_redaction_covers_unambiguous_absolute_paths(
+    tmp_path,
+    monkeypatch,
+    case_id,
+    absolute_path,
+    rendered_path,
+    sensitive_fragments,
+):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    _patch_tautomer_failure(
+        monkeypatch,
+        InvalidSDFError(f"could not parse SDF at {rendered_path}"),
+        attempt_id=f"attempt-precise-{case_id}",
+    )
+
+    result = runner.invoke(app, _tautomer_cli_args())
+
+    assert result.exit_code == 1
+    assert "EXECUTION ERROR" in result.output
+    assert f"Attempt ID: attempt-precise-{case_id}" in result.output
+    assert "Input state: state-a" in result.output
+    assert "[redacted-path]" in result.output
+    assert "Traceback" not in result.output
+
+    for stream in _result_streams(result):
+        assert absolute_path not in stream
+        assert rendered_path not in stream
+        for fragment in sensitive_fragments:
+            assert fragment not in stream
+
+
+@pytest.mark.parametrize(
+    "chemical_text",
+    [
+        "C(=O)/N=C/C",
+        "H+/OH- equilibrium",
+        r"N/C=C\C",
+        "SMILES C/C=C/C",
+        "ratio H2O/EtOH",
+        "pH+/OH- equilibrium",
+    ],
+)
+def test_tautomer_path_sanitizer_preserves_chemical_slash_expressions(chemical_text):
+    sanitized = cli_module._sanitize_tautomer_error_text(chemical_text)
+
+    assert sanitized == chemical_text
+    assert chemical_text in sanitized
+    assert "[redacted-path]" not in sanitized
+
+
+def test_tautomer_cli_mixed_message_redacts_only_path_and_preserves_chemistry(
+    tmp_path, monkeypatch
+):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    absolute_path = r"C:\Users\Jane Doe\private data\ligand.sdf"
+    chemical_text = "C(=O)/N=C/C"
+    _patch_tautomer_failure(
+        monkeypatch,
+        InvalidSDFError(
+            f"structure {chemical_text} could not be parsed from {absolute_path}"
+        ),
+        attempt_id="attempt-mixed-path-chemistry",
+    )
+
+    result = runner.invoke(app, _tautomer_cli_args())
+
+    assert result.exit_code == 1
+    assert "EXECUTION ERROR" in result.output
+    assert "Attempt ID: attempt-mixed-path-chemistry" in result.output
+    assert "Input state: state-a" in result.output
+    assert "[redacted-path]" in result.output
+    assert chemical_text in result.output
+    assert "Traceback" not in result.output
+
+    for stream in _result_streams(result):
+        assert absolute_path not in stream
+        assert "Jane Doe" not in stream
+        assert "private data" not in stream
+        assert "ligand.sdf" not in stream
+        assert chemical_text in stream or stream == ""

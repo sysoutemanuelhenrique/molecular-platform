@@ -857,20 +857,37 @@ def _echo_unconfirmed_removals(
         typer.echo(f"  Transformation '{operation_id}'")
 
 
-_TAUTOMER_WINDOWS_ABSOLUTE_PATH_RE = re.compile(
-    r"(?i)(?<![A-Za-z0-9_])(?:[A-Z]:(?:\\+|/)(?:[^\\/\s'\"<>|]+(?:\\+|/))*[^\\/\s'\"<>|]+)"
+_TAUTOMER_WINDOWS_DRIVE_PATH_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])"
+    r"[A-Z]:(?:\\+|/)"
+    r"(?:[^\\/\r\n'\"<>|?*]+(?:\\+|/))*"
+    r"[^\\/\r\n'\"<>|?*]*?\.[A-Za-z0-9]{1,12}"
+    r"(?:\.[A-Za-z0-9]{1,12})*"
 )
-_TAUTOMER_POSIX_ABSOLUTE_PATH_RE = re.compile(
-    r"(?<![A-Za-z0-9_:/])/(?!/)[^\s'\"<>]+"
+_TAUTOMER_UNC_PATH_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])"
+    r"\\{2,}"
+    r"[^\\/\r\n'\"<>|?*]+\\+"
+    r"(?:[^\\/\r\n'\"<>|?*]+\\+)*"
+    r"[^\\/\r\n'\"<>|?*]*?\.[A-Za-z0-9]{1,12}"
+    r"(?:\.[A-Za-z0-9]{1,12})*"
+)
+_TAUTOMER_POSIX_FILE_PATH_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9_+)\]])"
+    r"/(?!/)"
+    r"(?:[^/\r\n'\"<>]+/)+"
+    r"[^/\r\n'\"<>]*?\.[A-Za-z0-9]{1,12}"
+    r"(?:\.[A-Za-z0-9]{1,12})*"
 )
 
 
 def _sanitize_tautomer_error_text(value: object) -> str:
-    """Redact absolute filesystem paths from enumerate-tautomers presentation only."""
+    """Redact only lexically unambiguous absolute paths for this command."""
 
     text = str(value)
-    text = _TAUTOMER_WINDOWS_ABSOLUTE_PATH_RE.sub("[redacted-path]", text)
-    return _TAUTOMER_POSIX_ABSOLUTE_PATH_RE.sub("[redacted-path]", text)
+    text = _TAUTOMER_WINDOWS_DRIVE_PATH_RE.sub("[redacted-path]", text)
+    text = _TAUTOMER_UNC_PATH_RE.sub("[redacted-path]", text)
+    return _TAUTOMER_POSIX_FILE_PATH_RE.sub("[redacted-path]", text)
 
 
 def _echo_tautomer_validation_errors(error: ValidationError) -> None:
