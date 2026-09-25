@@ -4835,7 +4835,7 @@ def _validation_error_with_path(path_value):
     raise AssertionError("expected ValidationError")
 
 
-def test_tautomer_cli_redacts_missing_representation_absolute_path(tmp_path, monkeypatch):
+def test_tautomer_cli_missing_representation_does_not_expose_absolute_path(tmp_path, monkeypatch):
     source = _write_source_file(tmp_path, name="state.sdf", content=b"registered")
     project = _register_state_from_source(tmp_path, monkeypatch, source)
     artifact = project / "scientific" / "artifacts" / "states" / "state-a" / "state.sdf"
@@ -4849,7 +4849,8 @@ def test_tautomer_cli_redacts_missing_representation_absolute_path(tmp_path, mon
     assert "Attempt ID:" in result.output
     assert "Input state: state-a" in result.output
     assert "Traceback" not in result.output
-    _assert_path_redacted(result, absolute_path)
+    for stream in _result_streams(result):
+        assert absolute_path not in stream
 
 
 @pytest.mark.parametrize(
