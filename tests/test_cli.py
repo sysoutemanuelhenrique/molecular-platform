@@ -1,12 +1,25 @@
+import importlib.util
+import inspect
+import os
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
 import yaml
 from typer.testing import CliRunner
 
 import molecular.application as application_module
 import molecular.cli as cli_module
 from molecular.cli import app
+from molecular.rdkit_tautomer import (
+    IncompleteEnumerationError,
+    InvalidSDFError,
+    MultipleMoleculesError,
+    RDKitUnavailableError,
+)
 from molecular.scientific import ScientificEntity
 
 
@@ -3954,3 +3967,825 @@ def test_protein_show_writes_activity_log_error(tmp_path, monkeypatch):
     line = _last_log_line(project)
     assert "command=protein-show" in line
     assert "outcome=error" in line
+
+# =====================================================================
+# Increment 017 - Tautomer Enumeration CLI
+# =====================================================================
+
+
+_RDKIT_AVAILABLE = importlib.util.find_spec("rdkit") is not None
+
+
+def _tautomer_cli_args(*extra, input_state="state-a"):
+    return [
+        "state",
+        "enumerate-tautomers",
+        "exp001",
+        "--input-state",
+        input_state,
+        *extra,
+    ]
+
+
+def _fake_tautomer_success_attempt(operation_ids=(), *, attempt_id="attempt-017"):
+    return SimpleNamespace(
+        id=attempt_id,
+        input_state_id="state-a",
+        status="succeeded",
+        resolved=SimpleNamespace(engine_name="rdkit", engine_version="2026.03.6"),
+        operation_ids=tuple(operation_ids),
+    )
+
+
+def _patch_tautomer_success(monkeypatch, *, operation_ids=(), child_ids=None):
+    observed = {}
+    attempt = _fake_tautomer_success_attempt(operation_ids)
+    children = child_ids or {
+        operation_id: f"state-{index}"
+        for index, operation_id in enumerate(operation_ids, start=1)
+    }
+
+    def _enumerate(project_dir, *, input_state_id, policy):
+        observed["project_dir"] = project_dir
+        observed["input_state_id"] = input_state_id
+        observed["policy"] = policy
+        observed["calls"] = observed.get("calls", 0) + 1
+        return attempt
+
+    def _load_transformation(project_dir, operation_id):
+        observed.setdefault("loaded_operation_ids", []).append(operation_id)
+        return SimpleNamespace(
+            id=operation_id,
+            child_state_id=children[operation_id],
+        )
+
+    monkeypatch.setattr(cli_module, "enumerate_state_tautomers", _enumerate)
+    monkeypatch.setattr(cli_module, "load_state_transformation", _load_transformation)
+    return observed
+
+
+def _failed_wrapper(
+    original_error,
+    *,
+    attempt_id="attempt-failed-017",
+    input_state_id="state-a",
+    status="execution_failed",
+):
+    error = application_module.TautomerEnumerationAttemptFailedError(
+        attempt_id=attempt_id,
+        input_state_id=input_state_id,
+        status=status,
+        original_error=original_error,
+    )
+    error.__cause__ = original_error
+    return error
+
+
+def _fake_failed_attempt(
+    *,
+    phase="execution",
+    message="scientific failure",
+    residual_state_ids=(),
+    residual_operation_ids=(),
+):
+    return SimpleNamespace(
+        error=SimpleNamespace(
+            phase=phase,
+            message=message,
+            residual_state_ids=tuple(residual_state_ids),
+            residual_operation_ids=tuple(residual_operation_ids),
+        )
+    )
+
+
+def _patch_tautomer_failure(
+    monkeypatch,
+    original_error,
+    *,
+    status="execution_failed",
+    attempt_id="attempt-failed-017",
+    phase="execution",
+    residual_state_ids=(),
+    residual_operation_ids=(),
+):
+    wrapper = _failed_wrapper(
+        original_error,
+        attempt_id=attempt_id,
+        status=status,
+    )
+
+    def _enumerate(*args, **kwargs):
+        raise wrapper
+
+    monkeypatch.setattr(cli_module, "enumerate_state_tautomers", _enumerate)
+    monkeypatch.setattr(
+        cli_module,
+        "load_execution_attempt",
+        lambda project_dir, loaded_id: _fake_failed_attempt(
+            phase=phase,
+            message=str(original_error),
+            residual_state_ids=residual_state_ids,
+            residual_operation_ids=residual_operation_ids,
+        ),
+    )
+    return wrapper
+
+
+def _register_state_from_source(
+    tmp_path,
+    monkeypatch,
+    source_file,
+    *,
+    state_id="state-a",
+    file_format="sdf",
+):
+    project = _add_entity(tmp_path, monkeypatch)
+    result = runner.invoke(
+        app,
+        [
+            "state",
+            "add",
+            "exp001",
+            state_id,
+            "--entity",
+            "curcumin",
+            "--source-file",
+            str(source_file),
+            "--format",
+            file_format,
+        ],
+    )
+    assert result.exit_code == 0
+    return project
+
+
+def _write_rdkit_sdf(tmp_path, smiles, *, name="input.sdf", copies=1):
+    from rdkit import Chem
+
+    molecule = Chem.MolFromSmiles(smiles)
+    assert molecule is not None
+    path = tmp_path / name
+    writer = Chem.SDWriter(str(path))
+    try:
+        for _ in range(copies):
+            writer.write(molecule)
+    finally:
+        writer.close()
+    return path
+
+
+def test_tautomer_cli_01_help_documents_required_surface():
+    result = runner.invoke(app, ["state", "enumerate-tautomers", "--help"])
+
+    assert result.exit_code == 0
+    assert "--input-state" in result.output
+    assert "--max-states" in result.output
+    assert "EXPERIMENT" in result.output.upper()
+
+
+def test_tautomer_cli_02_missing_input_state_is_usage_error(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["state", "enumerate-tautomers", "exp001"])
+
+    assert result.exit_code != 0
+    assert "--input-state" in result.output
+
+
+def test_tautomer_cli_03_missing_max_states_builds_none_policy(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    observed = _patch_tautomer_success(monkeypatch)
+
+    result = runner.invoke(app, _tautomer_cli_args())
+
+    assert result.exit_code == 0
+    assert observed["calls"] == 1
+    assert observed["input_state_id"] == "state-a"
+    assert observed["policy"].schema_version == "1.0"
+    assert observed["policy"].source == "scientist"
+    assert observed["policy"].max_states is None
+
+
+def test_tautomer_cli_04_valid_max_states_builds_policy(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    observed = _patch_tautomer_success(monkeypatch)
+
+    result = runner.invoke(app, _tautomer_cli_args("--max-states", "2"))
+
+    assert result.exit_code == 0
+    assert observed["calls"] == 1
+    assert observed["policy"].max_states == 2
+
+
+def test_tautomer_cli_05_zero_max_states_rejected_before_application(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    calls = {"count": 0}
+
+    def _must_not_run(*args, **kwargs):
+        calls["count"] += 1
+        raise AssertionError("application service must not be called")
+
+    monkeypatch.setattr(cli_module, "enumerate_state_tautomers", _must_not_run)
+    result = runner.invoke(app, _tautomer_cli_args("--max-states", "0"))
+
+    assert result.exit_code == 1
+    assert "CONFIGURATION ERROR" in result.output
+    assert calls["count"] == 0
+
+
+def test_tautomer_cli_06_negative_max_states_rejected_before_application(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    calls = {"count": 0}
+
+    def _must_not_run(*args, **kwargs):
+        calls["count"] += 1
+        raise AssertionError("application service must not be called")
+
+    monkeypatch.setattr(cli_module, "enumerate_state_tautomers", _must_not_run)
+    result = runner.invoke(app, _tautomer_cli_args("--max-states", "-1"))
+
+    assert result.exit_code == 1
+    assert "CONFIGURATION ERROR" in result.output
+    assert calls["count"] == 0
+
+
+def test_tautomer_cli_07_malformed_input_state_rejected_before_application(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    calls = {"count": 0}
+
+    def _must_not_run(*args, **kwargs):
+        calls["count"] += 1
+        raise AssertionError("application service must not be called")
+
+    monkeypatch.setattr(cli_module, "enumerate_state_tautomers", _must_not_run)
+    result = runner.invoke(app, _tautomer_cli_args(input_state="bad id"))
+
+    assert result.exit_code == 1
+    assert "INPUT ERROR" in result.output
+    assert calls["count"] == 0
+
+
+@pytest.mark.skipif(_RDKIT_AVAILABLE, reason="requires an environment without RDKit")
+def test_tautomer_cli_08a_missing_state_without_rdkit_is_input_error(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, _tautomer_cli_args(input_state="missing-state"))
+
+    assert result.exit_code == 1
+    assert "INPUT ERROR" in result.output
+    assert "resolution_failed" in result.output
+
+
+@pytest.mark.skipif(not _RDKIT_AVAILABLE, reason="requires RDKit")
+def test_tautomer_cli_08b_missing_state_with_rdkit_is_input_error(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, _tautomer_cli_args(input_state="missing-state"))
+
+    assert result.exit_code == 1
+    assert "INPUT ERROR" in result.output
+    assert "resolution_failed" in result.output
+
+
+def test_tautomer_cli_09_non_sdf_representation_is_resolution_input_error(tmp_path, monkeypatch):
+    source = _write_source_file(tmp_path, name="state.smi", content=b"C\n")
+    _register_state_from_source(
+        tmp_path,
+        monkeypatch,
+        source,
+        file_format="smiles",
+    )
+
+    result = runner.invoke(app, _tautomer_cli_args())
+
+    assert result.exit_code == 1
+    assert "INPUT ERROR" in result.output
+    assert "Status: resolution_failed" in result.output
+    assert "expected 'sdf'" in result.output
+
+
+def test_tautomer_cli_10_checksum_mismatch_is_resolution_input_error(tmp_path, monkeypatch):
+    source = _write_source_file(tmp_path, name="state.sdf", content=b"original")
+    project = _register_state_from_source(tmp_path, monkeypatch, source)
+    artifact = project / "scientific" / "artifacts" / "states" / "state-a" / "state.sdf"
+    artifact.write_bytes(b"changed-after-registration")
+
+    result = runner.invoke(app, _tautomer_cli_args())
+
+    assert result.exit_code == 1
+    assert "INPUT ERROR" in result.output
+    assert "Status: resolution_failed" in result.output
+    assert "checksum mismatch" in result.output
+
+
+@pytest.mark.skipif(_RDKIT_AVAILABLE, reason="requires an environment without RDKit")
+def test_tautomer_cli_11_rdkit_absence_is_configuration_error(tmp_path, monkeypatch):
+    source = _write_source_file(tmp_path, name="state.sdf", content=b"not-read-without-rdkit")
+    _register_state_from_source(tmp_path, monkeypatch, source)
+
+    result = runner.invoke(app, _tautomer_cli_args())
+
+    assert result.exit_code == 1
+    assert "CONFIGURATION ERROR" in result.output
+    assert "Status: resolution_failed" in result.output
+
+
+def test_tautomer_cli_12_zero_new_states_is_success(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    observed = _patch_tautomer_success(monkeypatch, operation_ids=())
+
+    result = runner.invoke(app, _tautomer_cli_args())
+
+    assert result.exit_code == 0
+    assert observed["calls"] == 1
+    assert "TAUTOMER ENUMERATION" in result.output
+    assert "Status: succeeded" in result.output
+    assert "New states published: 0" in result.output
+    assert "transformation '" not in result.output
+
+
+@pytest.mark.skipif(not _RDKIT_AVAILABLE, reason="requires RDKit")
+def test_tautomer_cli_13_one_tautomer_real_end_to_end(tmp_path, monkeypatch):
+    source = _write_rdkit_sdf(
+        tmp_path,
+        "Nc1nc2[nH]cnc2c(=O)[nH]1",
+        name="guanine.sdf",
+    )
+    _register_state_from_source(tmp_path, monkeypatch, source)
+
+    result = runner.invoke(app, _tautomer_cli_args("--max-states", "1"))
+
+    assert result.exit_code == 0
+    assert "Status: succeeded" in result.output
+    assert "New states published: 1" in result.output
+    assert "(transformation '" in result.output
+
+
+def test_tautomer_cli_14_multiple_states_success_output(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    observed = _patch_tautomer_success(
+        monkeypatch,
+        operation_ids=("op-1", "op-2", "op-3"),
+        child_ids={"op-1": "state-1", "op-2": "state-2", "op-3": "state-3"},
+    )
+
+    result = runner.invoke(app, _tautomer_cli_args())
+
+    assert result.exit_code == 0
+    assert observed["calls"] == 1
+    assert "New states published: 3" in result.output
+    assert "State 'state-1'  (transformation 'op-1')" in result.output
+    assert "State 'state-3'  (transformation 'op-3')" in result.output
+
+
+def test_tautomer_cli_15_max_states_truncation_surface(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    observed = _patch_tautomer_success(
+        monkeypatch,
+        operation_ids=("op-1", "op-2"),
+        child_ids={"op-1": "state-1", "op-2": "state-2"},
+    )
+
+    result = runner.invoke(app, _tautomer_cli_args("--max-states", "2"))
+
+    assert result.exit_code == 0
+    assert observed["policy"].max_states == 2
+    assert "New states published: 2" in result.output
+    assert "op-1" in result.output
+    assert "op-2" in result.output
+
+
+def test_tautomer_cli_16_output_preserves_operation_id_order(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    _patch_tautomer_success(
+        monkeypatch,
+        operation_ids=("op-b", "op-a"),
+        child_ids={"op-b": "state-b", "op-a": "state-a-child"},
+    )
+
+    result = runner.invoke(app, _tautomer_cli_args())
+
+    assert result.exit_code == 0
+    assert result.output.index("op-b") < result.output.index("op-a")
+    assert result.output.index("state-b") < result.output.index("state-a-child")
+
+
+def test_tautomer_cli_17_invalid_sdf_is_execution_error(tmp_path, monkeypatch):
+    source = _write_source_file(tmp_path, name="broken.sdf", content=b"this is not an SDF")
+    _register_state_from_source(tmp_path, monkeypatch, source)
+
+    result = runner.invoke(app, _tautomer_cli_args())
+
+    assert result.exit_code == 1
+    assert "EXECUTION ERROR" in result.output
+    assert "Status: execution_failed" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_tautomer_cli_18_multiple_molecules_is_execution_error(tmp_path, monkeypatch):
+    source = _write_rdkit_sdf(tmp_path, "CCO", name="three.sdf", copies=3)
+    _register_state_from_source(tmp_path, monkeypatch, source)
+
+    result = runner.invoke(app, _tautomer_cli_args())
+
+    assert result.exit_code == 1
+    assert "EXECUTION ERROR" in result.output
+    assert "Status: execution_failed" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_tautomer_cli_19_incomplete_enumeration_maps_to_execution_error(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    original = IncompleteEnumerationError(
+        status="max-tautomers-reached",
+        tautomer_count=2,
+    )
+    _patch_tautomer_failure(monkeypatch, original)
+
+    result = runner.invoke(app, _tautomer_cli_args())
+
+    assert result.exit_code == 1
+    assert "EXECUTION ERROR" in result.output
+    assert "TAUTOMER ENUMERATION FAILED" in result.output
+
+
+def test_tautomer_cli_20_generic_value_error_maps_to_input_error(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    original = ValueError("representation format mismatch")
+    _patch_tautomer_failure(
+        monkeypatch,
+        original,
+        status="resolution_failed",
+        phase="resolution",
+    )
+
+    result = runner.invoke(app, _tautomer_cli_args())
+
+    assert result.exit_code == 1
+    assert "INPUT ERROR" in result.output
+    assert "EXECUTION ERROR" not in result.output
+
+
+def test_tautomer_cli_21_file_exists_maps_to_input_error(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    _patch_tautomer_failure(monkeypatch, FileExistsError("generated identity collision"))
+
+    result = runner.invoke(app, _tautomer_cli_args())
+
+    assert result.exit_code == 1
+    assert "INPUT ERROR" in result.output
+
+
+def test_tautomer_cli_22_oserror_maps_to_storage_error(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    _patch_tautomer_failure(monkeypatch, OSError("disk full"))
+
+    result = runner.invoke(app, _tautomer_cli_args())
+
+    assert result.exit_code == 1
+    assert "STORAGE ERROR" in result.output
+
+
+def test_tautomer_cli_23_failed_wrapper_displays_its_attempt_id(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    _patch_tautomer_failure(
+        monkeypatch,
+        InvalidSDFError("bad sdf"),
+        attempt_id="attempt-exact-23",
+    )
+
+    result = runner.invoke(app, _tautomer_cli_args())
+
+    assert result.exit_code == 1
+    assert "Attempt ID: attempt-exact-23" in result.output
+
+
+def test_tautomer_cli_25_loads_exact_attempt_id_from_wrapper(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    original = InvalidSDFError("bad sdf")
+    wrapper = _failed_wrapper(original, attempt_id="attempt-exact-25")
+    loaded = []
+
+    def _enumerate(*args, **kwargs):
+        raise wrapper
+
+    def _load(project_dir, attempt_id):
+        loaded.append(attempt_id)
+        return _fake_failed_attempt(message=str(original))
+
+    monkeypatch.setattr(cli_module, "enumerate_state_tautomers", _enumerate)
+    monkeypatch.setattr(cli_module, "load_execution_attempt", _load)
+
+    result = runner.invoke(app, _tautomer_cli_args())
+
+    assert result.exit_code == 1
+    assert loaded == ["attempt-exact-25"]
+
+
+def test_tautomer_cli_28_uses_no_attempt_directory_diff_or_direct_rdkit_import():
+    command_source = inspect.getsource(cli_module.state_enumerate_tautomers)
+    module_source = inspect.getsource(cli_module)
+
+    assert "execution_attempts" not in command_source
+    assert ".iterdir(" not in command_source
+    assert ".glob(" not in command_source
+    assert "load_execution_attempt(context.project_dir, error.attempt_id)" in command_source
+    assert "from rdkit " not in module_source
+    assert "from rdkit." not in module_source
+    assert "import rdkit" not in module_source
+
+
+def test_tautomer_cli_29_no_residuals_omits_unconfirmed_section(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    _patch_tautomer_failure(monkeypatch, InvalidSDFError("bad sdf"))
+
+    result = runner.invoke(app, _tautomer_cli_args())
+
+    assert result.exit_code == 1
+    assert "Unconfirmed removals" not in result.output
+
+
+def test_tautomer_cli_30_state_residuals_are_unconfirmed(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    _patch_tautomer_failure(
+        monkeypatch,
+        OSError("publication failed"),
+        residual_state_ids=("state-residual",),
+    )
+
+    result = runner.invoke(app, _tautomer_cli_args())
+
+    assert result.exit_code == 1
+    assert "Unconfirmed removals: 1 state(s), 0 transformation(s)" in result.output
+    assert "State 'state-residual'" in result.output
+
+
+def test_tautomer_cli_31_operation_residuals_are_unconfirmed(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    _patch_tautomer_failure(
+        monkeypatch,
+        OSError("publication failed"),
+        residual_operation_ids=("op-residual",),
+    )
+
+    result = runner.invoke(app, _tautomer_cli_args())
+
+    assert result.exit_code == 1
+    assert "Unconfirmed removals: 0 state(s), 1 transformation(s)" in result.output
+    assert "Transformation 'op-residual'" in result.output
+
+
+def test_tautomer_cli_32_both_residual_kinds_are_unconfirmed(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    _patch_tautomer_failure(
+        monkeypatch,
+        OSError("publication failed"),
+        residual_state_ids=("state-residual",),
+        residual_operation_ids=("op-residual",),
+    )
+
+    result = runner.invoke(app, _tautomer_cli_args())
+
+    assert result.exit_code == 1
+    assert "Unconfirmed removals: 1 state(s), 1 transformation(s)" in result.output
+    assert "State 'state-residual'" in result.output
+    assert "Transformation 'op-residual'" in result.output
+
+
+def test_tautomer_cli_33_attempt_load_failure_uses_fallback_template(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    original = InvalidSDFError("bad sdf")
+    wrapper = _failed_wrapper(original, attempt_id="attempt-fallback-33")
+
+    def _enumerate(*args, **kwargs):
+        raise wrapper
+
+    def _fail_load(*args, **kwargs):
+        raise FileNotFoundError("attempt disappeared")
+
+    monkeypatch.setattr(cli_module, "enumerate_state_tautomers", _enumerate)
+    monkeypatch.setattr(cli_module, "load_execution_attempt", _fail_load)
+
+    result = runner.invoke(app, _tautomer_cli_args())
+
+    assert result.exit_code == 1
+    assert "Attempt ID: attempt-fallback-33" in result.output
+    assert "Input state: state-a" in result.output
+    assert "Status: execution_failed" in result.output
+    assert "Error: bad sdf" in result.output
+    assert "(additional attempt details could not be loaded)" in result.output
+    assert "Phase:" not in result.output
+    assert "Unconfirmed removals" not in result.output
+
+
+@pytest.mark.skipif(not _RDKIT_AVAILABLE, reason="requires RDKit")
+def test_tautomer_cli_34_native_max_tautomer_log_does_not_leak_to_output_channels(
+    tmp_path, monkeypatch
+):
+    source = _write_rdkit_sdf(
+        tmp_path,
+        "Nc1nc2[nH]cnc2c(=O)[nH]1",
+        name="guanine-max.sdf",
+    )
+    _register_state_from_source(tmp_path, monkeypatch, source)
+
+    script = (
+        "import molecular.rdkit_tautomer as r; "
+        "r._MAX_TAUTOMERS = 2; "
+        "from molecular.cli import app; "
+        "app()"
+    )
+    environment = os.environ.copy()
+    source_root = str(Path(__file__).resolve().parents[1] / "src")
+    environment["PYTHONPATH"] = (
+        source_root
+        if not environment.get("PYTHONPATH")
+        else source_root + os.pathsep + environment["PYTHONPATH"]
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            "state",
+            "enumerate-tautomers",
+            "exp001",
+            "--input-state",
+            "state-a",
+        ],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert "EXECUTION ERROR" in completed.stdout
+    assert "Tautomer enumeration stopped" not in completed.stdout
+    assert "Tautomer enumeration stopped" not in completed.stderr
+
+
+def test_tautomer_cli_38_activity_log_is_not_duplicated_by_cli(tmp_path, monkeypatch):
+    source = _write_source_file(tmp_path, name="broken-log.sdf", content=b"not an sdf")
+    project = _register_state_from_source(tmp_path, monkeypatch, source)
+
+    runner.invoke(app, _tautomer_cli_args())
+
+    lines = (project / "logs" / "activity.log").read_text(encoding="utf-8").splitlines()
+    enumeration_lines = [
+        line for line in lines if "command=enumerate-state-tautomers" in line
+    ]
+    assert len(enumeration_lines) == 2
+    assert "outcome=started" in enumeration_lines[0]
+    assert "outcome=error" in enumeration_lines[1]
+
+
+def test_tautomer_cli_40_existing_state_show_command_still_works(tmp_path, monkeypatch):
+    _add_entity_and_state(tmp_path, monkeypatch, state_id="state-a")
+
+    result = runner.invoke(app, ["state", "show", "exp001", "state-a"])
+
+    assert result.exit_code == 0
+    assert "ID: state-a" in result.output
+
+
+def test_tautomer_cli_39a_ki_propagates_keyboard_interrupt(tmp_path, monkeypatch):
+    context = SimpleNamespace(project_dir=tmp_path)
+    interruption = KeyboardInterrupt()
+
+    monkeypatch.setattr(cli_module, "_resolve_experiment_or_exit", lambda identifier: context)
+
+    def _interrupt(*args, **kwargs):
+        raise interruption
+
+    monkeypatch.setattr(cli_module, "enumerate_state_tautomers", _interrupt)
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        cli_module.state_enumerate_tautomers(
+            "exp001",
+            input_state="state-a",
+            max_states=None,
+        )
+
+    assert caught.value is interruption
+
+
+def test_tautomer_cli_39a_se_propagates_system_exit(tmp_path, monkeypatch):
+    context = SimpleNamespace(project_dir=tmp_path)
+    interruption = SystemExit(17)
+
+    monkeypatch.setattr(cli_module, "_resolve_experiment_or_exit", lambda identifier: context)
+
+    def _interrupt(*args, **kwargs):
+        raise interruption
+
+    monkeypatch.setattr(cli_module, "enumerate_state_tautomers", _interrupt)
+
+    with pytest.raises(SystemExit) as caught:
+        cli_module.state_enumerate_tautomers(
+            "exp001",
+            input_state="state-a",
+            max_states=None,
+        )
+
+    assert caught.value is interruption
+
+
+def test_tautomer_cli_48_persistence_wrapper_maps_to_storage_error(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    original = InvalidSDFError("scientific failure")
+    persistence = OSError("could not persist terminal status")
+    wrapper = application_module.TautomerEnumerationAttemptPersistenceError(
+        attempt_id="attempt-persistence-48",
+        input_state_id="state-a",
+        intended_status="execution_failed",
+        phase="execution",
+        original_error=original,
+        persistence_error=persistence,
+        residual_state_ids=("state-residual",),
+        residual_operation_ids=("op-residual",),
+    )
+    wrapper.__cause__ = persistence
+
+    def _enumerate(*args, **kwargs):
+        raise wrapper
+
+    monkeypatch.setattr(cli_module, "enumerate_state_tautomers", _enumerate)
+
+    result = runner.invoke(app, _tautomer_cli_args())
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "STORAGE ERROR" in result.output
+    assert "Attempt ID: attempt-persistence-48" in result.output
+    assert "Input state: state-a" in result.output
+    assert "Phase: execution" in result.output
+    assert "Intended status: execution_failed" in result.output
+    assert "Terminal status persisted: no" in result.output
+    assert "Original error: scientific failure" in result.output
+    assert "Persistence error: could not persist terminal status" in result.output
+    assert "Unconfirmed removals: 1 state(s), 1 transformation(s)" in result.output
+
+
+def test_tautomer_cli_49_persistence_path_performs_no_retry_reload_or_compensation(
+    tmp_path, monkeypatch
+):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    original = InvalidSDFError("scientific failure")
+    persistence = OSError("terminal persistence failed")
+    wrapper = application_module.TautomerEnumerationAttemptPersistenceError(
+        attempt_id="attempt-persistence-49",
+        input_state_id="state-a",
+        intended_status="execution_failed",
+        phase="execution",
+        original_error=original,
+        persistence_error=persistence,
+        residual_state_ids=(),
+        residual_operation_ids=(),
+    )
+    counters = {
+        "load": 0,
+        "mark_resolution_failed": 0,
+        "mark_execution_failed": 0,
+        "compensate": 0,
+    }
+
+    def _enumerate(*args, **kwargs):
+        raise wrapper
+
+    def _count(name):
+        def _spy(*args, **kwargs):
+            counters[name] += 1
+            raise AssertionError(f"{name} must not be called by the CLI")
+
+        return _spy
+
+    monkeypatch.setattr(cli_module, "enumerate_state_tautomers", _enumerate)
+    monkeypatch.setattr(cli_module, "load_execution_attempt", _count("load"))
+    monkeypatch.setattr(
+        application_module,
+        "mark_resolution_failed",
+        _count("mark_resolution_failed"),
+    )
+    monkeypatch.setattr(
+        application_module,
+        "mark_execution_failed",
+        _count("mark_execution_failed"),
+    )
+    monkeypatch.setattr(
+        application_module,
+        "_compensate_published_candidates",
+        _count("compensate"),
+    )
+
+    result = runner.invoke(app, _tautomer_cli_args())
+
+    assert result.exit_code == 1
+    assert "STORAGE ERROR" in result.output
+    assert counters == {
+        "load": 0,
+        "mark_resolution_failed": 0,
+        "mark_execution_failed": 0,
+        "compensate": 0,
+    }

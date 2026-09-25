@@ -10,6 +10,9 @@ from pydantic import ValidationError
 from molecular.activity import record_activity
 from molecular.application import (
     InvalidPubChemCidError,
+    TautomerEnumerationAttemptFailedError,
+    TautomerEnumerationAttemptPersistenceError,
+    enumerate_state_tautomers,
     register_derived_state,
     register_ligand_from_pubchem,
 )
@@ -23,9 +26,17 @@ from molecular.context import (
     resolve_experiment,
     scan_experiments,
 )
+from molecular.execution import TautomerEnumerationPolicy
+from molecular.execution_registry import load_execution_attempt
 from molecular.inputs import validate_input_id
 from molecular.models import ExperimentConfig
 from molecular.pubchem import PubChemAcquisitionError, PubChemNotFoundError
+from molecular.rdkit_tautomer import (
+    IncompleteEnumerationError,
+    InvalidSDFError,
+    MultipleMoleculesError,
+    RDKitUnavailableError,
+)
 from molecular.registry import load_ligand, load_protein, register_ligand, register_protein
 from molecular.scientific import ScientificEntity
 from molecular.scientific_registry import (
@@ -39,7 +50,10 @@ from molecular.scientific_registry import (
     register_state,
 )
 from molecular.transformation import TransformationParameter, TransformationProducer
-from molecular.transformation_registry import list_state_transformations
+from molecular.transformation_registry import (
+    list_state_transformations,
+    load_state_transformation,
+)
 
 app = typer.Typer(
     help="Molecular Platform - scientific molecular research platform."
@@ -804,6 +818,169 @@ def state_list(
 
     for state in states:
         typer.echo(f"{state.id}  (entity={state.entity_id})")
+
+
+def _echo_unconfirmed_removals(
+    residual_state_ids: tuple[str, ...],
+    residual_operation_ids: tuple[str, ...],
+) -> None:
+    """Render only removals whose cleanup could not be confirmed."""
+
+    if not residual_state_ids and not residual_operation_ids:
+        return
+
+    typer.echo()
+    typer.echo(
+        "Unconfirmed removals: "
+        f"{len(residual_state_ids)} state(s), "
+        f"{len(residual_operation_ids)} transformation(s)"
+    )
+    for state_id in residual_state_ids:
+        typer.echo(f"  State '{state_id}'")
+    for operation_id in residual_operation_ids:
+        typer.echo(f"  Transformation '{operation_id}'")
+
+
+def _tautomer_failure_banner(error: BaseException) -> str:
+    """Map the structured original cause to the frozen CLI vocabulary."""
+
+    if isinstance(error, (InvalidSDFError, MultipleMoleculesError, IncompleteEnumerationError)):
+        return "EXECUTION ERROR"
+    if isinstance(error, RDKitUnavailableError):
+        return "CONFIGURATION ERROR"
+    if isinstance(error, (FileNotFoundError, FileExistsError)):
+        return "INPUT ERROR"
+    if isinstance(error, ValueError):
+        return "INPUT ERROR"
+    if isinstance(error, OSError):
+        return "STORAGE ERROR"
+    return "EXECUTION ERROR"
+
+
+@state_app.command("enumerate-tautomers")
+def state_enumerate_tautomers(
+    experiment: str,
+    input_state: str = typer.Option(..., "--input-state"),
+    max_states: Optional[int] = typer.Option(None, "--max-states"),
+):
+    """Enumerate and publish tautomeric states from an existing MolecularState."""
+
+    context = _resolve_experiment_or_exit(experiment)
+    validated_input_state = _validate_id_or_exit(
+        input_state,
+        project_dir=context.project_dir,
+        command="state-enumerate-tautomers",
+    )
+
+    try:
+        policy = TautomerEnumerationPolicy(
+            schema_version="1.0",
+            max_states=max_states,
+            source="scientist",
+        )
+    except ValidationError as error:
+        typer.echo("CONFIGURATION ERROR")
+        _echo_validation_errors(error)
+        raise typer.Exit(code=1)
+
+    try:
+        attempt = enumerate_state_tautomers(
+            context.project_dir,
+            input_state_id=validated_input_state,
+            policy=policy,
+        )
+
+    except TautomerEnumerationAttemptPersistenceError as error:
+        typer.echo("STORAGE ERROR")
+        typer.echo()
+        typer.echo(f"Attempt ID: {error.attempt_id}")
+        typer.echo(f"Input state: {error.input_state_id}")
+        typer.echo(f"Phase: {error.phase}")
+        typer.echo(f"Intended status: {error.intended_status}")
+        typer.echo("Terminal status persisted: no")
+        typer.echo(f"Original error: {str(error.original_error)}")
+        typer.echo(f"Persistence error: {str(error.persistence_error)}")
+        _echo_unconfirmed_removals(
+            error.residual_state_ids,
+            error.residual_operation_ids,
+        )
+        raise typer.Exit(code=1)
+
+    except TautomerEnumerationAttemptFailedError as error:
+        typer.echo(_tautomer_failure_banner(error.original_error))
+        typer.echo()
+
+        try:
+            failed_attempt = load_execution_attempt(context.project_dir, error.attempt_id)
+        except Exception:
+            typer.echo("TAUTOMER ENUMERATION FAILED")
+            typer.echo()
+            typer.echo(f"Attempt ID: {error.attempt_id}")
+            typer.echo(f"Input state: {error.input_state_id}")
+            typer.echo(f"Status: {error.status}")
+            typer.echo(f"Error: {str(error.original_error)}")
+            typer.echo()
+            typer.echo("(additional attempt details could not be loaded)")
+            raise typer.Exit(code=1)
+
+        typer.echo("TAUTOMER ENUMERATION FAILED")
+        typer.echo()
+        typer.echo(f"Attempt ID: {error.attempt_id}")
+        typer.echo(f"Input state: {error.input_state_id}")
+        typer.echo(f"Status: {error.status}")
+        typer.echo(f"Phase: {failed_attempt.error.phase}")
+        typer.echo(f"Error: {failed_attempt.error.message}")
+        _echo_unconfirmed_removals(
+            failed_attempt.error.residual_state_ids,
+            failed_attempt.error.residual_operation_ids,
+        )
+        raise typer.Exit(code=1)
+
+    except FileNotFoundError as error:
+        typer.echo("INPUT ERROR")
+        typer.echo(str(error))
+        raise typer.Exit(code=1)
+
+    except FileExistsError as error:
+        typer.echo("INPUT ERROR")
+        typer.echo(str(error))
+        raise typer.Exit(code=1)
+
+    except ValidationError as error:
+        typer.echo("CONFIGURATION ERROR")
+        _echo_validation_errors(error)
+        raise typer.Exit(code=1)
+
+    except ValueError as error:
+        typer.echo("INPUT ERROR")
+        typer.echo(str(error))
+        raise typer.Exit(code=1)
+
+    except OSError as error:
+        typer.echo("STORAGE ERROR")
+        typer.echo(str(error))
+        raise typer.Exit(code=1)
+
+    operation_ids = tuple(attempt.operation_ids or ())
+    transformations = [
+        load_state_transformation(context.project_dir, operation_id)
+        for operation_id in operation_ids
+    ]
+
+    typer.echo("TAUTOMER ENUMERATION")
+    typer.echo()
+    typer.echo(f"Attempt ID: {attempt.id}")
+    typer.echo(f"Input state: {validated_input_state}")
+    typer.echo("Status: succeeded")
+    typer.echo(f"Engine: {attempt.resolved.engine_name} {attempt.resolved.engine_version}")
+    typer.echo(f"New states published: {len(operation_ids)}")
+    typer.echo()
+
+    for operation_id, transformation in zip(operation_ids, transformations):
+        typer.echo(
+            f"  State '{transformation.child_state_id}'  "
+            f"(transformation '{operation_id}')"
+        )
 
 
 def _split_param(entry: str) -> Tuple[str, str]:
