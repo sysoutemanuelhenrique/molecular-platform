@@ -1554,6 +1554,7 @@ def test_mark_execution_failed_oserror_preserves_local_compensation_residuals(
     """Normative item 43."""
 
     _setup_input_state(tmp_path)
+    _capture_activity_calls(monkeypatch)
     fixed_uuid, uuid_calls = _install_controlled_attempt_uuid(monkeypatch)
     original_error = OSError("simulated second state publication failure")
     persistence_error = OSError("simulated execution terminal persistence failure")
@@ -1688,8 +1689,7 @@ def test_corrupted_attempt_yaml_validation_error_becomes_persistence_wrapper(
     is corrupted; real mark/load code must surface pydantic.ValidationError
     through TautomerEnumerationAttemptPersistenceError."""
 
-    if phase == "execution":
-        _setup_input_state(tmp_path)
+    _setup_input_state(tmp_path)
 
     fixed_uuid, _ = _install_controlled_attempt_uuid(monkeypatch)
     attempt_file = tmp_path / "scientific" / "execution_attempts" / f"{fixed_uuid.hex}.yaml"
