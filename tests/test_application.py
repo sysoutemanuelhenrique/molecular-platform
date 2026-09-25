@@ -1554,7 +1554,6 @@ def test_mark_execution_failed_oserror_preserves_local_compensation_residuals(
     """Normative item 43."""
 
     _setup_input_state(tmp_path)
-    _capture_activity_calls(monkeypatch)
     fixed_uuid, uuid_calls = _install_controlled_attempt_uuid(monkeypatch)
     original_error = OSError("simulated second state publication failure")
     persistence_error = OSError("simulated execution terminal persistence failure")
@@ -1598,7 +1597,8 @@ def test_mark_execution_failed_oserror_preserves_local_compensation_residuals(
     assert len(error.residual_operation_ids) == 1
     assert all(item != fixed_uuid.hex for item in error.residual_state_ids)
     assert all(item != fixed_uuid.hex for item in error.residual_operation_ids)
-    assert uuid_calls["count"] == 7
+    # 1 attempt + 6 staged candidate ids + 1 successful register_state staging id.
+    assert uuid_calls["count"] == 8
 
     states_dir = tmp_path / "scientific" / "states"
     transformations_dir = tmp_path / "scientific" / "transformations"
