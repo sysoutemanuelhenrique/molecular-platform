@@ -8,7 +8,7 @@ import pytest
 
 pytest.importorskip("rdkit")
 
-from rdkit import Chem
+from rdkit import Chem, rdBase
 from rdkit.Chem import rdMolDescriptors
 from rdkit.Chem.MolStandardize import rdMolStandardize
 
@@ -255,6 +255,27 @@ def test_status_max_tautomers_reached(tmp_path, monkeypatch):
 
     assert exc_info.value.status == "max-tautomers-reached"
     assert exc_info.value.tautomer_count == 2
+
+
+def test_enumeration_logs_are_suppressed_and_restored_after_incomplete_status(
+    tmp_path, monkeypatch, capfd
+):
+    monkeypatch.setattr(rdkit_tautomer_module, "_MAX_TAUTOMERS", 2)
+    sdf_path = _write_sdf(tmp_path, "guanine.sdf", "Nc1nc2[nH]cnc2c(=O)[nH]1")
+
+    capfd.readouterr()
+    with pytest.raises(IncompleteEnumerationError) as exc_info:
+        enumerate_tautomers_rdkit(source_path=sdf_path, source_format="sdf")
+
+    captured = capfd.readouterr()
+    assert exc_info.value.status == "max-tautomers-reached"
+    assert exc_info.value.tautomer_count == 2
+    assert "Tautomer enumeration stopped" not in captured.err
+
+    marker = "__increment017_rdkit_logs_restored__"
+    rdBase.LogWarningMsg(marker)
+    restored = capfd.readouterr()
+    assert marker in restored.err
 
 
 def test_status_max_transforms_reached(tmp_path, monkeypatch):

@@ -325,7 +325,8 @@ def enumerate_tautomers_rdkit(
     entry_smiles = Chem.MolToSmiles(input_mol, isomericSmiles=True)
 
     enumerator = _build_enumerator()
-    result = enumerator.Enumerate(input_mol)
+    with rdBase.BlockLogs():
+        result = enumerator.Enumerate(input_mol)
 
     if result.status != rdMolStandardize.TautomerEnumeratorStatus.Completed:
         raise IncompleteEnumerationError(
