@@ -4654,7 +4654,11 @@ def test_tautomer_cli_39a_ki_propagates_keyboard_interrupt(tmp_path, monkeypatch
     context = SimpleNamespace(project_dir=tmp_path)
     interruption = KeyboardInterrupt()
 
-    monkeypatch.setattr(cli_module, "_resolve_experiment_or_exit", lambda identifier: context)
+    monkeypatch.setattr(
+        cli_module,
+        "_resolve_experiment_or_exit",
+        lambda identifier, **kwargs: context,
+    )
 
     def _interrupt(*args, **kwargs):
         raise interruption
@@ -4675,7 +4679,11 @@ def test_tautomer_cli_39a_se_propagates_system_exit(tmp_path, monkeypatch):
     context = SimpleNamespace(project_dir=tmp_path)
     interruption = SystemExit(17)
 
-    monkeypatch.setattr(cli_module, "_resolve_experiment_or_exit", lambda identifier: context)
+    monkeypatch.setattr(
+        cli_module,
+        "_resolve_experiment_or_exit",
+        lambda identifier, **kwargs: context,
+    )
 
     def _interrupt(*args, **kwargs):
         raise interruption
@@ -4789,3 +4797,309 @@ def test_tautomer_cli_49_persistence_path_performs_no_retry_reload_or_compensati
         "mark_execution_failed": 0,
         "compensate": 0,
     }
+
+
+# =====================================================================
+# Increment 017 post-microreview hardening
+# =====================================================================
+
+
+def _result_streams(result):
+    streams = [result.output]
+    for name in ("stdout", "stderr"):
+        try:
+            value = getattr(result, name)
+        except (AttributeError, ValueError):
+            continue
+        if value not in streams:
+            streams.append(value)
+    return streams
+
+
+def _assert_path_redacted(result, *absolute_paths):
+    for stream in _result_streams(result):
+        for absolute_path in absolute_paths:
+            assert absolute_path not in stream
+    assert "[redacted-path]" in result.output
+
+
+def _validation_error_with_path(path_value):
+    try:
+        cli_module.TautomerEnumerationPolicy(
+            schema_version="1.0",
+            max_states=path_value,
+            source="scientist",
+        )
+    except cli_module.ValidationError as error:
+        return error
+    raise AssertionError("expected ValidationError")
+
+
+def test_tautomer_cli_redacts_missing_representation_absolute_path(tmp_path, monkeypatch):
+    source = _write_source_file(tmp_path, name="state.sdf", content=b"registered")
+    project = _register_state_from_source(tmp_path, monkeypatch, source)
+    artifact = project / "scientific" / "artifacts" / "states" / "state-a" / "state.sdf"
+    artifact.unlink()
+    absolute_path = str(artifact)
+
+    result = runner.invoke(app, _tautomer_cli_args())
+
+    assert result.exit_code == 1
+    assert "INPUT ERROR" in result.output
+    assert "Attempt ID:" in result.output
+    assert "Input state: state-a" in result.output
+    assert "Traceback" not in result.output
+    _assert_path_redacted(result, absolute_path)
+
+
+@pytest.mark.parametrize(
+    "absolute_path",
+    [
+        r"C:\Users\Pichau\molecular-platform\inputs\ligand.sdf",
+        "/home/user/molecular-platform/inputs/ligand.sdf",
+    ],
+    ids=["windows", "posix"],
+)
+def test_tautomer_cli_redacts_invalid_sdf_absolute_paths(
+    tmp_path, monkeypatch, absolute_path
+):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    _patch_tautomer_failure(
+        monkeypatch,
+        InvalidSDFError(f"could not parse SDF at {absolute_path}"),
+        attempt_id="attempt-redact-invalid-sdf",
+    )
+
+    result = runner.invoke(app, _tautomer_cli_args())
+
+    assert result.exit_code == 1
+    assert "EXECUTION ERROR" in result.output
+    assert "Attempt ID: attempt-redact-invalid-sdf" in result.output
+    assert "Input state: state-a" in result.output
+    assert "Traceback" not in result.output
+    _assert_path_redacted(result, absolute_path)
+
+
+def test_tautomer_cli_redacts_persisted_scientific_error_message(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    persisted_path = "/srv/molecular/private/run/input.sdf"
+    original = InvalidSDFError("scientific parse failure")
+    wrapper = _failed_wrapper(
+        original,
+        attempt_id="attempt-redact-persisted",
+    )
+
+    def _enumerate(*args, **kwargs):
+        raise wrapper
+
+    monkeypatch.setattr(cli_module, "enumerate_state_tautomers", _enumerate)
+    monkeypatch.setattr(
+        cli_module,
+        "load_execution_attempt",
+        lambda project_dir, attempt_id: _fake_failed_attempt(
+            message=f"persisted parser detail at {persisted_path}"
+        ),
+    )
+
+    result = runner.invoke(app, _tautomer_cli_args())
+
+    assert result.exit_code == 1
+    assert "EXECUTION ERROR" in result.output
+    assert "Attempt ID: attempt-redact-persisted" in result.output
+    assert "Input state: state-a" in result.output
+    assert "Traceback" not in result.output
+    _assert_path_redacted(result, persisted_path)
+
+
+def test_tautomer_cli_redacts_persistence_wrapper_error_paths(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    original_path = r"C:\Users\Pichau\molecular-platform\scientific\input.sdf"
+    persistence_path = "/var/lib/molecular/execution_attempts/attempt.yaml"
+    wrapper = application_module.TautomerEnumerationAttemptPersistenceError(
+        attempt_id="attempt-redact-persistence",
+        input_state_id="state-a",
+        intended_status="execution_failed",
+        phase="execution",
+        original_error=InvalidSDFError(f"invalid SDF at {original_path}"),
+        persistence_error=OSError(f"could not write {persistence_path}"),
+        residual_state_ids=("state-residual",),
+        residual_operation_ids=("op-residual",),
+    )
+
+    def _enumerate(*args, **kwargs):
+        raise wrapper
+
+    monkeypatch.setattr(cli_module, "enumerate_state_tautomers", _enumerate)
+
+    result = runner.invoke(app, _tautomer_cli_args())
+
+    assert result.exit_code == 1
+    assert "STORAGE ERROR" in result.output
+    assert "Attempt ID: attempt-redact-persistence" in result.output
+    assert "Input state: state-a" in result.output
+    assert "Phase: execution" in result.output
+    assert "Intended status: execution_failed" in result.output
+    assert "State 'state-residual'" in result.output
+    assert "Transformation 'op-residual'" in result.output
+    assert "Traceback" not in result.output
+    _assert_path_redacted(result, original_path, persistence_path)
+
+
+def test_tautomer_cli_redacts_fallback_error_when_attempt_load_fails(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    original_path = "/home/user/molecular-platform/scientific/input.sdf"
+    load_path = r"C:\Users\Pichau\molecular-platform\execution_attempts\missing.yaml"
+    wrapper = _failed_wrapper(
+        FileNotFoundError(f"representation missing at {original_path}"),
+        attempt_id="attempt-redact-fallback",
+        status="resolution_failed",
+    )
+
+    def _enumerate(*args, **kwargs):
+        raise wrapper
+
+    def _fail_load(*args, **kwargs):
+        raise FileNotFoundError(f"attempt metadata missing at {load_path}")
+
+    monkeypatch.setattr(cli_module, "enumerate_state_tautomers", _enumerate)
+    monkeypatch.setattr(cli_module, "load_execution_attempt", _fail_load)
+
+    result = runner.invoke(app, _tautomer_cli_args())
+
+    assert result.exit_code == 1
+    assert "INPUT ERROR" in result.output
+    assert "Attempt ID: attempt-redact-fallback" in result.output
+    assert "Input state: state-a" in result.output
+    assert "Status: resolution_failed" in result.output
+    assert "(additional attempt details could not be loaded)" in result.output
+    assert "Traceback" not in result.output
+    _assert_path_redacted(result, original_path, load_path)
+
+
+def test_tautomer_cli_redacts_absolute_path_in_malformed_input_state(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    absolute_path = "/home/user/private/state.sdf"
+
+    result = runner.invoke(
+        app,
+        _tautomer_cli_args(input_state=absolute_path),
+    )
+
+    assert result.exit_code == 1
+    assert "INPUT ERROR" in result.output
+    assert "Traceback" not in result.output
+    _assert_path_redacted(result, absolute_path)
+
+
+@pytest.mark.parametrize(
+    "error_kind,banner,absolute_path",
+    [
+        (
+            "file-not-found",
+            "STORAGE ERROR",
+            "/home/user/molecular-platform/scientific/transformations/op-1.yaml",
+        ),
+        (
+            "oserror",
+            "STORAGE ERROR",
+            r"C:\Users\Pichau\molecular-platform\scientific\transformations\op-1.yaml",
+        ),
+        (
+            "validation",
+            "CONFIGURATION ERROR",
+            "/srv/molecular/private/transformation.yaml",
+        ),
+        (
+            "yaml",
+            "CONFIGURATION ERROR",
+            r"C:\Users\Pichau\molecular-platform\scientific\transformations\bad.yaml",
+        ),
+    ],
+)
+def test_tautomer_cli_handles_post_success_transformation_load_failures_once(
+    tmp_path, monkeypatch, error_kind, banner, absolute_path
+):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    attempt = _fake_tautomer_success_attempt(
+        ("op-1",),
+        attempt_id="attempt-post-success-load",
+    )
+    calls = {"enumerate": 0, "load_transformation": 0, "load_attempt": 0}
+
+    def _enumerate(*args, **kwargs):
+        calls["enumerate"] += 1
+        return attempt
+
+    def _load_transformation(*args, **kwargs):
+        calls["load_transformation"] += 1
+        if error_kind == "file-not-found":
+            raise FileNotFoundError(f"missing transformation at {absolute_path}")
+        if error_kind == "oserror":
+            raise OSError(f"could not read transformation at {absolute_path}")
+        if error_kind == "validation":
+            raise _validation_error_with_path(absolute_path)
+        raise yaml.YAMLError(f"invalid YAML at {absolute_path}")
+
+    def _load_attempt(*args, **kwargs):
+        calls["load_attempt"] += 1
+        raise AssertionError("post-success presentation must not reload the attempt")
+
+    monkeypatch.setattr(cli_module, "enumerate_state_tautomers", _enumerate)
+    monkeypatch.setattr(cli_module, "load_state_transformation", _load_transformation)
+    monkeypatch.setattr(cli_module, "load_execution_attempt", _load_attempt)
+
+    result = runner.invoke(app, _tautomer_cli_args())
+
+    assert result.exit_code == 1
+    assert banner in result.output
+    assert "Attempt ID: attempt-post-success-load" in result.output
+    assert "Input state: state-a" in result.output
+    assert "Scientific enumeration completed: yes" in result.output
+    assert "Stored result presentation: failed" in result.output
+    assert "Transformation: 'op-1'" in result.output
+    assert "Traceback" not in result.output
+    assert "New states published:" not in result.output
+    assert "Status: succeeded" not in result.output
+    assert calls == {
+        "enumerate": 1,
+        "load_transformation": 1,
+        "load_attempt": 0,
+    }
+    assert attempt.status == "succeeded"
+    _assert_path_redacted(result, absolute_path)
+
+
+def test_tautomer_cli_resolves_all_children_before_printing_success(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    attempt = _fake_tautomer_success_attempt(
+        ("op-1", "op-2"),
+        attempt_id="attempt-no-partial-success",
+    )
+    load_calls = []
+    failure_path = "/home/user/molecular-platform/scientific/transformations/op-2.yaml"
+
+    def _enumerate(*args, **kwargs):
+        return attempt
+
+    def _load(project_dir, operation_id):
+        load_calls.append(operation_id)
+        if operation_id == "op-1":
+            return SimpleNamespace(id="op-1", child_state_id="state-one")
+        raise FileNotFoundError(f"missing transformation at {failure_path}")
+
+    monkeypatch.setattr(cli_module, "enumerate_state_tautomers", _enumerate)
+    monkeypatch.setattr(cli_module, "load_state_transformation", _load)
+
+    result = runner.invoke(app, _tautomer_cli_args())
+
+    assert result.exit_code == 1
+    assert load_calls == ["op-1", "op-2"]
+    assert "STORAGE ERROR" in result.output
+    assert "Attempt ID: attempt-no-partial-success" in result.output
+    assert "Input state: state-a" in result.output
+    assert "State 'state-one'" not in result.output
+    assert "New states published:" not in result.output
+    assert "Status: succeeded" not in result.output
+    assert "Traceback" not in result.output
+    assert attempt.status == "succeeded"
+    _assert_path_redacted(result, failure_path)
