@@ -13,16 +13,23 @@ and compensation; the real RDKit adapter is covered separately, in
 test_rdkit_tautomer.py.
 """
 
+from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 import subprocess
 import sys
+import threading
+import uuid
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
 import molecular.application as application_module
+import molecular.execution_registry as execution_registry
 from molecular.application import (
     InvalidPubChemCidError,
+    TautomerEnumerationAttemptFailedError,
+    TautomerEnumerationAttemptPersistenceError,
     enumerate_state_tautomers,
     register_ligand_from_pubchem,
 )
@@ -551,17 +558,49 @@ def _attempt_ids(tmp_path):
     return {p.stem for p in attempts_dir.glob("*.yaml")}
 
 
-def _new_attempt(tmp_path, before_ids):
-    """enumerate_state_tautomers raises the original exception after
-    recording it against its attempt (mirroring register_derived_state's
-    convention) - so a failure test must catch that exception, then load
-    the persisted attempt back by diffing the execution_attempts
-    directory, rather than inspecting a return value."""
+def _assert_attempt_failed(
+    caught,
+    *,
+    input_state_id,
+    status,
+    original_type,
+    original_error=None,
+):
+    error = caught.value
+    assert isinstance(error, TautomerEnumerationAttemptFailedError)
+    assert error.attempt_id
+    assert error.input_state_id == input_state_id
+    assert error.status == status
+    assert isinstance(error.original_error, original_type)
+    if original_error is not None:
+        assert error.original_error is original_error
+    assert error.__cause__ is error.original_error
+    return error
 
-    new_ids = _attempt_ids(tmp_path) - before_ids
-    assert len(new_ids) == 1, f"expected exactly one new attempt, got {new_ids}"
-    return load_execution_attempt(tmp_path, next(iter(new_ids)))
 
+def _install_controlled_attempt_uuid(
+    monkeypatch,
+    value="00000000-0000-0000-0000-000000000017",
+):
+    """Fix only begin_execution_attempt's first uuid4 call.
+
+    application.uuid and execution_registry.uuid refer to the same module
+    object, so every later uuid4 call must delegate to the captured real
+    function or generated state/transformation ids would collide.
+    """
+
+    fixed_uuid = uuid.UUID(value)
+    real_uuid4 = execution_registry.uuid.uuid4
+    calls = {"count": 0}
+
+    def controlled_uuid4():
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return fixed_uuid
+        return real_uuid4()
+
+    monkeypatch.setattr(execution_registry.uuid, "uuid4", controlled_uuid4)
+    return fixed_uuid, calls
 
 # --- full success cycle ---
 
@@ -633,24 +672,31 @@ def test_enumerate_state_tautomers_published_states_inherit_parent_entity_id(tmp
 
 def test_enumerate_state_tautomers_engine_resolution_failure(tmp_path):
     _setup_input_state(tmp_path)
-    before = _attempt_ids(tmp_path)
+    original_error = RDKitUnavailableError("no engine")
 
-    with pytest.raises(RDKitUnavailableError):
+    with pytest.raises(TautomerEnumerationAttemptFailedError) as caught:
         enumerate_state_tautomers(
             tmp_path,
             input_state_id="state-a",
             policy=_policy(),
-            _resolve_engine=_fake_resolve_engine_raising(RDKitUnavailableError("no engine")),
+            _resolve_engine=_fake_resolve_engine_raising(original_error),
             _enumerate=_fake_enumerate_returning([]),
         )
 
-    attempt = _new_attempt(tmp_path, before)
+    error = _assert_attempt_failed(
+        caught,
+        input_state_id="state-a",
+        status="resolution_failed",
+        original_type=RDKitUnavailableError,
+        original_error=original_error,
+    )
+    attempt = load_execution_attempt(tmp_path, error.attempt_id)
     assert attempt.status == "resolution_failed"
     assert attempt.error.phase == "resolution"
 
 
 def test_enumerate_state_tautomers_missing_input_state(tmp_path):
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(TautomerEnumerationAttemptFailedError) as caught:
         enumerate_state_tautomers(
             tmp_path,
             input_state_id="does-not-exist",
@@ -659,16 +705,21 @@ def test_enumerate_state_tautomers_missing_input_state(tmp_path):
             _enumerate=_fake_enumerate_returning([]),
         )
 
-    attempt = _new_attempt(tmp_path, set())
+    error = _assert_attempt_failed(
+        caught,
+        input_state_id="does-not-exist",
+        status="resolution_failed",
+        original_type=FileNotFoundError,
+    )
+    attempt = load_execution_attempt(tmp_path, error.attempt_id)
     assert attempt.status == "resolution_failed"
     assert attempt.error.phase == "resolution"
 
 
 def test_enumerate_state_tautomers_rejects_non_sdf_format(tmp_path):
     _setup_input_state(tmp_path, file_format="smiles")
-    before = _attempt_ids(tmp_path)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(TautomerEnumerationAttemptFailedError) as caught:
         enumerate_state_tautomers(
             tmp_path,
             input_state_id="state-a",
@@ -677,7 +728,14 @@ def test_enumerate_state_tautomers_rejects_non_sdf_format(tmp_path):
             _enumerate=_fake_enumerate_returning([]),
         )
 
-    attempt = _new_attempt(tmp_path, before)
+    error = _assert_attempt_failed(
+        caught,
+        input_state_id="state-a",
+        status="resolution_failed",
+        original_type=ValueError,
+    )
+    assert "expected 'sdf'" in str(error.original_error)
+    attempt = load_execution_attempt(tmp_path, error.attempt_id)
     assert attempt.status == "resolution_failed"
     assert attempt.error.phase == "resolution"
 
@@ -690,9 +748,7 @@ def test_enumerate_state_tautomers_rejects_checksum_mismatch(tmp_path):
     data["representation"]["checksum"] = "0" * 64
     metadata_file.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
 
-    before = _attempt_ids(tmp_path)
-
-    with pytest.raises(ValueError):
+    with pytest.raises(TautomerEnumerationAttemptFailedError) as caught:
         enumerate_state_tautomers(
             tmp_path,
             input_state_id="state-a",
@@ -701,7 +757,14 @@ def test_enumerate_state_tautomers_rejects_checksum_mismatch(tmp_path):
             _enumerate=_fake_enumerate_returning([]),
         )
 
-    attempt = _new_attempt(tmp_path, before)
+    error = _assert_attempt_failed(
+        caught,
+        input_state_id="state-a",
+        status="resolution_failed",
+        original_type=ValueError,
+    )
+    assert "checksum mismatch" in str(error.original_error)
+    attempt = load_execution_attempt(tmp_path, error.attempt_id)
     assert attempt.status == "resolution_failed"
     assert attempt.error.phase == "resolution"
 
@@ -720,9 +783,8 @@ def test_enumerate_state_tautomers_rejects_checksum_mismatch(tmp_path):
 )
 def test_enumerate_state_tautomers_engine_execution_failure(tmp_path, exc):
     _setup_input_state(tmp_path)
-    before = _attempt_ids(tmp_path)
 
-    with pytest.raises(type(exc)):
+    with pytest.raises(TautomerEnumerationAttemptFailedError) as caught:
         enumerate_state_tautomers(
             tmp_path,
             input_state_id="state-a",
@@ -731,11 +793,17 @@ def test_enumerate_state_tautomers_engine_execution_failure(tmp_path, exc):
             _enumerate=_fake_enumerate_raising(exc),
         )
 
-    attempt = _new_attempt(tmp_path, before)
+    error = _assert_attempt_failed(
+        caught,
+        input_state_id="state-a",
+        status="execution_failed",
+        original_type=type(exc),
+        original_error=exc,
+    )
+    attempt = load_execution_attempt(tmp_path, error.attempt_id)
     assert attempt.status == "execution_failed"
     assert attempt.error.phase == "execution"
     assert list_state_transformations(tmp_path, parent_state_id="state-a") == []
-
 
 # --- zero new states is a valid success ---
 
@@ -796,16 +864,16 @@ def test_enumerate_state_tautomers_max_states_truncation(
 
 def test_enumerate_state_tautomers_rollback_on_kth_register_state_failure(tmp_path, monkeypatch):
     _setup_input_state(tmp_path)
-    before = _attempt_ids(tmp_path)
+    original_error = OSError("simulated failure")
 
     real_register_state = application_module.register_state
     monkeypatch.setattr(
         application_module,
         "register_state",
-        _fail_nth_call(real_register_state, 3, lambda: OSError("simulated failure")),
+        _fail_nth_call(real_register_state, 3, lambda: original_error),
     )
 
-    with pytest.raises(OSError):
+    with pytest.raises(TautomerEnumerationAttemptFailedError) as caught:
         enumerate_state_tautomers(
             tmp_path,
             input_state_id="state-a",
@@ -814,7 +882,14 @@ def test_enumerate_state_tautomers_rollback_on_kth_register_state_failure(tmp_pa
             _enumerate=_fake_enumerate_returning(["Ca", "Cb", "Cc", "Cd"]),
         )
 
-    attempt = _new_attempt(tmp_path, before)
+    error = _assert_attempt_failed(
+        caught,
+        input_state_id="state-a",
+        status="execution_failed",
+        original_type=OSError,
+        original_error=original_error,
+    )
+    attempt = load_execution_attempt(tmp_path, error.attempt_id)
     assert attempt.status == "execution_failed"
     assert attempt.error.residual_state_ids == ()
     assert attempt.error.residual_operation_ids == ()
@@ -842,15 +917,15 @@ def test_enumerate_state_tautomers_rollback_preserves_prior_calls_records(tmp_pa
     first_transformations = list_state_transformations(tmp_path, parent_state_id="state-a")
     assert len(first_transformations) == 2
 
+    original_error = OSError("simulated failure")
     real_register_state = application_module.register_state
     monkeypatch.setattr(
         application_module,
         "register_state",
-        _fail_nth_call(real_register_state, 2, lambda: OSError("simulated failure")),
+        _fail_nth_call(real_register_state, 2, lambda: original_error),
     )
 
-    before = _attempt_ids(tmp_path)
-    with pytest.raises(OSError):
+    with pytest.raises(TautomerEnumerationAttemptFailedError) as caught:
         enumerate_state_tautomers(
             tmp_path,
             input_state_id="state-a",
@@ -859,7 +934,14 @@ def test_enumerate_state_tautomers_rollback_preserves_prior_calls_records(tmp_pa
             _enumerate=_fake_enumerate_returning(["Csecond1", "Csecond2"]),
         )
 
-    second = _new_attempt(tmp_path, before)
+    error = _assert_attempt_failed(
+        caught,
+        input_state_id="state-a",
+        status="execution_failed",
+        original_type=OSError,
+        original_error=original_error,
+    )
+    second = load_execution_attempt(tmp_path, error.attempt_id)
     assert second.status == "execution_failed"
 
     remaining_transformations = list_state_transformations(tmp_path, parent_state_id="state-a")
@@ -870,16 +952,16 @@ def test_enumerate_state_tautomers_rollback_on_kth_register_transformation_failu
     tmp_path, monkeypatch
 ):
     _setup_input_state(tmp_path)
-    before = _attempt_ids(tmp_path)
+    original_error = OSError("simulated failure")
 
     real_register_transformation = application_module.register_state_transformation
     monkeypatch.setattr(
         application_module,
         "register_state_transformation",
-        _fail_nth_call(real_register_transformation, 2, lambda: OSError("simulated failure")),
+        _fail_nth_call(real_register_transformation, 2, lambda: original_error),
     )
 
-    with pytest.raises(OSError):
+    with pytest.raises(TautomerEnumerationAttemptFailedError) as caught:
         enumerate_state_tautomers(
             tmp_path,
             input_state_id="state-a",
@@ -888,7 +970,14 @@ def test_enumerate_state_tautomers_rollback_on_kth_register_transformation_failu
             _enumerate=_fake_enumerate_returning(["Ca", "Cb", "Cc"]),
         )
 
-    attempt = _new_attempt(tmp_path, before)
+    error = _assert_attempt_failed(
+        caught,
+        input_state_id="state-a",
+        status="execution_failed",
+        original_type=OSError,
+        original_error=original_error,
+    )
+    attempt = load_execution_attempt(tmp_path, error.attempt_id)
     assert attempt.status == "execution_failed"
     assert list_state_transformations(tmp_path, parent_state_id="state-a") == []
 
@@ -899,15 +988,14 @@ def test_enumerate_state_tautomers_rollback_on_kth_register_transformation_failu
 
 def test_enumerate_state_tautomers_rollback_on_mark_succeeded_failure(tmp_path, monkeypatch):
     _setup_input_state(tmp_path)
-
-    real_mark_succeeded = application_module.mark_succeeded
+    original_error = OSError("simulated mark_succeeded failure")
 
     def _raise_mark_succeeded(*args, **kwargs):
-        raise OSError("simulated mark_succeeded failure")
+        raise original_error
 
     monkeypatch.setattr(application_module, "mark_succeeded", _raise_mark_succeeded)
 
-    with pytest.raises(OSError):
+    with pytest.raises(TautomerEnumerationAttemptFailedError) as caught:
         enumerate_state_tautomers(
             tmp_path,
             input_state_id="state-a",
@@ -916,6 +1004,17 @@ def test_enumerate_state_tautomers_rollback_on_mark_succeeded_failure(tmp_path, 
             _enumerate=_fake_enumerate_returning(["Ca", "Cb", "Cc"]),
         )
 
+    error = _assert_attempt_failed(
+        caught,
+        input_state_id="state-a",
+        status="execution_failed",
+        original_type=OSError,
+        original_error=original_error,
+    )
+    attempt = load_execution_attempt(tmp_path, error.attempt_id)
+    assert attempt.status == "execution_failed"
+    assert attempt.error.residual_state_ids == ()
+    assert attempt.error.residual_operation_ids == ()
     assert list_state_transformations(tmp_path, parent_state_id="state-a") == []
     states_dir = tmp_path / "scientific" / "states"
     remaining = [p.stem for p in states_dir.glob("*.yaml")] if states_dir.exists() else []
@@ -926,19 +1025,19 @@ def test_enumerate_state_tautomers_residual_ids_recorded_when_rollback_cannot_co
     tmp_path, monkeypatch
 ):
     _setup_input_state(tmp_path)
-    before = _attempt_ids(tmp_path)
+    original_error = OSError("simulated failure")
 
     real_register_state = application_module.register_state
     monkeypatch.setattr(
         application_module,
         "register_state",
-        _fail_nth_call(real_register_state, 2, lambda: OSError("simulated failure")),
+        _fail_nth_call(real_register_state, 2, lambda: original_error),
     )
     # The first candidate's state was fully published before the failure;
     # simulate compensation being unable to confirm its removal.
     monkeypatch.setattr(application_module, "_remove_state_best_effort", lambda *a, **k: None)
 
-    with pytest.raises(OSError):
+    with pytest.raises(TautomerEnumerationAttemptFailedError) as caught:
         enumerate_state_tautomers(
             tmp_path,
             input_state_id="state-a",
@@ -947,14 +1046,21 @@ def test_enumerate_state_tautomers_residual_ids_recorded_when_rollback_cannot_co
             _enumerate=_fake_enumerate_returning(["Ca", "Cb", "Cc"]),
         )
 
-    attempt = _new_attempt(tmp_path, before)
+    error = _assert_attempt_failed(
+        caught,
+        input_state_id="state-a",
+        status="execution_failed",
+        original_type=OSError,
+        original_error=original_error,
+    )
+    attempt = load_execution_attempt(tmp_path, error.attempt_id)
     assert attempt.status == "execution_failed"
     assert len(attempt.error.residual_state_ids) == 1
+    assert attempt.error.residual_operation_ids == ()
 
     states_dir = tmp_path / "scientific" / "states"
     remaining = {p.stem for p in states_dir.glob("*.yaml")}
     assert attempt.error.residual_state_ids[0] in remaining
-
 
 # --- activity log semantics: published_*_ids means "actually registered by
 # this execution", identically on success and error - never residual ids
@@ -998,16 +1104,16 @@ def test_activity_log_error_after_partial_publication_records_everything_actuall
 
     _setup_input_state(tmp_path)
     calls = _capture_activity_calls(monkeypatch)
+    original_error = OSError("simulated failure")
 
     real_register_state_transformation = application_module.register_state_transformation
     monkeypatch.setattr(
         application_module,
         "register_state_transformation",
-        _fail_nth_call(real_register_state_transformation, 2, lambda: OSError("simulated failure")),
+        _fail_nth_call(real_register_state_transformation, 2, lambda: original_error),
     )
 
-    before = _attempt_ids(tmp_path)
-    with pytest.raises(OSError):
+    with pytest.raises(TautomerEnumerationAttemptFailedError) as caught:
         enumerate_state_tautomers(
             tmp_path,
             input_state_id="state-a",
@@ -1016,7 +1122,14 @@ def test_activity_log_error_after_partial_publication_records_everything_actuall
             _enumerate=_fake_enumerate_returning(["Ca", "Cb", "Cc"]),
         )
 
-    attempt = _new_attempt(tmp_path, before)
+    error = _assert_attempt_failed(
+        caught,
+        input_state_id="state-a",
+        status="execution_failed",
+        original_type=OSError,
+        original_error=original_error,
+    )
+    attempt = load_execution_attempt(tmp_path, error.attempt_id)
     assert attempt.status == "execution_failed"
 
     error_calls = [c for c in calls if c["outcome"] == "error"]
@@ -1027,6 +1140,8 @@ def test_activity_log_error_after_partial_publication_records_everything_actuall
     # only its state was registered before the transformation call failed.
     assert len(details.published_state_ids) == 2
     assert len(details.published_transformation_ids) == 1
+    assert details.attempt_id == error.attempt_id
+    assert details.input_state_id == "state-a"
 
 
 def test_activity_log_still_shows_published_ids_when_compensation_removes_everything(
@@ -1038,16 +1153,16 @@ def test_activity_log_still_shows_published_ids_when_compensation_removes_everyt
 
     _setup_input_state(tmp_path)
     calls = _capture_activity_calls(monkeypatch)
+    original_error = OSError("simulated failure")
 
     real_register_state_transformation = application_module.register_state_transformation
     monkeypatch.setattr(
         application_module,
         "register_state_transformation",
-        _fail_nth_call(real_register_state_transformation, 2, lambda: OSError("simulated failure")),
+        _fail_nth_call(real_register_state_transformation, 2, lambda: original_error),
     )
 
-    before = _attempt_ids(tmp_path)
-    with pytest.raises(OSError):
+    with pytest.raises(TautomerEnumerationAttemptFailedError) as caught:
         enumerate_state_tautomers(
             tmp_path,
             input_state_id="state-a",
@@ -1056,14 +1171,23 @@ def test_activity_log_still_shows_published_ids_when_compensation_removes_everyt
             _enumerate=_fake_enumerate_returning(["Ca", "Cb", "Cc"]),
         )
 
-    attempt = _new_attempt(tmp_path, before)
+    error = _assert_attempt_failed(
+        caught,
+        input_state_id="state-a",
+        status="execution_failed",
+        original_type=OSError,
+        original_error=original_error,
+    )
+    attempt = load_execution_attempt(tmp_path, error.attempt_id)
     assert attempt.error.residual_state_ids == ()
     assert attempt.error.residual_operation_ids == ()
 
     error_calls = [c for c in calls if c["outcome"] == "error"]
+    assert len(error_calls) == 1
     details = error_calls[0]["details"]
     assert len(details.published_state_ids) == 2
     assert len(details.published_transformation_ids) == 1
+    assert details.attempt_id == error.attempt_id
 
 
 def test_activity_log_does_not_redefine_published_as_residual_when_residuals_exist(
@@ -1078,9 +1202,10 @@ def test_activity_log_does_not_redefine_published_as_residual_when_residuals_exi
 
     _setup_input_state(tmp_path)
     calls = _capture_activity_calls(monkeypatch)
+    original_error = OSError("simulated mark_succeeded failure")
 
     def _raise_mark_succeeded(*args, **kwargs):
-        raise OSError("simulated mark_succeeded failure")
+        raise original_error
 
     monkeypatch.setattr(application_module, "mark_succeeded", _raise_mark_succeeded)
 
@@ -1091,8 +1216,7 @@ def test_activity_log_does_not_redefine_published_as_residual_when_residuals_exi
         _noop_nth_call(real_remove_transformation, 1),
     )
 
-    before = _attempt_ids(tmp_path)
-    with pytest.raises(OSError):
+    with pytest.raises(TautomerEnumerationAttemptFailedError) as caught:
         enumerate_state_tautomers(
             tmp_path,
             input_state_id="state-a",
@@ -1101,7 +1225,14 @@ def test_activity_log_does_not_redefine_published_as_residual_when_residuals_exi
             _enumerate=_fake_enumerate_returning(["Ca", "Cb", "Cc", "Cd"]),
         )
 
-    attempt = _new_attempt(tmp_path, before)
+    error = _assert_attempt_failed(
+        caught,
+        input_state_id="state-a",
+        status="execution_failed",
+        original_type=OSError,
+        original_error=original_error,
+    )
+    attempt = load_execution_attempt(tmp_path, error.attempt_id)
     assert attempt.status == "execution_failed"
 
     # exactly one transformation's removal could not be confirmed; every
@@ -1117,12 +1248,533 @@ def test_activity_log_does_not_redefine_published_as_residual_when_residuals_exi
     # all 4 candidates were fully published before mark_succeeded failed.
     assert len(details.published_state_ids) == 4
     assert len(details.published_transformation_ids) == 4
+    assert details.attempt_id == error.attempt_id
 
     # the residual set is a strict subset of what was published - the log
     # never redefines "published" as "residual".
     assert set(attempt.error.residual_operation_ids) < set(details.published_transformation_ids)
     assert len(details.published_transformation_ids) > len(attempt.error.residual_operation_ids)
 
+
+# ==========================================================================
+# Increment 017 deterministic failure handoff and persistence-failure contract
+# ==========================================================================
+
+
+def test_tautomer_attempt_failed_preserves_original_error_and_chaining(tmp_path):
+    """Normative item 24: original_error is preserved by identity and is
+    also the explicit Python cause of the deterministic attempt wrapper."""
+
+    _setup_input_state(tmp_path)
+    original_error = InvalidSDFError("scientific execution failure")
+
+    with pytest.raises(TautomerEnumerationAttemptFailedError) as caught:
+        enumerate_state_tautomers(
+            tmp_path,
+            input_state_id="state-a",
+            policy=_policy(),
+            _resolve_engine=_fake_resolve_engine(),
+            _enumerate=_fake_enumerate_raising(original_error),
+        )
+
+    error = _assert_attempt_failed(
+        caught,
+        input_state_id="state-a",
+        status="execution_failed",
+        original_type=InvalidSDFError,
+        original_error=original_error,
+    )
+    attempt = load_execution_attempt(tmp_path, error.attempt_id)
+    assert attempt.status == "execution_failed"
+    assert attempt.error.phase == "execution"
+
+
+def _run_concurrent_resolution_failure(project_dir, input_state_id, barrier, message):
+    original_error = RDKitUnavailableError(message)
+
+    def _resolve():
+        barrier.wait(timeout=10)
+        raise original_error
+
+    try:
+        enumerate_state_tautomers(
+            project_dir,
+            input_state_id=input_state_id,
+            policy=_policy(),
+            _resolve_engine=_resolve,
+            _enumerate=_fake_enumerate_returning([]),
+        )
+    except TautomerEnumerationAttemptFailedError as error:
+        return error, original_error
+
+    raise AssertionError("expected TautomerEnumerationAttemptFailedError")
+
+
+def test_concurrent_failures_for_different_states_keep_attempt_handoffs_separate(tmp_path):
+    """Normative item 26: concurrent calls for different input states cannot
+    cross-correlate attempt ids or input_state_ids."""
+
+    parent = _setup_input_state(tmp_path, state_id="state-a")
+    register_state(
+        tmp_path,
+        state_id="state-b",
+        entity_id=parent.entity_id,
+        source_file=_write_sdf_source(tmp_path, name="structure-b.sdf"),
+        format="sdf",
+    )
+    barrier = threading.Barrier(2)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        future_a = pool.submit(
+            _run_concurrent_resolution_failure,
+            tmp_path,
+            "state-a",
+            barrier,
+            "no engine for state-a",
+        )
+        future_b = pool.submit(
+            _run_concurrent_resolution_failure,
+            tmp_path,
+            "state-b",
+            barrier,
+            "no engine for state-b",
+        )
+        error_a, original_a = future_a.result(timeout=20)
+        error_b, original_b = future_b.result(timeout=20)
+
+    assert error_a.attempt_id != error_b.attempt_id
+    assert (error_a.input_state_id, error_b.input_state_id) == ("state-a", "state-b")
+    assert error_a.status == error_b.status == "resolution_failed"
+    assert error_a.original_error is original_a
+    assert error_b.original_error is original_b
+    assert error_a.__cause__ is original_a
+    assert error_b.__cause__ is original_b
+    assert load_execution_attempt(tmp_path, error_a.attempt_id).input_state_id == "state-a"
+    assert load_execution_attempt(tmp_path, error_b.attempt_id).input_state_id == "state-b"
+
+
+def test_concurrent_failures_for_same_state_still_have_distinct_attempt_ids(tmp_path):
+    """Normative item 27: input_state_id is not a correlation key; two
+    concurrent attempts against the same state remain distinct."""
+
+    _setup_input_state(tmp_path, state_id="state-a")
+    barrier = threading.Barrier(2)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        future_a = pool.submit(
+            _run_concurrent_resolution_failure,
+            tmp_path,
+            "state-a",
+            barrier,
+            "first concurrent failure",
+        )
+        future_b = pool.submit(
+            _run_concurrent_resolution_failure,
+            tmp_path,
+            "state-a",
+            barrier,
+            "second concurrent failure",
+        )
+        error_a, original_a = future_a.result(timeout=20)
+        error_b, original_b = future_b.result(timeout=20)
+
+    assert error_a.attempt_id != error_b.attempt_id
+    assert error_a.input_state_id == error_b.input_state_id == "state-a"
+    assert error_a.status == error_b.status == "resolution_failed"
+    assert error_a.original_error is original_a
+    assert error_b.original_error is original_b
+    assert error_a.__cause__ is original_a
+    assert error_b.__cause__ is original_b
+    assert load_execution_attempt(tmp_path, error_a.attempt_id).status == "resolution_failed"
+    assert load_execution_attempt(tmp_path, error_b.attempt_id).status == "resolution_failed"
+
+
+def test_pre_attempt_validation_failure_keeps_original_exception_unwrapped(tmp_path):
+    """Case E: malformed ids fail before begin_execution_attempt and never
+    acquire either Increment 017 attempt wrapper."""
+
+    with pytest.raises(ValueError) as caught:
+        enumerate_state_tautomers(
+            tmp_path,
+            input_state_id="bad/id",
+            policy=_policy(),
+            _resolve_engine=_fake_resolve_engine(),
+            _enumerate=_fake_enumerate_returning([]),
+        )
+
+    assert not isinstance(caught.value, TautomerEnumerationAttemptFailedError)
+    assert not isinstance(caught.value, TautomerEnumerationAttemptPersistenceError)
+    assert _attempt_ids(tmp_path) == set()
+
+
+@pytest.mark.parametrize(
+    "interruption_cls",
+    [KeyboardInterrupt, SystemExit],
+    ids=["keyboard-interrupt", "system-exit"],
+)
+def test_execution_interrupt_persists_terminal_failure_and_propagates_original(
+    tmp_path, monkeypatch, interruption_cls
+):
+    """Normative items 39b-KI/39b-SE."""
+
+    _setup_input_state(tmp_path)
+    fixed_uuid, uuid_calls = _install_controlled_attempt_uuid(monkeypatch)
+    interruption = interruption_cls()
+    compensation_calls = {"count": 0}
+    real_compensate = application_module._compensate_published_candidates
+
+    def _compensate_spy(*args, **kwargs):
+        compensation_calls["count"] += 1
+        return real_compensate(*args, **kwargs)
+
+    monkeypatch.setattr(application_module, "_compensate_published_candidates", _compensate_spy)
+
+    with pytest.raises(interruption_cls) as caught:
+        enumerate_state_tautomers(
+            tmp_path,
+            input_state_id="state-a",
+            policy=_policy(),
+            _resolve_engine=_fake_resolve_engine(),
+            _enumerate=_fake_enumerate_raising(interruption),
+        )
+
+    assert caught.value is interruption
+    assert caught.value.__cause__ is None
+    assert uuid_calls["count"] == 1
+    assert compensation_calls["count"] == 1
+
+    attempt = load_execution_attempt(tmp_path, fixed_uuid.hex)
+    assert attempt.id == fixed_uuid.hex
+    assert attempt.input_state_id == "state-a"
+    assert attempt.status == "execution_failed"
+    assert attempt.error.phase == "execution"
+    assert attempt.error.residual_state_ids == ()
+    assert attempt.error.residual_operation_ids == ()
+
+    lines = _activity_lines(tmp_path)
+    enumerate_lines = [line for line in lines if "command=enumerate-state-tautomers" in line]
+    assert len(enumerate_lines) == 2
+    assert "outcome=started" in enumerate_lines[0]
+    assert "outcome=error" in enumerate_lines[1]
+
+
+@pytest.mark.parametrize(
+    "interruption_cls",
+    [KeyboardInterrupt, SystemExit],
+    ids=["keyboard-interrupt", "system-exit"],
+)
+def test_execution_interrupt_keeps_original_when_terminal_persistence_fails(
+    tmp_path, monkeypatch, interruption_cls
+):
+    """Normative items 39c-KI/39c-SE."""
+
+    _setup_input_state(tmp_path)
+    fixed_uuid, uuid_calls = _install_controlled_attempt_uuid(monkeypatch)
+    interruption = interruption_cls()
+    persistence_error = OSError("simulated mark_execution_failed persistence failure")
+    compensation_calls = {"count": 0}
+    real_compensate = application_module._compensate_published_candidates
+
+    def _compensate_spy(*args, **kwargs):
+        compensation_calls["count"] += 1
+        return real_compensate(*args, **kwargs)
+
+    def _raise_persistence_error(*args, **kwargs):
+        raise persistence_error
+
+    monkeypatch.setattr(application_module, "_compensate_published_candidates", _compensate_spy)
+    monkeypatch.setattr(application_module, "mark_execution_failed", _raise_persistence_error)
+
+    with pytest.raises(interruption_cls) as caught:
+        enumerate_state_tautomers(
+            tmp_path,
+            input_state_id="state-a",
+            policy=_policy(),
+            _resolve_engine=_fake_resolve_engine(),
+            _enumerate=_fake_enumerate_raising(interruption),
+        )
+
+    assert caught.value is interruption
+    assert caught.value.__cause__ is persistence_error
+    assert uuid_calls["count"] == 1
+    assert compensation_calls["count"] == 1
+
+    attempt = load_execution_attempt(tmp_path, fixed_uuid.hex)
+    assert attempt.id == fixed_uuid.hex
+    assert attempt.status == "resolved"
+    assert attempt.error is None
+
+    lines = _activity_lines(tmp_path)
+    enumerate_lines = [line for line in lines if "command=enumerate-state-tautomers" in line]
+    assert len(enumerate_lines) == 2
+    assert "outcome=started" in enumerate_lines[0]
+    assert "outcome=error" in enumerate_lines[1]
+
+
+def test_mark_resolution_failed_oserror_becomes_persistence_wrapper(tmp_path, monkeypatch):
+    """Normative item 42."""
+
+    original_error = FileNotFoundError("scientific input state missing")
+    persistence_error = OSError("simulated resolution terminal persistence failure")
+
+    def _raise_original_state_error(*args, **kwargs):
+        raise original_error
+
+    def _raise_persistence_error(*args, **kwargs):
+        raise persistence_error
+
+    monkeypatch.setattr(application_module, "load_state", _raise_original_state_error)
+    monkeypatch.setattr(application_module, "mark_resolution_failed", _raise_persistence_error)
+
+    with pytest.raises(TautomerEnumerationAttemptPersistenceError) as caught:
+        enumerate_state_tautomers(
+            tmp_path,
+            input_state_id="state-a",
+            policy=_policy(),
+            _resolve_engine=_fake_resolve_engine(),
+            _enumerate=_fake_enumerate_returning([]),
+        )
+
+    error = caught.value
+    assert error.attempt_id
+    assert error.input_state_id == "state-a"
+    assert error.phase == "resolution"
+    assert error.intended_status == "resolution_failed"
+    assert error.original_error is original_error
+    assert error.persistence_error is persistence_error
+    assert error.__cause__ is persistence_error
+    assert error.residual_state_ids == ()
+    assert error.residual_operation_ids == ()
+    assert load_execution_attempt(tmp_path, error.attempt_id).status == "started"
+
+
+def test_mark_execution_failed_oserror_preserves_local_compensation_residuals(
+    tmp_path, monkeypatch
+):
+    """Normative item 43."""
+
+    _setup_input_state(tmp_path)
+    fixed_uuid, uuid_calls = _install_controlled_attempt_uuid(monkeypatch)
+    original_error = OSError("simulated second state publication failure")
+    persistence_error = OSError("simulated execution terminal persistence failure")
+
+    real_register_state = application_module.register_state
+    monkeypatch.setattr(
+        application_module,
+        "register_state",
+        _fail_nth_call(real_register_state, 2, lambda: original_error),
+    )
+    monkeypatch.setattr(application_module, "_remove_state_best_effort", lambda *a, **k: None)
+    monkeypatch.setattr(
+        application_module,
+        "_remove_state_transformation_best_effort",
+        lambda *a, **k: None,
+    )
+
+    def _raise_persistence_error(*args, **kwargs):
+        raise persistence_error
+
+    monkeypatch.setattr(application_module, "mark_execution_failed", _raise_persistence_error)
+
+    with pytest.raises(TautomerEnumerationAttemptPersistenceError) as caught:
+        enumerate_state_tautomers(
+            tmp_path,
+            input_state_id="state-a",
+            policy=_policy(),
+            _resolve_engine=_fake_resolve_engine(),
+            _enumerate=_fake_enumerate_returning(["Ca", "Cb", "Cc"]),
+        )
+
+    error = caught.value
+    assert error.attempt_id == fixed_uuid.hex
+    assert error.input_state_id == "state-a"
+    assert error.phase == "execution"
+    assert error.intended_status == "execution_failed"
+    assert error.original_error is original_error
+    assert error.persistence_error is persistence_error
+    assert error.__cause__ is persistence_error
+    assert len(error.residual_state_ids) == 1
+    assert len(error.residual_operation_ids) == 1
+    assert all(item != fixed_uuid.hex for item in error.residual_state_ids)
+    assert all(item != fixed_uuid.hex for item in error.residual_operation_ids)
+    # 1 attempt + 6 staged candidate ids + 1 successful register_state staging id.
+    assert uuid_calls["count"] == 8
+
+    states_dir = tmp_path / "scientific" / "states"
+    transformations_dir = tmp_path / "scientific" / "transformations"
+    assert (states_dir / f"{error.residual_state_ids[0]}.yaml").exists()
+    assert (transformations_dir / f"{error.residual_operation_ids[0]}.yaml").exists()
+    assert load_execution_attempt(tmp_path, fixed_uuid.hex).status == "resolved"
+
+
+def test_internal_resolution_failure_load_error_becomes_persistence_wrapper(
+    tmp_path, monkeypatch
+):
+    """Normative item 44: patch the name resolved inside execution_registry."""
+
+    persistence_error = FileNotFoundError("simulated attempt load failure during resolution")
+
+    def _raise_internal_load_error(*args, **kwargs):
+        raise persistence_error
+
+    monkeypatch.setattr(execution_registry, "load_execution_attempt", _raise_internal_load_error)
+
+    with pytest.raises(TautomerEnumerationAttemptPersistenceError) as caught:
+        enumerate_state_tautomers(
+            tmp_path,
+            input_state_id="does-not-exist",
+            policy=_policy(),
+            _resolve_engine=_fake_resolve_engine(),
+            _enumerate=_fake_enumerate_returning([]),
+        )
+
+    error = caught.value
+    assert error.input_state_id == "does-not-exist"
+    assert error.phase == "resolution"
+    assert error.intended_status == "resolution_failed"
+    assert isinstance(error.original_error, FileNotFoundError)
+    assert error.persistence_error is persistence_error
+    assert error.__cause__ is persistence_error
+    assert error.residual_state_ids == ()
+    assert error.residual_operation_ids == ()
+    assert load_execution_attempt(tmp_path, error.attempt_id).status == "started"
+
+
+def test_internal_execution_failure_load_error_becomes_persistence_wrapper(
+    tmp_path, monkeypatch
+):
+    """Normative item 45: patch execution_registry only after mark_resolved."""
+
+    _setup_input_state(tmp_path)
+    original_error = InvalidSDFError("scientific execution failure")
+    persistence_error = FileNotFoundError("simulated attempt load failure during execution")
+
+    def _enumerate_then_break_internal_load(*, source_path, source_format):
+        def _raise_internal_load_error(*args, **kwargs):
+            raise persistence_error
+
+        monkeypatch.setattr(
+            execution_registry,
+            "load_execution_attempt",
+            _raise_internal_load_error,
+        )
+        raise original_error
+
+    with pytest.raises(TautomerEnumerationAttemptPersistenceError) as caught:
+        enumerate_state_tautomers(
+            tmp_path,
+            input_state_id="state-a",
+            policy=_policy(),
+            _resolve_engine=_fake_resolve_engine(),
+            _enumerate=_enumerate_then_break_internal_load,
+        )
+
+    error = caught.value
+    assert error.input_state_id == "state-a"
+    assert error.phase == "execution"
+    assert error.intended_status == "execution_failed"
+    assert error.original_error is original_error
+    assert error.persistence_error is persistence_error
+    assert error.__cause__ is persistence_error
+    assert error.residual_state_ids == ()
+    assert error.residual_operation_ids == ()
+    assert load_execution_attempt(tmp_path, error.attempt_id).status == "resolved"
+
+
+@pytest.mark.parametrize("phase", ["resolution", "execution"])
+def test_corrupted_attempt_yaml_validation_error_becomes_persistence_wrapper(
+    tmp_path, monkeypatch, phase
+):
+    """Normative item 46: a valid attempt is persisted first, then its YAML
+    is corrupted; real mark/load code must surface pydantic.ValidationError
+    through TautomerEnumerationAttemptPersistenceError."""
+
+    _setup_input_state(tmp_path)
+
+    fixed_uuid, _ = _install_controlled_attempt_uuid(monkeypatch)
+    attempt_file = tmp_path / "scientific" / "execution_attempts" / f"{fixed_uuid.hex}.yaml"
+
+    def _corrupt_attempt():
+        assert attempt_file.exists()
+        attempt_file.write_text(
+            yaml.safe_dump({"schema_version": "9.9", "corrupted": True}, sort_keys=False),
+            encoding="utf-8",
+        )
+
+    if phase == "resolution":
+        original_error = RDKitUnavailableError("scientific resolution failure")
+
+        def _resolve():
+            _corrupt_attempt()
+            raise original_error
+
+        resolve_engine = _resolve
+        enumerate_fn = _fake_enumerate_returning([])
+        expected_status = "resolution_failed"
+    else:
+        original_error = InvalidSDFError("scientific execution failure")
+
+        def _enumerate(*, source_path, source_format):
+            _corrupt_attempt()
+            raise original_error
+
+        resolve_engine = _fake_resolve_engine()
+        enumerate_fn = _enumerate
+        expected_status = "execution_failed"
+
+    with pytest.raises(TautomerEnumerationAttemptPersistenceError) as caught:
+        enumerate_state_tautomers(
+            tmp_path,
+            input_state_id="state-a",
+            policy=_policy(),
+            _resolve_engine=resolve_engine,
+            _enumerate=enumerate_fn,
+        )
+
+    error = caught.value
+    assert error.attempt_id == fixed_uuid.hex
+    assert error.input_state_id == "state-a"
+    assert error.phase == phase
+    assert error.intended_status == expected_status
+    assert error.original_error is original_error
+    assert isinstance(error.persistence_error, ValidationError)
+    assert error.__cause__ is error.persistence_error
+    assert error.residual_state_ids == ()
+    assert error.residual_operation_ids == ()
+
+
+def test_persistence_wrapper_exposes_all_structured_properties(tmp_path, monkeypatch):
+    """Normative item 47."""
+
+    _setup_input_state(tmp_path)
+    original_error = InvalidSDFError("scientific execution failure")
+    persistence_error = OSError("simulated persistence failure")
+
+    def _raise_persistence_error(*args, **kwargs):
+        raise persistence_error
+
+    monkeypatch.setattr(application_module, "mark_execution_failed", _raise_persistence_error)
+
+    with pytest.raises(TautomerEnumerationAttemptPersistenceError) as caught:
+        enumerate_state_tautomers(
+            tmp_path,
+            input_state_id="state-a",
+            policy=_policy(),
+            _resolve_engine=_fake_resolve_engine(),
+            _enumerate=_fake_enumerate_raising(original_error),
+        )
+
+    error = caught.value
+    assert error.attempt_id
+    assert error.input_state_id == "state-a"
+    assert error.phase == "execution"
+    assert error.intended_status == "execution_failed"
+    assert isinstance(error.original_error, InvalidSDFError)
+    assert error.original_error is original_error
+    assert error.persistence_error is persistence_error
+    assert error.__cause__ is error.persistence_error
+    assert error.residual_state_ids == ()
+    assert error.residual_operation_ids == ()
 
 # --- independence of successive attempts ---
 
@@ -1163,12 +1815,16 @@ def test_enumerate_state_tautomers_without_rdkit_extra_produces_resolution_faile
 
     _setup_input_state(tmp_path)
 
-    before = _attempt_ids(tmp_path)
-
-    with pytest.raises(RDKitUnavailableError):
+    with pytest.raises(TautomerEnumerationAttemptFailedError) as caught:
         enumerate_state_tautomers(tmp_path, input_state_id="state-a", policy=_policy())
 
-    attempt = _new_attempt(tmp_path, before)
+    error = _assert_attempt_failed(
+        caught,
+        input_state_id="state-a",
+        status="resolution_failed",
+        original_type=RDKitUnavailableError,
+    )
+    attempt = load_execution_attempt(tmp_path, error.attempt_id)
     assert attempt.status == "resolution_failed"
     assert attempt.error.phase == "resolution"
     assert attempt.error.message

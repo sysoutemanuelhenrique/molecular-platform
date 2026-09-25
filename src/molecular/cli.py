@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 from typing import List, Optional, Tuple
 
 import typer
@@ -10,6 +11,9 @@ from pydantic import ValidationError
 from molecular.activity import record_activity
 from molecular.application import (
     InvalidPubChemCidError,
+    TautomerEnumerationAttemptFailedError,
+    TautomerEnumerationAttemptPersistenceError,
+    enumerate_state_tautomers,
     register_derived_state,
     register_ligand_from_pubchem,
 )
@@ -23,9 +27,17 @@ from molecular.context import (
     resolve_experiment,
     scan_experiments,
 )
+from molecular.execution import TautomerEnumerationPolicy
+from molecular.execution_registry import load_execution_attempt
 from molecular.inputs import validate_input_id
 from molecular.models import ExperimentConfig
 from molecular.pubchem import PubChemAcquisitionError, PubChemNotFoundError
+from molecular.rdkit_tautomer import (
+    IncompleteEnumerationError,
+    InvalidSDFError,
+    MultipleMoleculesError,
+    RDKitUnavailableError,
+)
 from molecular.registry import load_ligand, load_protein, register_ligand, register_protein
 from molecular.scientific import ScientificEntity
 from molecular.scientific_registry import (
@@ -39,7 +51,10 @@ from molecular.scientific_registry import (
     register_state,
 )
 from molecular.transformation import TransformationParameter, TransformationProducer
-from molecular.transformation_registry import list_state_transformations
+from molecular.transformation_registry import (
+    list_state_transformations,
+    load_state_transformation,
+)
 
 app = typer.Typer(
     help="Molecular Platform - scientific molecular research platform."
@@ -127,40 +142,48 @@ def _record_activity_safely(project_dir: Path, command: str, outcome: str) -> No
         pass
 
 
-def _resolve_experiment_or_exit(identifier: str) -> ExperimentContext:
+def _resolve_experiment_or_exit(
+    identifier: str, *, error_sanitizer=None
+) -> ExperimentContext:
     """Resolve an experiment by its logical experiment_id, or exit with a
     friendly error.
 
     There is no activity log entry on failure here: without a resolved
-    context there is no project_dir to log against.
+    context there is no project_dir to log against. error_sanitizer is
+    opt-in presentation only; existing commands preserve their exact
+    output by leaving it as None.
     """
+
+    def _present(value: object) -> str:
+        text = str(value)
+        return error_sanitizer(text) if error_sanitizer is not None else text
 
     try:
         return resolve_experiment(identifier, loader=load_experiment)
 
     except ExperimentNotFoundError:
         typer.echo("INPUT ERROR")
-        typer.echo(f"Experiment '{identifier}' was not found.")
+        typer.echo(_present(f"Experiment '{identifier}' was not found."))
         raise typer.Exit(code=1)
 
     except InvalidExperimentConfigError as error:
         typer.echo("CONFIGURATION ERROR")
-        typer.echo(f"Experiment '{identifier}' is invalid.")
+        typer.echo(_present(f"Experiment '{identifier}' is invalid."))
 
         for item in error.validation_error.errors():
             field = ".".join(str(part) for part in item["loc"])
-            typer.echo(f"- {field}: {item['msg']}")
+            typer.echo(f"- {field}: {_present(item['msg'])}")
 
         raise typer.Exit(code=1)
 
     except AmbiguousExperimentError as error:
         typer.echo("CONFIGURATION ERROR")
-        typer.echo(str(error))
+        typer.echo(_present(error))
         raise typer.Exit(code=1)
 
     except OSError as error:
         typer.echo("STORAGE ERROR")
-        typer.echo(f"Could not read the current directory: {error}")
+        typer.echo(_present(f"Could not read the current directory: {error}"))
         raise typer.Exit(code=1)
 
 
@@ -270,7 +293,11 @@ def _echo_validation_errors(error: ValidationError) -> None:
 
 
 def _validate_id_or_exit(
-    value: str, *, project_dir: Optional[Path] = None, command: Optional[str] = None
+    value: str,
+    *,
+    project_dir: Optional[Path] = None,
+    command: Optional[str] = None,
+    error_sanitizer=None,
 ) -> str:
     """Validate a scientific/input id at the CLI boundary before calling any
     load/list function that does not validate id format internally itself.
@@ -288,7 +315,10 @@ def _validate_id_or_exit(
         return validate_input_id(value)
     except ValueError as error:
         typer.echo("INPUT ERROR")
-        typer.echo(str(error))
+        message = str(error)
+        if error_sanitizer is not None:
+            message = error_sanitizer(message)
+        typer.echo(message)
         if project_dir is not None and command is not None:
             _record_activity_safely(project_dir, command=command, outcome="error")
         raise typer.Exit(code=1)
@@ -804,6 +834,369 @@ def state_list(
 
     for state in states:
         typer.echo(f"{state.id}  (entity={state.entity_id})")
+
+
+def _echo_unconfirmed_removals(
+    residual_state_ids: tuple[str, ...],
+    residual_operation_ids: tuple[str, ...],
+) -> None:
+    """Render only removals whose cleanup could not be confirmed."""
+
+    if not residual_state_ids and not residual_operation_ids:
+        return
+
+    typer.echo()
+    typer.echo(
+        "Unconfirmed removals: "
+        f"{len(residual_state_ids)} state(s), "
+        f"{len(residual_operation_ids)} transformation(s)"
+    )
+    for state_id in residual_state_ids:
+        typer.echo(f"  State '{state_id}'")
+    for operation_id in residual_operation_ids:
+        typer.echo(f"  Transformation '{operation_id}'")
+
+
+_TAUTOMER_URL_RE = re.compile(r"(?i)\bhttps?://[^\s'\"<>]+")
+_TAUTOMER_FILE_SUFFIX_RE = re.compile(
+    r"\.[A-Za-z0-9]{1,12}(?:\.[A-Za-z0-9]{1,12})*"
+)
+_TAUTOMER_PATH_CONNECTORS = (" and ", " then ")
+
+
+def _tautomer_path_start(text: str, index: int):
+    """Return (kind, content_start) for an unambiguous absolute-path prefix."""
+
+    if (
+        index + 2 < len(text)
+        and text[index].isalpha()
+        and text[index + 1] == ":"
+        and text[index + 2] in "\\/"
+        and (index == 0 or not (text[index - 1].isalnum() or text[index - 1] == "_"))
+    ):
+        return "windows", index + 2
+
+    if text.startswith("\\\\", index):
+        cursor = index
+        while cursor < len(text) and text[cursor] == "\\":
+            cursor += 1
+        if (
+            cursor - index >= 2
+            and (index == 0 or not (text[index - 1].isalnum() or text[index - 1] == "_"))
+        ):
+            return "unc", cursor
+
+    if text[index] == "/":
+        previous = text[index - 1] if index else ""
+        if (
+            not text.startswith("//", index)
+            and (index == 0 or not (previous.isalnum() or previous in "_+)]"))
+        ):
+            return "posix", index + 1
+
+    return None
+
+
+def _tautomer_is_path_separator(character: str, kind: str) -> bool:
+    if kind == "windows":
+        return character in "\\/"
+    if kind == "unc":
+        return character == "\\"
+    return character == "/"
+
+
+def _tautomer_path_end(
+    text: str,
+    *,
+    content_start: int,
+    kind: str,
+):
+    """Find one path's first file-like endpoint without crossing text boundaries."""
+
+    cursor = content_start
+    while cursor < len(text):
+        character = text[cursor]
+
+        if character in "\r\n'\"<>":
+            return None
+
+        if character in ",;)}]":
+            return None
+
+        if any(text.startswith(connector, cursor) for connector in _TAUTOMER_PATH_CONNECTORS):
+            return None
+
+        if _tautomer_is_path_separator(character, kind):
+            while (
+                cursor < len(text)
+                and _tautomer_is_path_separator(text[cursor], kind)
+            ):
+                cursor += 1
+            continue
+
+        if cursor > content_start and _tautomer_path_start(text, cursor) is not None:
+            return None
+
+        suffix = _TAUTOMER_FILE_SUFFIX_RE.match(text, cursor)
+        if suffix is None:
+            cursor += 1
+            continue
+
+        endpoint = suffix.end()
+        if endpoint < len(text) and _tautomer_is_path_separator(text[endpoint], kind):
+            cursor = endpoint
+            continue
+
+        following = text[endpoint] if endpoint < len(text) else ""
+        if (
+            not following
+            or following.isspace()
+            or following in "'\",;:)]}!?#."
+        ):
+            return endpoint
+
+        cursor = endpoint
+
+    return None
+
+
+def _redact_tautomer_paths_outside_urls(text: str) -> str:
+    pieces = []
+    cursor = 0
+
+    while cursor < len(text):
+        path = _tautomer_path_start(text, cursor)
+        if path is None:
+            pieces.append(text[cursor])
+            cursor += 1
+            continue
+
+        kind, content_start = path
+        endpoint = _tautomer_path_end(
+            text,
+            content_start=content_start,
+            kind=kind,
+        )
+        if endpoint is None:
+            pieces.append(text[cursor])
+            cursor += 1
+            continue
+
+        pieces.append("[redacted-path]")
+        cursor = endpoint
+
+    return "".join(pieces)
+
+
+def _sanitize_tautomer_error_text(value: object) -> str:
+    """Redact absolute paths while preserving URLs and chemistry verbatim."""
+
+    text = str(value)
+    pieces = []
+    cursor = 0
+
+    for url in _TAUTOMER_URL_RE.finditer(text):
+        pieces.append(_redact_tautomer_paths_outside_urls(text[cursor : url.start()]))
+        pieces.append(url.group(0))
+        cursor = url.end()
+
+    pieces.append(_redact_tautomer_paths_outside_urls(text[cursor:]))
+    return "".join(pieces)
+
+
+def _echo_tautomer_validation_errors(error: ValidationError) -> None:
+    for item in error.errors():
+        field = ".".join(str(part) for part in item["loc"])
+        typer.echo(f"- {field}: {_sanitize_tautomer_error_text(item['msg'])}")
+
+
+def _tautomer_failure_banner(error: BaseException) -> str:
+    """Map the structured original cause to the frozen CLI vocabulary."""
+
+    if isinstance(error, (InvalidSDFError, MultipleMoleculesError, IncompleteEnumerationError)):
+        return "EXECUTION ERROR"
+    if isinstance(error, RDKitUnavailableError):
+        return "CONFIGURATION ERROR"
+    if isinstance(error, (FileNotFoundError, FileExistsError)):
+        return "INPUT ERROR"
+    if isinstance(error, ValueError):
+        return "INPUT ERROR"
+    if isinstance(error, OSError):
+        return "STORAGE ERROR"
+    return "EXECUTION ERROR"
+
+
+def _exit_tautomer_result_presentation_error(
+    *,
+    banner: str,
+    attempt_id: str,
+    input_state_id: str,
+    operation_id: str,
+    error: Exception,
+) -> None:
+    typer.echo(banner)
+    typer.echo()
+    typer.echo("TAUTOMER ENUMERATION RESULT ERROR")
+    typer.echo()
+    typer.echo(f"Attempt ID: {attempt_id}")
+    typer.echo(f"Input state: {input_state_id}")
+    typer.echo("Scientific enumeration completed: yes")
+    typer.echo("Stored result presentation: failed")
+    typer.echo(f"Transformation: '{operation_id}'")
+    typer.echo(f"Error: {_sanitize_tautomer_error_text(error)}")
+    raise typer.Exit(code=1)
+
+
+@state_app.command("enumerate-tautomers")
+def state_enumerate_tautomers(
+    experiment: str,
+    input_state: str = typer.Option(..., "--input-state"),
+    max_states: Optional[int] = typer.Option(None, "--max-states"),
+):
+    """Enumerate and publish tautomeric states from an existing MolecularState."""
+
+    context = _resolve_experiment_or_exit(
+        experiment, error_sanitizer=_sanitize_tautomer_error_text
+    )
+    validated_input_state = _validate_id_or_exit(
+        input_state,
+        project_dir=context.project_dir,
+        command="state-enumerate-tautomers",
+        error_sanitizer=_sanitize_tautomer_error_text,
+    )
+
+    try:
+        policy = TautomerEnumerationPolicy(
+            schema_version="1.0",
+            max_states=max_states,
+            source="scientist",
+        )
+    except ValidationError as error:
+        typer.echo("CONFIGURATION ERROR")
+        _echo_tautomer_validation_errors(error)
+        raise typer.Exit(code=1)
+
+    try:
+        attempt = enumerate_state_tautomers(
+            context.project_dir,
+            input_state_id=validated_input_state,
+            policy=policy,
+        )
+
+    except TautomerEnumerationAttemptPersistenceError as error:
+        typer.echo("STORAGE ERROR")
+        typer.echo()
+        typer.echo(f"Attempt ID: {error.attempt_id}")
+        typer.echo(f"Input state: {error.input_state_id}")
+        typer.echo(f"Phase: {error.phase}")
+        typer.echo(f"Intended status: {error.intended_status}")
+        typer.echo("Terminal status persisted: no")
+        typer.echo(
+            f"Original error: {_sanitize_tautomer_error_text(error.original_error)}"
+        )
+        typer.echo(
+            f"Persistence error: {_sanitize_tautomer_error_text(error.persistence_error)}"
+        )
+        _echo_unconfirmed_removals(
+            error.residual_state_ids,
+            error.residual_operation_ids,
+        )
+        raise typer.Exit(code=1)
+
+    except TautomerEnumerationAttemptFailedError as error:
+        typer.echo(_tautomer_failure_banner(error.original_error))
+        typer.echo()
+
+        try:
+            failed_attempt = load_execution_attempt(context.project_dir, error.attempt_id)
+        except Exception:
+            typer.echo("TAUTOMER ENUMERATION FAILED")
+            typer.echo()
+            typer.echo(f"Attempt ID: {error.attempt_id}")
+            typer.echo(f"Input state: {error.input_state_id}")
+            typer.echo(f"Status: {error.status}")
+            typer.echo(f"Error: {_sanitize_tautomer_error_text(error.original_error)}")
+            typer.echo()
+            typer.echo("(additional attempt details could not be loaded)")
+            raise typer.Exit(code=1)
+
+        typer.echo("TAUTOMER ENUMERATION FAILED")
+        typer.echo()
+        typer.echo(f"Attempt ID: {error.attempt_id}")
+        typer.echo(f"Input state: {error.input_state_id}")
+        typer.echo(f"Status: {error.status}")
+        typer.echo(f"Phase: {failed_attempt.error.phase}")
+        typer.echo(f"Error: {_sanitize_tautomer_error_text(failed_attempt.error.message)}")
+        _echo_unconfirmed_removals(
+            failed_attempt.error.residual_state_ids,
+            failed_attempt.error.residual_operation_ids,
+        )
+        raise typer.Exit(code=1)
+
+    except FileNotFoundError as error:
+        typer.echo("INPUT ERROR")
+        typer.echo(_sanitize_tautomer_error_text(error))
+        raise typer.Exit(code=1)
+
+    except FileExistsError as error:
+        typer.echo("INPUT ERROR")
+        typer.echo(_sanitize_tautomer_error_text(error))
+        raise typer.Exit(code=1)
+
+    except ValidationError as error:
+        typer.echo("CONFIGURATION ERROR")
+        _echo_tautomer_validation_errors(error)
+        raise typer.Exit(code=1)
+
+    except ValueError as error:
+        typer.echo("INPUT ERROR")
+        typer.echo(_sanitize_tautomer_error_text(error))
+        raise typer.Exit(code=1)
+
+    except OSError as error:
+        typer.echo("STORAGE ERROR")
+        typer.echo(_sanitize_tautomer_error_text(error))
+        raise typer.Exit(code=1)
+
+    operation_ids = tuple(attempt.operation_ids or ())
+    resolved_results: list[tuple[str, str]] = []
+    for operation_id in operation_ids:
+        try:
+            transformation = load_state_transformation(
+                context.project_dir, operation_id
+            )
+        except (FileNotFoundError, OSError) as error:
+            _exit_tautomer_result_presentation_error(
+                banner="STORAGE ERROR",
+                attempt_id=attempt.id,
+                input_state_id=validated_input_state,
+                operation_id=operation_id,
+                error=error,
+            )
+        except (ValidationError, yaml.YAMLError) as error:
+            _exit_tautomer_result_presentation_error(
+                banner="CONFIGURATION ERROR",
+                attempt_id=attempt.id,
+                input_state_id=validated_input_state,
+                operation_id=operation_id,
+                error=error,
+            )
+        resolved_results.append((operation_id, transformation.child_state_id))
+
+    typer.echo("TAUTOMER ENUMERATION")
+    typer.echo()
+    typer.echo(f"Attempt ID: {attempt.id}")
+    typer.echo(f"Input state: {validated_input_state}")
+    typer.echo("Status: succeeded")
+    typer.echo(f"Engine: {attempt.resolved.engine_name} {attempt.resolved.engine_version}")
+    typer.echo(f"New states published: {len(operation_ids)}")
+    typer.echo()
+
+    for operation_id, child_state_id in resolved_results:
+        typer.echo(
+            f"  State '{child_state_id}'  "
+            f"(transformation '{operation_id}')"
+        )
 
 
 def _split_param(entry: str) -> Tuple[str, str]:

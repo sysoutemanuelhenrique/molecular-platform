@@ -80,6 +80,57 @@ class InvalidPubChemCidError(ValueError):
     """Raised when a PubChem CID is not a positive integer."""
 
 
+class TautomerEnumerationAttemptFailedError(RuntimeError):
+    """A tautomer-enumeration attempt reached a persisted terminal failure."""
+
+    def __init__(
+        self,
+        *,
+        attempt_id: str,
+        input_state_id: str,
+        status: Literal["resolution_failed", "execution_failed"],
+        original_error: BaseException,
+    ) -> None:
+        super().__init__(
+            f"tautomer enumeration attempt '{attempt_id}' failed with status "
+            f"'{status}': {str(original_error) or repr(original_error)}"
+        )
+        self.attempt_id = attempt_id
+        self.input_state_id = input_state_id
+        self.status = status
+        self.original_error = original_error
+
+
+class TautomerEnumerationAttemptPersistenceError(RuntimeError):
+    """A tautomer-enumeration attempt could not persist its terminal failure."""
+
+    def __init__(
+        self,
+        *,
+        attempt_id: str,
+        input_state_id: str,
+        intended_status: Literal["resolution_failed", "execution_failed"],
+        phase: Literal["resolution", "execution"],
+        original_error: BaseException,
+        persistence_error: Exception,
+        residual_state_ids: tuple[str, ...] = (),
+        residual_operation_ids: tuple[str, ...] = (),
+    ) -> None:
+        super().__init__(
+            f"tautomer enumeration attempt '{attempt_id}' could not persist "
+            f"intended status '{intended_status}': "
+            f"{str(persistence_error) or repr(persistence_error)}"
+        )
+        self.attempt_id = attempt_id
+        self.input_state_id = input_state_id
+        self.intended_status = intended_status
+        self.phase = phase
+        self.original_error = original_error
+        self.persistence_error = persistence_error
+        self.residual_state_ids = tuple(residual_state_ids)
+        self.residual_operation_ids = tuple(residual_operation_ids)
+
+
 def _record_activity_safely(project_dir: Path, *, outcome: str) -> None:
     """Best-effort activity logging that must never affect the caller's own
     outcome. Catches Exception, not just OSError: any ordinary logging
@@ -493,20 +544,22 @@ def enumerate_state_tautomers(
     so a malformed id fails immediately, without creating an attempt at
     all.
 
-    Every domain/persistence exception raised by the modules this calls
-    propagates unchanged to a corresponding mark_resolution_failed or
-    mark_execution_failed call, mirroring register_derived_state's own
-    error-handling convention in this module: this function never lets an
-    exception escape without first recording it against the attempt it
-    belongs to, except for the pre-attempt validation in step 1, which by
-    construction has no attempt yet to record against.
+    Ordinary Exceptions raised after begin_execution_attempt succeeds are
+    translated at this application boundary so callers receive the exact
+    attempt_id deterministically. If the terminal failure status is
+    persisted, TautomerEnumerationAttemptFailedError is raised from the
+    original scientific/storage error. If persisting that terminal status
+    itself fails, TautomerEnumerationAttemptPersistenceError is raised from
+    the persistence error while retaining the original error separately.
+    Pre-attempt failures continue to propagate unchanged.
 
-    The compensation/error-logging boundary from resolve onward is
-    `except BaseException`, not `except Exception`, mirroring
-    register_derived_state's own justification in this module: once a
-    write has occurred, a KeyboardInterrupt/SystemExit must still trigger
-    compensation and a best-effort error log, exactly like any other
-    exception.
+    KeyboardInterrupt and SystemExit have dedicated handlers: they still
+    trigger terminal-failure persistence (and execution compensation where
+    applicable) plus best-effort error activity logging, but the original
+    interruption itself always propagates. If terminal persistence also
+    fails, that persistence error is chained as the interruption's cause.
+    GeneratorExit and other non-Exception BaseException subclasses are not
+    treated as scientific failures.
     """
 
     validate_input_id(input_state_id)
@@ -552,16 +605,55 @@ def enumerate_state_tautomers(
 
         engine_resolution = _resolve_engine()
 
-    except BaseException as error:
-        mark_resolution_failed(
-            project_dir,
-            attempt.id,
-            error=ExecutionAttemptError(phase="resolution", message=_describe_error(error)),
-        )
+    except (KeyboardInterrupt, SystemExit) as interrupt:
+        persistence_error: Optional[Exception] = None
+        try:
+            mark_resolution_failed(
+                project_dir,
+                attempt.id,
+                error=ExecutionAttemptError(
+                    phase="resolution", message=_describe_error(interrupt)
+                ),
+            )
+        except Exception as error:
+            persistence_error = error
+
         _record_enumerate_tautomers_activity_safely(
             project_dir, outcome="error", details=started_details
         )
+        if persistence_error is not None:
+            raise interrupt from persistence_error
         raise
+
+    except Exception as error:
+        try:
+            mark_resolution_failed(
+                project_dir,
+                attempt.id,
+                error=ExecutionAttemptError(phase="resolution", message=_describe_error(error)),
+            )
+        except Exception as persistence_error:
+            _record_enumerate_tautomers_activity_safely(
+                project_dir, outcome="error", details=started_details
+            )
+            raise TautomerEnumerationAttemptPersistenceError(
+                attempt_id=attempt.id,
+                input_state_id=input_state_id,
+                intended_status="resolution_failed",
+                phase="resolution",
+                original_error=error,
+                persistence_error=persistence_error,
+            ) from persistence_error
+
+        _record_enumerate_tautomers_activity_safely(
+            project_dir, outcome="error", details=started_details
+        )
+        raise TautomerEnumerationAttemptFailedError(
+            attempt_id=attempt.id,
+            input_state_id=input_state_id,
+            status="resolution_failed",
+            original_error=error,
+        ) from error
 
     resolved_snapshot = ResolvedExecutionSnapshot(
         schema_version="1.0",
@@ -692,20 +784,25 @@ def enumerate_state_tautomers(
         )
         return succeeded
 
-    except BaseException as error:
+    except (KeyboardInterrupt, SystemExit) as interrupt:
         residual_state_ids, residual_operation_ids = _compensate_published_candidates(
             project_dir, staged, state_created_flags, transformation_created_flags
         )
-        mark_execution_failed(
-            project_dir,
-            attempt.id,
-            error=ExecutionAttemptError(
-                phase="execution",
-                message=_describe_error(error),
-                residual_state_ids=residual_state_ids,
-                residual_operation_ids=residual_operation_ids,
-            ),
-        )
+        persistence_error: Optional[Exception] = None
+        try:
+            mark_execution_failed(
+                project_dir,
+                attempt.id,
+                error=ExecutionAttemptError(
+                    phase="execution",
+                    message=_describe_error(interrupt),
+                    residual_state_ids=residual_state_ids,
+                    residual_operation_ids=residual_operation_ids,
+                ),
+            )
+        except Exception as error:
+            persistence_error = error
+
         _record_enumerate_tautomers_activity_safely(
             project_dir,
             outcome="error",
@@ -716,4 +813,60 @@ def enumerate_state_tautomers(
                 published_transformation_ids=tuple(published_transformation_ids),
             ),
         )
+        if persistence_error is not None:
+            raise interrupt from persistence_error
         raise
+
+    except Exception as error:
+        residual_state_ids, residual_operation_ids = _compensate_published_candidates(
+            project_dir, staged, state_created_flags, transformation_created_flags
+        )
+        try:
+            mark_execution_failed(
+                project_dir,
+                attempt.id,
+                error=ExecutionAttemptError(
+                    phase="execution",
+                    message=_describe_error(error),
+                    residual_state_ids=residual_state_ids,
+                    residual_operation_ids=residual_operation_ids,
+                ),
+            )
+        except Exception as persistence_error:
+            _record_enumerate_tautomers_activity_safely(
+                project_dir,
+                outcome="error",
+                details=TautomerEnumerationActivityDetails(
+                    attempt_id=attempt.id,
+                    input_state_id=input_state_id,
+                    published_state_ids=tuple(published_state_ids),
+                    published_transformation_ids=tuple(published_transformation_ids),
+                ),
+            )
+            raise TautomerEnumerationAttemptPersistenceError(
+                attempt_id=attempt.id,
+                input_state_id=input_state_id,
+                intended_status="execution_failed",
+                phase="execution",
+                original_error=error,
+                persistence_error=persistence_error,
+                residual_state_ids=residual_state_ids,
+                residual_operation_ids=residual_operation_ids,
+            ) from persistence_error
+
+        _record_enumerate_tautomers_activity_safely(
+            project_dir,
+            outcome="error",
+            details=TautomerEnumerationActivityDetails(
+                attempt_id=attempt.id,
+                input_state_id=input_state_id,
+                published_state_ids=tuple(published_state_ids),
+                published_transformation_ids=tuple(published_transformation_ids),
+            ),
+        )
+        raise TautomerEnumerationAttemptFailedError(
+            attempt_id=attempt.id,
+            input_state_id=input_state_id,
+            status="execution_failed",
+            original_error=error,
+        ) from error
