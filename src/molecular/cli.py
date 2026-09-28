@@ -923,8 +923,27 @@ def _tautomer_path_end(
         if character in ",;)}]":
             return None
 
-        if any(text.startswith(connector, cursor) for connector in _TAUTOMER_PATH_CONNECTORS):
-            return None
+        connector = next(
+            (
+                candidate
+                for candidate in _TAUTOMER_PATH_CONNECTORS
+                if text.startswith(candidate, cursor)
+            ),
+            None,
+        )
+        if connector is not None:
+            after_connector = cursor + len(connector)
+            # A connector word only separates two distinct paths when a new
+            # absolute path actually starts right after it; otherwise it is
+            # part of this path's own directory name (e.g. "Jane and Joe"),
+            # so keep scanning through it for this same path's real endpoint.
+            if (
+                after_connector < len(text)
+                and _tautomer_path_start(text, after_connector) is not None
+            ):
+                return None
+            cursor = after_connector
+            continue
 
         if _tautomer_is_path_separator(character, kind):
             while (
