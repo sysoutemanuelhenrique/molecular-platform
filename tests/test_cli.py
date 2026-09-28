@@ -5489,3 +5489,213 @@ def test_tautomer_path_sanitizer_preserves_mixed_message_boundaries(message, exp
     sanitized = cli_module._sanitize_tautomer_error_text(message)
 
     assert sanitized == expected
+
+
+# =====================================================================
+# Increment 017 hotfix: a connector-like word ("and"/"then") that is
+# literally part of a single path's directory name must not defeat
+# redaction of that path, while two genuinely distinct paths joined by
+# the same words must still be redacted separately.
+# =====================================================================
+
+
+@pytest.mark.parametrize(
+    "path,sensitive_fragments",
+    [
+        (
+            r"C:\Users\Jane and Joe\private\ligand.sdf",
+            ("Jane", "Joe", "private", "ligand.sdf"),
+        ),
+        (
+            r"C:\Users\Jane then Joe\private\ligand.sdf",
+            ("Jane", "Joe", "private", "ligand.sdf"),
+        ),
+        (
+            r"\\server\share\Jane and Joe\ligand.sdf",
+            ("server", "share", "Jane", "Joe", "ligand.sdf"),
+        ),
+        (
+            r"\\server\share\Jane then Joe\ligand.sdf",
+            ("server", "share", "Jane", "Joe", "ligand.sdf"),
+        ),
+        (
+            "/home/Jane and Joe/private/ligand.sdf",
+            ("Jane", "Joe", "private", "ligand.sdf"),
+        ),
+        (
+            "/home/Jane then Joe/private/ligand.sdf",
+            ("Jane", "Joe", "private", "ligand.sdf"),
+        ),
+    ],
+    ids=[
+        "windows-drive-and",
+        "windows-drive-then",
+        "unc-and",
+        "unc-then",
+        "posix-and",
+        "posix-then",
+    ],
+)
+def test_tautomer_path_sanitizer_redacts_connector_word_inside_directory_name(
+    path, sensitive_fragments
+):
+    sanitized = cli_module._sanitize_tautomer_error_text(path)
+
+    assert sanitized == "[redacted-path]"
+    assert sanitized.count("[redacted-path]") == 1
+    for fragment in sensitive_fragments:
+        assert fragment not in sanitized
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "data/Jane and Joe/ligand.sdf",
+        "data/Jane then Joe/ligand.sdf",
+    ],
+    ids=["relative-and", "relative-then"],
+)
+def test_tautomer_path_sanitizer_does_not_redact_relative_path_by_connector_word_alone(
+    relative_path,
+):
+    sanitized = cli_module._sanitize_tautomer_error_text(relative_path)
+
+    assert sanitized == relative_path
+    assert "[redacted-path]" not in sanitized
+
+
+@pytest.mark.parametrize(
+    "message,expected",
+    [
+        (
+            "path '" + r"C:\Users\Jane and Joe\ligand.sdf" + "'",
+            "path '[redacted-path]'",
+        ),
+        (
+            'path "' + "/home/Jane then Joe/ligand.sdf" + '"',
+            'path "[redacted-path]"',
+        ),
+        (
+            "repr: WindowsPath('" + r"C:\Users\Jane and Joe\ligand.sdf" + "')",
+            "repr: WindowsPath('[redacted-path]')",
+        ),
+        (
+            "structure could not be parsed from /home/Jane and Joe/private/ligand.sdf.",
+            "structure could not be parsed from [redacted-path].",
+        ),
+    ],
+    ids=[
+        "single-quoted",
+        "double-quoted",
+        "repr-wrapped",
+        "trailing-punctuation",
+    ],
+)
+def test_tautomer_path_sanitizer_connector_path_respects_quoting_and_punctuation(
+    message, expected
+):
+    sanitized = cli_module._sanitize_tautomer_error_text(message)
+
+    assert sanitized == expected
+
+
+@pytest.mark.parametrize(
+    "message,expected",
+    [
+        (
+            "https://example.org/a.sdf then /home/Jane and Joe/private/ligand.sdf",
+            "https://example.org/a.sdf then [redacted-path]",
+        ),
+        (
+            "/home/Jane and Joe/private/ligand.sdf then see https://example.org/a.sdf",
+            "[redacted-path] then see https://example.org/a.sdf",
+        ),
+        (
+            "C(=O)/N=C/C found in /home/Jane and Joe/private/ligand.sdf "
+            "while pH+/OH- equilibrium holds",
+            "C(=O)/N=C/C found in [redacted-path] while pH+/OH- equilibrium holds",
+        ),
+    ],
+    ids=[
+        "url-before-connector-path",
+        "url-after-connector-path",
+        "chemistry-before-and-after-connector-path",
+    ],
+)
+def test_tautomer_path_sanitizer_connector_path_preserves_urls_and_chemistry(
+    message, expected
+):
+    sanitized = cli_module._sanitize_tautomer_error_text(message)
+
+    assert sanitized == expected
+
+
+@pytest.mark.parametrize(
+    "message,expected,sensitive_fragments",
+    [
+        (
+            "C:/Users/Jane/a.sdf and /home/Jane/b.sdf",
+            "[redacted-path] and [redacted-path]",
+            ("Jane", "a.sdf", "b.sdf"),
+        ),
+        (
+            "C:/Users/Jane/a.sdf then /home/Jane/b.sdf",
+            "[redacted-path] then [redacted-path]",
+            ("Jane", "a.sdf", "b.sdf"),
+        ),
+        (
+            r"C:\Users\Jane\a.sdf and /home/jane/b.sdf then \\server\share\c.sdf",
+            "[redacted-path] and [redacted-path] then [redacted-path]",
+            ("Jane", "a.sdf", "jane", "b.sdf", "server", "share", "c.sdf"),
+        ),
+    ],
+    ids=[
+        "two-distinct-paths-and",
+        "two-distinct-paths-then",
+        "three-distinct-paths-mixed-connectors",
+    ],
+)
+def test_tautomer_path_sanitizer_still_separates_distinct_paths_across_connectors(
+    message, expected, sensitive_fragments
+):
+    sanitized = cli_module._sanitize_tautomer_error_text(message)
+
+    assert sanitized == expected
+    assert sanitized.count("[redacted-path]") == expected.count("[redacted-path]")
+    for fragment in sensitive_fragments:
+        assert fragment not in sanitized
+    assert " and " in sanitized or "and" not in message
+    assert " then " in sanitized or "then" not in message
+
+
+def test_tautomer_cli_redacts_path_with_connector_in_directory_name(
+    tmp_path, monkeypatch
+):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    absolute_path = r"C:\Users\Jane and Joe\private data\ligand.sdf"
+    chemical_text = "H+/OH- equilibrium"
+    _patch_tautomer_failure(
+        monkeypatch,
+        InvalidSDFError(
+            f"structure could not be parsed from {absolute_path} ({chemical_text})"
+        ),
+        attempt_id="attempt-connector-directory-name",
+    )
+
+    result = runner.invoke(app, _tautomer_cli_args())
+
+    assert result.exit_code == 1
+    assert "EXECUTION ERROR" in result.output
+    assert "Attempt ID: attempt-connector-directory-name" in result.output
+    assert "Input state: state-a" in result.output
+    assert result.output.count("[redacted-path]") == 1
+    assert chemical_text in result.output
+    assert "Traceback" not in result.output
+
+    for stream in _result_streams(result):
+        assert absolute_path not in stream
+        assert "Jane" not in stream
+        assert "Joe" not in stream
+        assert "private data" not in stream
+        assert "ligand.sdf" not in stream
+        assert chemical_text in stream or stream == ""
