@@ -29,6 +29,8 @@ from typing import Literal, Mapping, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from molecular.promotion import LigandPromotionPolicy
+
 try:
     from rdkit import Chem, rdBase
     from rdkit.Chem import rdMolDescriptors
@@ -251,6 +253,234 @@ class RDKitTautomerEnumerationResult(BaseModel):
                 f"new_unique_count={self.new_unique_count})"
             )
         return self
+
+
+class InvalidPromotionSDFError(ValueError):
+    """`invalid-sdf` (Section 17 of Increment 018's frozen final
+    specification). Raised when the SDF source is empty, not SDF at all
+    (supplier construction itself fails - Section 9.2, step 3), when the
+    single physical record fails to parse into a non-null molecule
+    (Section 9.4), or when a molecule accepted under `sanitize=False` fails
+    the mandatory posterior sanitization check on a copy (Section 9.2,
+    step 8; Section 9.6, layer 5). Distinct from `InvalidSDFError` above:
+    that one is the tautomer enumerator's own error for a different call
+    site and a different caller contract (Section 9's docstring rule:
+    never reuse a tautomer-enumeration decision for the RAW inspection
+    contract when the two differ)."""
+
+
+class PromotionRecordCountError(ValueError):
+    """`record-count` (Section 17). Raised whenever the physical record
+    count is anything other than exactly one non-null record: zero
+    records (supplier constructed successfully but iterated none - never
+    empirically reproduced by any RD-018-01 fixture, Section 9.4/9.6, but
+    logically required), or two or more records regardless of how many of
+    them are individually valid (Section 9.2, step 6 - the single valid
+    record is never accepted in isolation when the file contains more than
+    one record, in either order)."""
+
+    def __init__(self, record_count: int) -> None:
+        super().__init__(
+            f"expected exactly 1 physical SDF record, found {record_count}"
+        )
+        self.record_count = record_count
+
+
+class DisconnectedStructureError(ValueError):
+    """`disconnected-structure` (Section 17). Raised when the single
+    accepted molecule has more than one connected fragment (Section 9.4,
+    "um registro desconectado"; `LigandPromotionPolicy.component_policy`
+    is always `"reject-disconnected"`, Section 6.1)."""
+
+
+# Controlled vocabulary for warnings (Section 9.2, step 9; Section 6.3's
+# invariant that warnings use controlled vocabulary, never a path). Only
+# what is genuinely derivable from `source_path` + `policy` alone: an
+# expected entity name or PubChem CID to compare against is not part of
+# this adapter's frozen signature (Section 9.1) and is therefore never
+# compared here - see this module's own docstring/report for that scope
+# note.
+_WARNING_UNDEFINED_STEREOCENTER = "undefined-stereocenter"
+_WARNING_SD_NAME_PROPERTY_ABSENT = "sd-name-property-absent"
+_WARNING_SD_CID_PROPERTY_ABSENT = "sd-cid-property-absent"
+_SD_NAME_PROPERTY_KEYS = ("PUBCHEM_IUPAC_NAME", "NAME", "Name", "name")
+_SD_CID_PROPERTY_KEY = "PUBCHEM_COMPOUND_CID"
+
+
+class RDKitLigandInspectionResult(BaseModel):
+    """The RDKit adapter's neutral inspection result for RAW ligand
+    promotion (Section 9.1/9.2 of the frozen spec). Deliberately mirrors
+    the RDKit-derived subset of `molecular.promotion.
+    ResolvedLigandPromotionSnapshot` field-for-field (everything except
+    `raw_checksum_persisted`/`snapshot_checksum`/`snapshot_size_bytes`,
+    which come from Route B, not from this adapter) - a future Application
+    Service combines the two. No `Mol` object crosses this boundary
+    (Section 9.1)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    engine_name: EngineName
+    engine_version: str = Field(min_length=1)
+    input_format: InputFormat
+    sanitize: bool
+    remove_hs: bool
+    strict_parsing: bool
+    record_count: Literal[1]
+    fragment_count: Literal[1]
+    formal_charge: int
+    atom_count: int = Field(ge=1)
+    explicit_hydrogen_count: int = Field(ge=0)
+    isotopic_hydrogen_count: int = Field(ge=0)
+    warnings: tuple[str, ...] = ()
+
+
+def _classify_record_counts(total: int, valid: int) -> None:
+    """The single-molecule rule RDKit does not itself enforce (Section
+    9.2, steps 4-6; Section 9.4's table) - a pure decision function over
+    the platform's own hand-counted tallies, factored out so the
+    total==0 branch (never empirically reproduced by any RD-018-01
+    fixture) is directly unit-testable without depending on a real RDKit
+    parse producing that exact outcome. Returns None (accept) only when
+    exactly one physical record exists and it parsed into a non-null
+    molecule."""
+
+    if total == 0:
+        raise PromotionRecordCountError(0)
+    if total == 1:
+        if valid == 1:
+            return
+        raise InvalidPromotionSDFError(
+            "the single record in the SDF source failed to parse into a valid molecule"
+        )
+    raise PromotionRecordCountError(total)
+
+
+def inspect_single_sdf_for_promotion(
+    *, source_path: Path, policy: LigandPromotionPolicy
+) -> RDKitLigandInspectionResult:
+    """Inspect a single-molecule SDF snapshot for RAW ligand promotion
+    (Section 9.1/9.2 of the frozen spec). `source_path` MUST already be a
+    verified private snapshot (Section 8) - this function never validates
+    or re-reads the original RAW path, and never writes to `source_path`.
+
+    The three RDKit flags are always taken explicitly from `policy` and
+    passed explicitly to `Chem.SDMolSupplier` - RD-018-01 confirmed the
+    library's own defaults (`sanitize=True, removeHs=True,
+    strictParsing=True`) differ from the production policy
+    (`removeHs=False`) and must never be relied upon implicitly (Section
+    9.2, step 2; Section 7.1).
+
+    Raises (all resolution-phase, Section 17):
+    - RDKitUnavailableError if rdkit cannot be resolved at all.
+    - InvalidPromotionSDFError for an empty/non-SDF source (supplier
+      construction itself fails), a single record that fails to parse, or
+      a molecule that fails the mandatory posterior-sanitization check
+      when `sanitize=False` was requested.
+    - PromotionRecordCountError for zero or two-or-more physical records
+      (Section 9.2, step 6 - never accepts the one valid record in
+      isolation when more than one record is present).
+    - DisconnectedStructureError for more than one connected fragment.
+
+    Never treats `Chem.MolToSmiles` succeeding as proof of eligibility
+    (Section 9.6) - no SMILES is even generated here, precisely because
+    this adapter never needs it for anything this contract requires.
+    """
+
+    engine = resolve_rdkit_engine()
+
+    try:
+        supplier = Chem.SDMolSupplier(
+            str(source_path),
+            sanitize=policy.sanitize,
+            removeHs=policy.remove_hs,
+            strictParsing=policy.strict_parsing,
+        )
+    except OSError as error:
+        raise InvalidPromotionSDFError(str(error)) from error
+
+    total = 0
+    valid = 0
+    sole_mol = None
+    with rdBase.BlockLogs():
+        for record in supplier:
+            total += 1
+            if record is not None:
+                valid += 1
+                sole_mol = record
+
+    _classify_record_counts(total, valid)
+    mol = sole_mol
+    if mol is None:  # pragma: no cover - guaranteed unreachable by _classify_record_counts
+        raise InvalidPromotionSDFError("no valid molecule was produced")
+
+    fragments = Chem.GetMolFrags(mol, sanitizeFrags=False)
+    if len(fragments) != 1:
+        raise DisconnectedStructureError(
+            f"expected exactly 1 connected fragment, found {len(fragments)}"
+        )
+
+    # Section 9.2, step 7: measurements are taken on the ORIGINAL mol,
+    # strictly before any posterior sanitization (step 8) - never on the
+    # sanitized copy, and never reordered relative to step 8 below.
+    formal_charge = Chem.GetFormalCharge(mol)
+    atom_count = mol.GetNumAtoms()
+    explicit_hydrogen_count = sum(
+        1 for atom in mol.GetAtoms() if atom.GetAtomicNum() == 1 and atom.GetIsotope() == 0
+    )
+    isotopic_hydrogen_count = sum(
+        1 for atom in mol.GetAtoms() if atom.GetAtomicNum() == 1 and atom.GetIsotope() != 0
+    )
+
+    warnings: list[str] = []
+    try:
+        chiral_centers = Chem.FindMolChiralCenters(
+            mol, includeUnassigned=True, useLegacyImplementation=False
+        )
+    except Exception:
+        # Stereo perception can require sanitized ring/aromaticity
+        # information this module does not force onto the original mol
+        # (Section 9.2 forbids sanitizing the original at all) - an
+        # inability to determine stereo here is not itself grounds to
+        # reject the molecule; it simply means this specific warning
+        # cannot be produced for this input.
+        chiral_centers = ()
+    if any(tag == "?" for _, tag in chiral_centers):
+        warnings.append(_WARNING_UNDEFINED_STEREOCENTER)
+
+    if not any(mol.HasProp(key) for key in _SD_NAME_PROPERTY_KEYS):
+        warnings.append(_WARNING_SD_NAME_PROPERTY_ABSENT)
+    if not mol.HasProp(_SD_CID_PROPERTY_KEY):
+        warnings.append(_WARNING_SD_CID_PROPERTY_ABSENT)
+
+    # Section 9.2, step 8: only when sanitize=False was requested, verify
+    # chemical usability via Chem.SanitizeMol on a COPY - never the
+    # original object, never the source file. This runs strictly AFTER
+    # the measurements above, exactly matching the algorithm's own order.
+    if not policy.sanitize:
+        mol_copy = Chem.Mol(mol)
+        try:
+            with rdBase.BlockLogs():
+                Chem.SanitizeMol(mol_copy)
+        except Chem.MolSanitizeException as error:
+            raise InvalidPromotionSDFError(
+                f"molecule failed sanitization on a copy: {error}"
+            ) from error
+
+    return RDKitLigandInspectionResult(
+        engine_name=engine.engine_name,
+        engine_version=engine.engine_version,
+        input_format=_INPUT_FORMAT,
+        sanitize=policy.sanitize,
+        remove_hs=policy.remove_hs,
+        strict_parsing=policy.strict_parsing,
+        record_count=1,
+        fragment_count=1,
+        formal_charge=formal_charge,
+        atom_count=atom_count,
+        explicit_hydrogen_count=explicit_hydrogen_count,
+        isotopic_hydrogen_count=isotopic_hydrogen_count,
+        warnings=tuple(warnings),
+    )
 
 
 def _formula(mol) -> str:
