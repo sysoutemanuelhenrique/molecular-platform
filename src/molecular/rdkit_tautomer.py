@@ -303,7 +303,12 @@ class DisconnectedStructureError(ValueError):
 _WARNING_UNDEFINED_STEREOCENTER = "undefined-stereocenter"
 _WARNING_SD_NAME_PROPERTY_ABSENT = "sd-name-property-absent"
 _WARNING_SD_CID_PROPERTY_ABSENT = "sd-cid-property-absent"
-_SD_NAME_PROPERTY_KEYS = ("PUBCHEM_IUPAC_NAME", "NAME", "Name", "name")
+# Checkpoint 3 correction (MINOR-B1): `_Name` is RDKit's own special
+# property, auto-populated from the MOL block's title line (distinct from
+# an explicit SD data field such as `>  <NAME>`) - a real, common pattern
+# (e.g. ChemDraw/OpenBabel exports that only ever populate the title line).
+# Recognized here so such a file is never incorrectly flagged as nameless.
+_SD_NAME_PROPERTY_KEYS = ("PUBCHEM_IUPAC_NAME", "NAME", "Name", "name", "_Name")
 _SD_CID_PROPERTY_KEY = "PUBCHEM_COMPOUND_CID"
 
 
@@ -396,17 +401,33 @@ def inspect_single_sdf_for_promotion(
             strictParsing=policy.strict_parsing,
         )
     except OSError as error:
-        raise InvalidPromotionSDFError(str(error)) from error
+        raise InvalidPromotionSDFError(
+            f"the SDF source could not be parsed by the supplier: {error.__class__.__name__}"
+        ) from error
 
     total = 0
     valid = 0
     sole_mol = None
-    with rdBase.BlockLogs():
-        for record in supplier:
-            total += 1
-            if record is not None:
-                valid += 1
-                sole_mol = record
+    try:
+        with rdBase.BlockLogs():
+            for record in supplier:
+                total += 1
+                if record is not None:
+                    valid += 1
+                    sole_mol = record
+    except Exception as error:
+        # Checkpoint 3 correction (MAJOR-B1): construction succeeding is no
+        # guarantee that iterating every record will not itself raise (the
+        # RDKit C++/Boost.Python layer can raise mid-iteration on a
+        # malformed record, distinct from simply yielding `None`). Never
+        # let a raw framework exception escape this adapter's closed error
+        # taxonomy (Section 17), and never accept the partial `total`/
+        # `valid` tally accumulated so far as if iteration had completed.
+        # `except Exception` deliberately excludes KeyboardInterrupt/
+        # SystemExit/GeneratorExit (direct BaseException subclasses).
+        raise InvalidPromotionSDFError(
+            f"iterating the SDF source raised {error.__class__.__name__}"
+        ) from error
 
     _classify_record_counts(total, valid)
     mol = sole_mol
@@ -447,7 +468,13 @@ def inspect_single_sdf_for_promotion(
     if any(tag == "?" for _, tag in chiral_centers):
         warnings.append(_WARNING_UNDEFINED_STEREOCENTER)
 
-    if not any(mol.HasProp(key) for key in _SD_NAME_PROPERTY_KEYS):
+    # `_Name` is RDKit's own auto-populated title-line property: it is
+    # ALWAYS present (HasProp is True) once a molecule has gone through
+    # Chem.SDWriter, even when the title line is blank - so presence alone
+    # is not "has a real name" for this one key. A blank value carries no
+    # more name information than no value at all, so it is treated as
+    # absent for every key checked here, not only `_Name`.
+    if not any(mol.HasProp(key) and mol.GetProp(key).strip() for key in _SD_NAME_PROPERTY_KEYS):
         warnings.append(_WARNING_SD_NAME_PROPERTY_ABSENT)
     if not mol.HasProp(_SD_CID_PROPERTY_KEY):
         warnings.append(_WARNING_SD_CID_PROPERTY_ABSENT)
@@ -463,7 +490,7 @@ def inspect_single_sdf_for_promotion(
                 Chem.SanitizeMol(mol_copy)
         except Chem.MolSanitizeException as error:
             raise InvalidPromotionSDFError(
-                f"molecule failed sanitization on a copy: {error}"
+                f"molecule failed sanitization on a copy: {error.__class__.__name__}"
             ) from error
 
     return RDKitLigandInspectionResult(

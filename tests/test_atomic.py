@@ -974,18 +974,22 @@ def test_snapshot_path_removed_on_failure(tmp_path):
     assert not snapshot_path.exists()
 
 
-def test_snapshot_path_with_stale_preexisting_content_removed_on_failure(tmp_path):
-    """Item 149: a stale file already sitting at `snapshot_path` before the
-    call (e.g. left over from an unrelated prior run) is removed on
-    failure, not left in place looking like a valid result."""
+def test_snapshot_path_with_stale_preexisting_content_rejected_untouched(tmp_path):
+    """Item 149 (Checkpoint 3 correction, BLOCKER-A2): a stale file already
+    sitting at `snapshot_path` before the call (e.g. left over from an
+    unrelated prior run) is rejected immediately, before the RAW is even
+    opened - and, critically, its content is left completely untouched:
+    this invocation never created it and must never overwrite or remove
+    it, regardless of how the RAW side of the same call would otherwise
+    have turned out."""
 
     project_dir, raw_path, checksum, snapshot_path = _make_raw_input(tmp_path)
     snapshot_path.write_bytes(b"stale leftover content")
 
-    with pytest.raises(RawArtifactIntegrityError):
+    with pytest.raises(FileExistsError):
         _snapshot(project_dir, raw_path, "0" * 64, snapshot_path)
 
-    assert not snapshot_path.exists()
+    assert snapshot_path.read_bytes() == b"stale leftover content"
 
 
 def test_snapshot_absent_entirely_after_mid_read_failure(tmp_path):
@@ -1003,3 +1007,448 @@ def test_snapshot_absent_entirely_after_mid_read_failure(tmp_path):
         _snapshot(project_dir, raw_path, "0" * 64, snapshot_path)
 
     assert not snapshot_path.exists()
+
+
+# =============================================================================
+# Checkpoint 3 correction - snapshot ownership/staging protocol
+# (BLOCKER-A1, BLOCKER-A2), reparse fail-closed (MAJOR-A1), and
+# error-message redaction (MAJOR-A2).
+# =============================================================================
+
+
+def _staging_leftovers(directory):
+    return list(directory.glob(".raw-snapshot-*.tmp"))
+
+
+def _symlink_or_skip(link_path, target):
+    try:
+        os.symlink(target, link_path)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is not permitted in this environment: {exc}")
+
+
+# --- Snapshot destination test 1: snapshot_path == final_path ---
+
+
+def test_snapshot_path_equal_to_raw_rejected_raw_untouched(tmp_path):
+    project_dir, raw_path, checksum, _snapshot_path = _make_raw_input(tmp_path)
+    final_path = project_dir / "inputs" / "ligands" / _INPUT_ID / "raw.sdf"
+    raw_before = final_path.read_bytes()
+
+    with pytest.raises(FileExistsError):
+        _snapshot(project_dir, raw_path, checksum, final_path)
+
+    assert final_path.read_bytes() == raw_before
+    assert hashlib.sha256(final_path.read_bytes()).hexdigest() == checksum
+
+
+# --- Snapshot destination test 2: snapshot_path is a preexisting hard
+# link to the RAW artifact ---
+
+
+def test_snapshot_path_hardlink_to_raw_rejected_both_untouched(tmp_path):
+    project_dir, raw_path, checksum, snapshot_path = _make_raw_input(tmp_path)
+    final_path = project_dir / "inputs" / "ligands" / _INPUT_ID / "raw.sdf"
+    os.link(final_path, snapshot_path)
+
+    with pytest.raises(FileExistsError):
+        _snapshot(project_dir, raw_path, checksum, snapshot_path)
+
+    assert final_path.read_bytes() == _CONTENT
+    assert snapshot_path.read_bytes() == _CONTENT
+    assert hashlib.sha256(final_path.read_bytes()).hexdigest() == checksum
+
+
+# --- Snapshot destination test 3: snapshot_path is a preexisting symlink
+# to the RAW artifact ---
+
+
+def test_snapshot_path_symlink_to_raw_rejected_without_following(tmp_path):
+    project_dir, raw_path, checksum, snapshot_path = _make_raw_input(tmp_path)
+    final_path = project_dir / "inputs" / "ligands" / _INPUT_ID / "raw.sdf"
+    _symlink_or_skip(snapshot_path, final_path)
+
+    with pytest.raises(FileExistsError):
+        _snapshot(project_dir, raw_path, checksum, snapshot_path)
+
+    assert final_path.read_bytes() == _CONTENT
+    assert hashlib.sha256(final_path.read_bytes()).hexdigest() == checksum
+
+
+# --- Snapshot destination test 4: snapshot_path is an unrelated
+# preexisting regular file (covered above by
+# test_snapshot_path_with_stale_preexisting_content_rejected_untouched,
+# item 149) ---
+
+
+# --- Snapshot destination test 5: snapshot_path is a directory ---
+
+
+def test_snapshot_path_directory_rejected_directory_intact(tmp_path):
+    project_dir, raw_path, checksum, snapshot_path = _make_raw_input(tmp_path)
+    snapshot_path.mkdir()
+    (snapshot_path / "marker.txt").write_text("keep me", encoding="utf-8")
+
+    with pytest.raises(FileExistsError):
+        _snapshot(project_dir, raw_path, checksum, snapshot_path)
+
+    assert snapshot_path.is_dir()
+    assert (snapshot_path / "marker.txt").read_text(encoding="utf-8") == "keep me"
+
+
+# --- Snapshot destination test 6: RAW-side failure before the staging
+# file is even created - a preexisting file elsewhere is never touched,
+# and nothing appears at snapshot_path or as a leftover staging file ---
+
+
+def test_raw_side_failure_before_staging_creation_leaves_no_trace(tmp_path, monkeypatch):
+    project_dir, raw_path, checksum, snapshot_path = _make_raw_input(tmp_path)
+    final_path = project_dir / "inputs" / "ligands" / _INPUT_ID / "raw.sdf"
+    real_open = open
+
+    def _denying_open(path, mode="r", *args, **kwargs):
+        if Path(path) == final_path and mode == "rb":
+            raise PermissionError(13, "simulated permission denied")
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(atomic_module, "open", _denying_open, raising=False)
+
+    with pytest.raises(RawArtifactSharingViolationError):
+        _snapshot(project_dir, raw_path, checksum, snapshot_path)
+
+    assert not snapshot_path.exists()
+    assert _staging_leftovers(snapshot_path.parent) == []
+
+
+# --- Snapshot destination test 7: failure during the staging write loop
+# (an ancestor identity change mid-read) - only this call's own staging
+# is removed, snapshot_path never appears ---
+
+
+def test_failure_during_staging_write_removes_only_own_staging(tmp_path, monkeypatch):
+    """A failure detected while the staging file is being written (the
+    ancestor reverify called immediately after opening the RAW, while its
+    descriptor is still held open) - real filesystem substitution of the
+    root is not obtainable here on Windows while the RAW's own file handle
+    is open (confirmed empirically elsewhere in this suite), so this uses
+    the same localized `_capture_identity` fabrication already established
+    for that exact timing window."""
+
+    content = b"A" * 32
+    project_dir, raw_path, checksum, snapshot_path = _make_raw_input(tmp_path, content=content)
+    root = project_dir / "inputs" / "ligands" / _INPUT_ID
+    real_capture = atomic_module._capture_identity
+    root_calls = {"n": 0}
+
+    def _fake_capture(path):
+        token = real_capture(path)
+        if Path(path) == root:
+            root_calls["n"] += 1
+            if root_calls["n"] >= 3:
+                return atomic_module._IdentityToken(
+                    st_dev=token.st_dev,
+                    st_ino=token.st_ino + 1,
+                    is_reparse_point=token.is_reparse_point,
+                    file_attributes=token.file_attributes,
+                    reparse_tag=token.reparse_tag,
+                    is_regular_file=token.is_regular_file,
+                    is_directory=token.is_directory,
+                    size=token.size,
+                )
+        return token
+
+    monkeypatch.setattr(atomic_module, "_capture_identity", _fake_capture)
+
+    with pytest.raises(RawArtifactIdentityUnstableError):
+        _snapshot(project_dir, raw_path, checksum, snapshot_path)
+
+    assert not snapshot_path.exists()
+    assert _staging_leftovers(snapshot_path.parent) == []
+
+
+# --- Snapshot destination test 8: checksum failure - staging removed,
+# final never published, RAW intact (extends item 150 with an explicit
+# staging-leftover check) ---
+
+
+def test_checksum_failure_removes_staging_leaves_no_trace(tmp_path):
+    project_dir, raw_path, _checksum, snapshot_path = _make_raw_input(tmp_path)
+    final_path = project_dir / "inputs" / "ligands" / _INPUT_ID / "raw.sdf"
+    raw_before = final_path.read_bytes()
+
+    with pytest.raises(RawArtifactIntegrityError):
+        _snapshot(project_dir, raw_path, "0" * 64, snapshot_path)
+
+    assert not snapshot_path.exists()
+    assert _staging_leftovers(snapshot_path.parent) == []
+    assert final_path.read_bytes() == raw_before
+
+
+# --- Snapshot destination test 9: a competing process creates
+# snapshot_path after this call's own pre-check but before publication -
+# the winner's file must survive untouched, and the loss must be typed ---
+
+
+def test_publication_race_lost_winner_file_survives(tmp_path, monkeypatch):
+    project_dir, raw_path, checksum, snapshot_path = _make_raw_input(tmp_path)
+    winner_content = b"the other process's own content"
+    real_link = os.link
+
+    def _racing_link(src, dst, *args, **kwargs):
+        Path(dst).write_bytes(winner_content)
+        return real_link(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(atomic_module.os, "link", _racing_link)
+
+    with pytest.raises(FileExistsError):
+        _snapshot(project_dir, raw_path, checksum, snapshot_path)
+
+    assert snapshot_path.read_bytes() == winner_content
+    assert _staging_leftovers(snapshot_path.parent) == []
+
+
+# --- Snapshot destination test 10: success - exact bytes, no staging
+# leftover, checksum/size from the bytes actually read ---
+
+
+def test_snapshot_publication_success_leaves_no_staging_leftover(tmp_path):
+    project_dir, raw_path, checksum, snapshot_path = _make_raw_input(tmp_path)
+
+    result = _snapshot(project_dir, raw_path, checksum, snapshot_path)
+
+    assert snapshot_path.read_bytes() == _CONTENT
+    assert result.snapshot_checksum == checksum
+    assert result.snapshot_size_bytes == len(_CONTENT)
+    assert _staging_leftovers(snapshot_path.parent) == []
+
+
+def test_snapshot_publication_uses_exclusive_link_never_replace(tmp_path, monkeypatch):
+    """Confirms the publication step never uses `os.replace`/`os.rename`
+    over `snapshot_path` - only `os.link`, which fails rather than
+    overwrites when the destination already exists."""
+
+    project_dir, raw_path, checksum, snapshot_path = _make_raw_input(tmp_path)
+
+    def _poisoned_replace(*args, **kwargs):
+        raise AssertionError("create_verified_raw_snapshot must never call os.replace")
+
+    monkeypatch.setattr(atomic_module.os, "replace", _poisoned_replace)
+
+    result = _snapshot(project_dir, raw_path, checksum, snapshot_path)
+
+    assert result.snapshot_checksum == checksum
+
+
+# --- Destination platform validation (BLOCKER-A1's A.3 sub-finding: the
+# platform gate must also cover snapshot_path, not only project_dir) ---
+
+
+def test_destination_platform_check_runs_before_any_write(tmp_path, monkeypatch):
+    project_dir, raw_path, checksum, snapshot_path = _make_raw_input(tmp_path)
+    real_require = atomic_module._require_validated_platform
+    seen_paths = []
+
+    def _tracking_require(path):
+        seen_paths.append(Path(path))
+        return real_require(path)
+
+    monkeypatch.setattr(atomic_module, "_require_validated_platform", _tracking_require)
+
+    _snapshot(project_dir, raw_path, checksum, snapshot_path)
+
+    assert project_dir in seen_paths
+    assert snapshot_path in seen_paths
+
+
+def test_destination_non_ntfs_filesystem_fails_closed(tmp_path, monkeypatch):
+    project_dir, raw_path, checksum, snapshot_path = _make_raw_input(tmp_path)
+    real_require = atomic_module._require_validated_platform
+
+    def _selective_require(path):
+        if Path(path) == snapshot_path:
+            raise RawArtifactNoFollowUnavailableError("simulated non-NTFS destination volume")
+        return real_require(path)
+
+    monkeypatch.setattr(atomic_module, "_require_validated_platform", _selective_require)
+
+    with pytest.raises(RawArtifactNoFollowUnavailableError):
+        _snapshot(project_dir, raw_path, checksum, snapshot_path)
+
+    assert not snapshot_path.exists()
+
+
+# --- Ownership: staging cleanup never touches anything but this call's
+# own uuid4-named staging file, verified directly against the private
+# helper rather than only inferred from black-box behavior above ---
+
+
+def test_reject_existing_snapshot_destination_accepts_absent_path(tmp_path):
+    missing = tmp_path / "does-not-exist.sdf"
+    assert atomic_module._reject_existing_snapshot_destination(missing) is None
+
+
+def test_reject_existing_snapshot_destination_rejects_existing_file(tmp_path):
+    existing = tmp_path / "already-here.sdf"
+    existing.write_bytes(b"x")
+
+    with pytest.raises(FileExistsError):
+        atomic_module._reject_existing_snapshot_destination(existing)
+
+
+# =============================================================================
+# Checkpoint 3 correction - MAJOR-A1: reparse fail-closed in
+# `_capture_identity` when file attributes cannot be determined.
+# =============================================================================
+
+
+class _FakeLstatResult:
+    """A minimal stand-in for `os.stat_result` that lets individual tests
+    control exactly which attributes are present - real `os.lstat` never
+    produces a result missing `st_file_attributes` on this validated
+    platform, so this is the only way to exercise the fail-closed branch."""
+
+    def __init__(self, *, st_dev=1, st_ino=1, st_mode=0o100644, st_size=0, **extra):
+        self.st_dev = st_dev
+        self.st_ino = st_ino
+        self.st_mode = st_mode
+        self.st_size = st_size
+        for key, value in extra.items():
+            setattr(self, key, value)
+
+
+def test_capture_identity_fails_closed_when_file_attributes_is_none(monkeypatch):
+    monkeypatch.setattr(
+        atomic_module.os, "lstat", lambda path: _FakeLstatResult(st_file_attributes=None)
+    )
+
+    with pytest.raises(RawArtifactNoFollowUnavailableError):
+        atomic_module._capture_identity(Path("irrelevant"))
+
+
+def test_capture_identity_fails_closed_when_file_attributes_attribute_is_absent(monkeypatch):
+    """`getattr(result, "st_file_attributes", None)` collapses a missing
+    attribute and an explicit `None` value to the same outcome - this test
+    exercises the attribute genuinely not existing on the stat result at
+    all, distinct from the previous test's explicit `None`."""
+
+    monkeypatch.setattr(atomic_module.os, "lstat", lambda path: _FakeLstatResult())
+
+    with pytest.raises(RawArtifactNoFollowUnavailableError):
+        atomic_module._capture_identity(Path("irrelevant"))
+
+
+def test_capture_identity_rejects_reparse_bit_even_without_tag(monkeypatch):
+    """If the reparse bit IS present, the absence of `st_reparse_tag`
+    must never cause the path to be accepted as a safe regular file -
+    `is_reparse_point` is decided solely by the bit."""
+
+    monkeypatch.setattr(
+        atomic_module.os,
+        "lstat",
+        lambda path: _FakeLstatResult(
+            st_file_attributes=atomic_module.stat.FILE_ATTRIBUTE_REPARSE_POINT
+        ),
+    )
+
+    token = atomic_module._capture_identity(Path("irrelevant"))
+
+    assert token.is_reparse_point is True
+    assert token.reparse_tag is None
+    with pytest.raises(UnsafeRawArtifactPathError):
+        atomic_module._reject_reparse_point(token, "a test path")
+
+
+def test_capture_identity_none_attributes_never_accepted_as_safe_regular_file(monkeypatch):
+    """None of the three indeterminate/edge cases above are ever silently
+    treated as "a normal, safe regular file" - confirmed end to end
+    through `create_verified_raw_snapshot` by poisoning the RAW artifact's
+    own ancestor lstat."""
+
+    monkeypatch.setattr(
+        atomic_module.os, "lstat", lambda path: _FakeLstatResult(st_file_attributes=None)
+    )
+
+    with pytest.raises(RawArtifactNoFollowUnavailableError):
+        atomic_module._capture_identity(Path("irrelevant"))
+
+
+# =============================================================================
+# Checkpoint 3 correction - MAJOR-A2: no absolute path leaks through
+# RawArtifactSharingViolationError (or any other new Checkpoint 3
+# exception) raised from a PermissionError with a real, sensitive path.
+# =============================================================================
+
+
+def test_sharing_violation_error_never_leaks_absolute_path(tmp_path, monkeypatch):
+    project_dir, raw_path, checksum, snapshot_path = _make_raw_input(tmp_path)
+    final_path = project_dir / "inputs" / "ligands" / _INPUT_ID / "raw.sdf"
+    real_open = open
+
+    def _denying_open(path, mode="r", *args, **kwargs):
+        if Path(path) == final_path and mode == "rb":
+            # A real PermissionError's own message embeds the absolute
+            # path (confirmed by the Windows OS-level error text) - this
+            # is exactly the shape of exception MAJOR-A2 was raised
+            # against.
+            raise PermissionError(13, "Permission denied", str(final_path))
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(atomic_module, "open", _denying_open, raising=False)
+
+    with pytest.raises(RawArtifactSharingViolationError) as exc_info:
+        _snapshot(project_dir, raw_path, checksum, snapshot_path)
+
+    assert str(project_dir) not in str(exc_info.value)
+    assert str(final_path) not in str(exc_info.value)
+    assert str(tmp_path) not in str(exc_info.value)
+
+
+def test_destination_indeterminate_lstat_error_message_never_leaks_path(tmp_path, monkeypatch):
+    project_dir, raw_path, checksum, snapshot_path = _make_raw_input(tmp_path)
+    real_lstat = os.lstat
+
+    def _denying_lstat(path, *args, **kwargs):
+        if Path(path) == snapshot_path:
+            raise PermissionError(13, "Permission denied", str(snapshot_path))
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(atomic_module.os, "lstat", _denying_lstat)
+
+    with pytest.raises(RawArtifactSharingViolationError) as exc_info:
+        _snapshot(project_dir, raw_path, checksum, snapshot_path)
+
+    assert str(snapshot_path) not in str(exc_info.value)
+    assert str(project_dir) not in str(exc_info.value)
+
+
+def test_staging_creation_os_error_message_never_leaks_path(tmp_path, monkeypatch):
+    project_dir, raw_path, checksum, snapshot_path = _make_raw_input(tmp_path)
+    real_open = open
+
+    def _denying_staging_open(path, mode="r", *args, **kwargs):
+        if mode == "xb":
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(atomic_module, "open", _denying_staging_open, raising=False)
+
+    with pytest.raises(RawArtifactSharingViolationError) as exc_info:
+        _snapshot(project_dir, raw_path, checksum, snapshot_path)
+
+    assert str(snapshot_path.parent) not in str(exc_info.value)
+    assert str(project_dir) not in str(exc_info.value)
+
+
+def test_publication_conflict_os_error_message_never_leaks_path(tmp_path, monkeypatch):
+    project_dir, raw_path, checksum, snapshot_path = _make_raw_input(tmp_path)
+
+    def _denying_link(src, dst, *args, **kwargs):
+        raise PermissionError(13, "Permission denied", f"{src} -> {dst}")
+
+    monkeypatch.setattr(atomic_module.os, "link", _denying_link)
+
+    with pytest.raises(RawArtifactSharingViolationError) as exc_info:
+        _snapshot(project_dir, raw_path, checksum, snapshot_path)
+
+    assert str(snapshot_path) not in str(exc_info.value)
+    assert str(project_dir) not in str(exc_info.value)

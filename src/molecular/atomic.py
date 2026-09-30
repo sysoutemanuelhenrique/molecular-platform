@@ -281,13 +281,28 @@ def _capture_identity(path: Path) -> _IdentityToken:
     8.3.1 requires: `st_dev`/`st_ino` for identity, and
     `st_file_attributes`/`st_reparse_tag` (both exposed directly by
     `os.lstat` on this Windows/Python combination - confirmed empirically,
-    no `ctypes` needed) to detect any reparse point, of any tag."""
+    no `ctypes` needed) to detect any reparse point, of any tag.
+
+    Checkpoint 3 correction (MAJOR-A1): when `st_file_attributes` itself is
+    unavailable, this is NOT treated as "not a reparse point" - an
+    indeterminate result is never silently downgraded to "safe". The
+    platform has already been proven to be Windows/NTFS by
+    `_require_validated_platform` before this is ever called for a RAW
+    artifact component, so `st_file_attributes` being absent here means the
+    one property Route B endurecida depends on to detect reparse points is
+    not actually available for this specific path - failing closed with
+    `RawArtifactNoFollowUnavailableError` rather than proceeding as if the
+    path had been proven safe."""
 
     result = os.lstat(path)
     file_attributes = getattr(result, "st_file_attributes", None)
-    is_reparse_point = bool(
-        file_attributes is not None and file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
-    )
+    if file_attributes is None:
+        raise RawArtifactNoFollowUnavailableError(
+            "the platform did not report file attributes for a path "
+            "component; reparse-point detection cannot be proven for it, "
+            "failing closed rather than assuming the path is safe"
+        )
+    is_reparse_point = bool(file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
     reparse_tag = getattr(result, "st_reparse_tag", None) if is_reparse_point else None
 
     return _IdentityToken(
@@ -502,6 +517,43 @@ def _reverify_ancestor_chain(
     return fresh_tokens
 
 
+def _reject_existing_snapshot_destination(snapshot_path: Path) -> None:
+    """Checkpoint 3 correction (BLOCKER-A1/BLOCKER-A2): `snapshot_path`
+    must not already name anything on disk before this call ever writes a
+    single byte - not the RAW artifact itself, not a hard link or symlink
+    to it, not a symlink to anything else, not a preexisting regular file,
+    not a directory. Checked via `os.lstat` (never following), so a
+    symlink is caught by its own existence regardless of where - or
+    whether - its target resolves; a hard link to the RAW is caught
+    because it names a real, existing directory entry just like any other
+    file. This is a fail-fast pre-check only, run before the RAW is ever
+    opened - the actual, race-proof guarantee against two writers
+    publishing to the same name comes from the exclusive `os.link`
+    publication step at the end of `create_verified_raw_snapshot`, not
+    from this function."""
+
+    try:
+        os.lstat(snapshot_path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        # Indeterminate (e.g. a permission error inspecting a parent
+        # component) is never treated as "confirmed absent" - fail closed
+        # rather than assume the destination is safe to use.
+        raise RawArtifactSharingViolationError(
+            "snapshot_path could not be inspected before publication: "
+            f"{exc.__class__.__name__}; failing closed rather than "
+            "assuming it is safe to use"
+        ) from exc
+
+    raise FileExistsError(
+        "snapshot_path already names an existing file, directory, hard "
+        "link, or symlink - a private, exclusively-created destination is "
+        "required; it is never overwritten and never aliased with the RAW "
+        "artifact"
+    )
+
+
 def create_verified_raw_snapshot(
     *,
     project_dir: Path,
@@ -511,36 +563,64 @@ def create_verified_raw_snapshot(
     snapshot_path: Path,
 ) -> RawSnapshot:
     """Validate, open, read, and verify a LigandInput RAW artifact via the
-    hardened Route B (Section 8 of the frozen spec), writing a private
-    snapshot of its bytes to `snapshot_path` (caller-supplied - this
-    function never invents its own staging convention). Read-only against
-    the RAW artifact itself: never rewritten, sanitized in place,
+    hardened Route B (Section 8 of the frozen spec), publishing a private
+    snapshot of its bytes to `snapshot_path` (caller-supplied). Read-only
+    against the RAW artifact itself: never rewritten, sanitized in place,
     converted, its timestamp touched, moved, copied back onto, or removed
-    (Section 8, "RAW imutável"). On any failure, `snapshot_path` is removed
-    before the typed error is raised - no partial snapshot is ever left
-    for a caller to mistake for a complete one.
+    (Section 8, "RAW imutável").
 
-    Order of operations (Section 8.3.2 / 8.3.2.1, literally):
+    `snapshot_path` receives the same "never overwrite, never alias"
+    discipline as the RAW side (Checkpoint 3 correction, BLOCKER-A1/
+    BLOCKER-A2): it MUST NOT already exist (Section 8's immutability pillar
+    would otherwise let this function itself destroy the RAW, a hard link
+    to it, or any other preexisting file the caller did not intend to
+    lose), and it is never opened directly for writing. Instead, the bytes
+    read from the RAW are written to a privately-named staging file created
+    in `snapshot_path`'s own directory via exclusive creation (`"xb"`,
+    O_CREAT|O_EXCL) - a name only this call knows - and only after every
+    post-read verification below has passed is that staging file published
+    to `snapshot_path` via `os.link` (itself exclusive: it fails, rather
+    than overwrites, if `snapshot_path` already exists - including if
+    another process won a race to create it first). The staging file is
+    always removed afterward - on success (only its now-redundant extra
+    name is unlinked; the published inode survives under `snapshot_path`)
+    and on any failure alike - because its unpredictable name guarantees
+    it was created by, and belongs exclusively to, this call. `snapshot_path`
+    itself is NEVER removed by this function under any circumstances: it is
+    either fully published (a complete, verified snapshot) or never touched
+    at all - there is no cleanup path that can delete a file this call did
+    not create.
 
-    1. fail closed if the platform/filesystem is not the validated one;
+    Order of operations (Section 8.3.2 / 8.3.2.1, extended by the
+    Checkpoint 3 correction for the destination side):
+
+    1. fail closed if the RAW-side platform/filesystem is not the
+       validated one;
     2. validate the path lexically (Section 8.1) and resolve+contain it
        against the authorized root `inputs/ligands/<input_id>/`
        (Section 8.2), rejecting any reparse point at any level;
     3. capture the initial identity of the full ancestor chain and of the
        final file (all via `lstat`, never following);
     4. reverify the ancestor chain immediately before opening;
-    5. open the final file by its validated path, `fstat` the descriptor,
+    5. fail closed if the destination's platform/filesystem is not the
+       validated one, and reject `snapshot_path` if anything already
+       exists there (`_reject_existing_snapshot_destination`) - both
+       before the RAW is ever opened;
+    6. create the private staging file exclusively;
+    7. open the final file by its validated path, `fstat` the descriptor,
        and compare its identity against the pre-open `lstat` - divergence
        is `raw-identity-unstable`;
-    6. reverify the ancestor chain again, at this same moment;
-    7. read the file entirely through the same open descriptor, computing
+    8. reverify the ancestor chain again, at this same moment;
+    9. read the file entirely through the same open descriptor, computing
        SHA-256 and size incrementally over the bytes actually read, while
-       writing those same bytes to `snapshot_path`;
-    8. mandatory post-read verification: reverify the final file's
-       identity and the full ancestor chain once more, compare the size
-       actually read against the pre-open `lstat`'s `st_size`, then
-       compare the SHA-256 against `raw_artifact_checksum`;
-    9. only then return the `RawSnapshot`.
+       writing those same bytes to the staging file;
+    10. mandatory post-read verification: reverify the final file's
+        identity and the full ancestor chain once more, compare the size
+        actually read against the pre-open `lstat`'s `st_size`, then
+        compare the SHA-256 against `raw_artifact_checksum`;
+    11. only then publish the staging file to `snapshot_path` via
+        exclusive `os.link`, remove the staging name, and return the
+        `RawSnapshot`.
     """
 
     _require_validated_platform(project_dir)
@@ -575,15 +655,41 @@ def create_verified_raw_snapshot(
 
     pre_open_ancestor_tokens = _reverify_ancestor_chain(ancestor_paths, initial_ancestor_tokens)
 
-    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-    snapshot_written = False
+    # --- destination side: same "never overwrite, never alias" discipline
+    # as the RAW side, applied before the RAW is ever opened for reading
+    # (Checkpoint 3 correction, BLOCKER-A1/BLOCKER-A2) ---
+    snapshot_path = Path(snapshot_path)
+    _require_validated_platform(snapshot_path)
+    _reject_existing_snapshot_destination(snapshot_path)
 
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    staging_path = snapshot_path.parent / f".raw-snapshot-{uuid.uuid4().hex}.tmp"
+
+    try:
+        staging_file = open(staging_path, "xb")
+    except FileExistsError as exc:
+        # The unpredictable uuid4-derived name colliding with something
+        # already there is not a realistic race - if it somehow happens,
+        # fail closed rather than silently reusing a name of unknown origin.
+        raise FileExistsError(
+            "the generated staging filename already exists; refusing to reuse it"
+        ) from exc
+    except OSError as exc:
+        raise RawArtifactSharingViolationError(
+            f"the staging file could not be created: {exc.__class__.__name__}"
+        ) from exc
+
+    # From this point on, `staging_path` names a file this call - and only
+    # this call - created, under an unpredictable name. Every exit path
+    # below removes exactly that file and nothing else; `snapshot_path`
+    # itself is never touched by any cleanup in this function.
     try:
         try:
             file = open(final_path, "rb")
         except PermissionError as exc:
             raise RawArtifactSharingViolationError(
-                f"the operating system denied opening the RAW artifact: {exc}"
+                "the operating system denied opening the RAW artifact: "
+                f"{exc.__class__.__name__}"
             ) from exc
         except OSError as exc:
             raise RawArtifactTypeError(
@@ -611,14 +717,13 @@ def create_verified_raw_snapshot(
 
             digest = hashlib.sha256()
             bytes_read = 0
-            with open(snapshot_path, "wb") as snapshot_file:
+            with staging_file:
                 for chunk in iter(lambda: file.read(65536), b""):
                     digest.update(chunk)
-                    snapshot_file.write(chunk)
+                    staging_file.write(chunk)
                     bytes_read += len(chunk)
-                snapshot_file.flush()
-                os.fsync(snapshot_file.fileno())
-            snapshot_written = True
+                staging_file.flush()
+                os.fsync(staging_file.fileno())
 
         # --- mandatory post-read verification (Section 8.3.2.1) ---
         try:
@@ -650,6 +755,23 @@ def create_verified_raw_snapshot(
                 "match the checksum persisted for this input"
             )
 
+        # --- publish: exclusive create-once, never overwrite (Section
+        # 8's "RAW imutável" pillar extended to the destination side) ---
+        try:
+            os.link(staging_path, snapshot_path)
+        except FileExistsError as exc:
+            raise FileExistsError(
+                "snapshot_path was created by another process before "
+                "publication; the winner's file is never overwritten"
+            ) from exc
+        except OSError as exc:
+            raise RawArtifactSharingViolationError(
+                f"the verified snapshot could not be published: {exc.__class__.__name__}"
+            ) from exc
+
+        with contextlib.suppress(OSError):
+            staging_path.unlink()
+
         return RawSnapshot(
             snapshot_path=snapshot_path,
             snapshot_checksum=snapshot_checksum,
@@ -657,7 +779,14 @@ def create_verified_raw_snapshot(
         )
 
     except BaseException:
-        if snapshot_written or snapshot_path.exists():
-            with contextlib.suppress(OSError):
-                snapshot_path.unlink()
+        # `staging_file` may still be open at this point (e.g. the RAW
+        # artifact's own `open()` failed before the write loop, or a
+        # mid-loop failure) - Windows refuses to unlink an open file, so it
+        # must be closed first. `.close()` on an already-closed file object
+        # (the common case: most failures occur after the `with staging_file:`
+        # block above already closed it) is a safe no-op, never an error.
+        with contextlib.suppress(Exception):
+            staging_file.close()
+        with contextlib.suppress(OSError):
+            staging_path.unlink(missing_ok=True)
         raise

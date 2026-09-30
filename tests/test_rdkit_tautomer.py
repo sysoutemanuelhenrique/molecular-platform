@@ -827,3 +827,130 @@ def test_no_rdkit_object_escapes_inspect_single_sdf_for_promotion(tmp_path):
     assert not isinstance(result, Chem.rdchem.Mol)
     for value in result.__dict__.values():
         assert not isinstance(value, Chem.rdchem.Mol)
+
+
+# =============================================================================
+# Checkpoint 3 correction - MAJOR-B1 (untyped exceptions during supplier
+# iteration), MAJOR-A2/audit (path leakage in InvalidPromotionSDFError
+# messages), and MINOR-B1 (`_Name` blank-value edge case).
+# =============================================================================
+
+
+class _ExplodingSupplier:
+    """A controlled stand-in for `Chem.SDMolSupplier` whose iteration
+    yields some records and then raises - reproducing the RDKit
+    C++/Boost.Python mid-iteration failure mode that no real fixture in
+    this corpus could trigger deterministically."""
+
+    def __init__(self, records):
+        self._records = records
+
+    def __iter__(self):
+        for item in self._records:
+            if item == "BOOM":
+                raise RuntimeError("simulated RDKit iteration failure")
+            yield item
+
+
+def test_supplier_iteration_exception_is_translated_and_chained(tmp_path, monkeypatch):
+    sdf_path = _write_sdf(tmp_path, "ethanol.sdf", "CCO")
+    real_mol = Chem.MolFromSmiles("CCO")
+
+    def _fake_supplier(*args, **kwargs):
+        return _ExplodingSupplier([real_mol, "BOOM"])
+
+    monkeypatch.setattr(rdkit_tautomer_module.Chem, "SDMolSupplier", _fake_supplier)
+
+    with pytest.raises(InvalidPromotionSDFError) as exc_info:
+        inspect_single_sdf_for_promotion(source_path=sdf_path, policy=_default_policy())
+
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert "simulated RDKit iteration failure" not in str(exc_info.value)
+
+
+def test_supplier_iteration_exception_never_accepts_partial_result(tmp_path, monkeypatch):
+    """Even though one real, valid molecule was yielded before the
+    exception, no `RDKitLigandInspectionResult` is ever produced from a
+    supplier whose iteration did not complete - confirmed by the raised
+    exception type itself (a returned result would mean this assertion
+    never even had a chance to run)."""
+
+    sdf_path = _write_sdf(tmp_path, "ethanol.sdf", "CCO")
+    real_mol = Chem.MolFromSmiles("CCO")
+
+    def _fake_supplier(*args, **kwargs):
+        return _ExplodingSupplier([real_mol, "BOOM"])
+
+    monkeypatch.setattr(rdkit_tautomer_module.Chem, "SDMolSupplier", _fake_supplier)
+
+    result = None
+    try:
+        result = inspect_single_sdf_for_promotion(source_path=sdf_path, policy=_default_policy())
+    except InvalidPromotionSDFError:
+        pass
+
+    assert result is None
+
+
+def test_supplier_iteration_never_catches_keyboard_interrupt(tmp_path, monkeypatch):
+    class _RaisingOnKeyboardInterrupt:
+        def __iter__(self):
+            raise KeyboardInterrupt()
+
+    def _fake_supplier(*args, **kwargs):
+        return _RaisingOnKeyboardInterrupt()
+
+    monkeypatch.setattr(rdkit_tautomer_module.Chem, "SDMolSupplier", _fake_supplier)
+    sdf_path = _write_sdf(tmp_path, "ethanol.sdf", "CCO")
+
+    with pytest.raises(KeyboardInterrupt):
+        inspect_single_sdf_for_promotion(source_path=sdf_path, policy=_default_policy())
+
+
+def test_supplier_construction_failure_message_never_leaks_path(tmp_path):
+    missing_path = tmp_path / "does-not-exist.sdf"
+
+    with pytest.raises(InvalidPromotionSDFError) as exc_info:
+        inspect_single_sdf_for_promotion(source_path=missing_path, policy=_default_policy())
+
+    assert str(missing_path) not in str(exc_info.value)
+    assert str(tmp_path) not in str(exc_info.value)
+
+
+def test_posterior_sanitization_failure_message_never_leaks_path(tmp_path):
+    path = _write_raw_text(tmp_path, "pentavalent.sdf", _PENTAVALENT_CARBON_MOLBLOCK)
+    policy = _default_policy(sanitize=False, remove_hs=False, strict_parsing=True)
+
+    with pytest.raises(InvalidPromotionSDFError) as exc_info:
+        inspect_single_sdf_for_promotion(source_path=path, policy=policy)
+
+    assert str(path) not in str(exc_info.value)
+    assert str(tmp_path) not in str(exc_info.value)
+
+
+# --- MINOR-B1 correction: `_Name` recognized, but a BLANK title line
+# (RDKit auto-populates `_Name` for every molecule written via SDWriter,
+# even with an empty title) must not be mistaken for a real name ---
+
+
+def test_title_line_name_recognized_via_underscore_name(tmp_path):
+    mol = Chem.MolFromSmiles("CCO")
+    mol.SetProp("_Name", "curcumin")
+    path = _write_mol(tmp_path, "titled.sdf", mol)
+
+    result = inspect_single_sdf_for_promotion(source_path=path, policy=_default_policy())
+
+    assert "sd-name-property-absent" not in result.warnings
+
+
+def test_blank_title_line_still_emits_name_absent_warning(tmp_path):
+    """RDKit's `SDWriter` always populates `_Name` from the title line,
+    even when it is blank - `HasProp("_Name")` alone would therefore
+    always be true and could never emit this warning at all. A blank
+    value must still count as "no real name"."""
+
+    sdf_path = _write_sdf(tmp_path, "noname.sdf", "CCO")
+
+    result = inspect_single_sdf_for_promotion(source_path=sdf_path, policy=_default_policy())
+
+    assert "sd-name-property-absent" in result.warnings
