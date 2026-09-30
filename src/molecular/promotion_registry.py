@@ -333,16 +333,38 @@ def _inspect_slot(slot_dir: Path) -> ReservationStatus:
     spec). Never creates, deletes, or repairs anything. A slot directory
     that exists but whose metadata cannot be read is never reported as
     free - it is RESERVED_..._INDETERMINATE, distinct from both
-    ABSENT_FREE and RESERVED_KNOWN_OWNER."""
+    ABSENT_FREE and RESERVED_KNOWN_OWNER.
 
-    if not slot_dir.exists():
+    ABSENT_FREE is reported only for a *confirmed* absence: `slot_dir.
+    exists()` returning `False` normally. If the filesystem itself cannot
+    answer that question (`slot_dir.exists()` raising `OSError`/
+    `PermissionError`), this is conservatively folded into
+    RESERVED_METADATA_CORRUPT_INDETERMINATE - the platform could not
+    inspect the slot's identity, which is never grounds for treating it as
+    free. The same conservative rule applies one level down: if metadata
+    is unreadable and even `metadata_file.exists()` itself raises `OSError`
+    (so it cannot be determined whether the metadata is merely missing or
+    present-but-corrupt), the result is RESERVED_METADATA_CORRUPT_
+    INDETERMINATE, never MISSING and never ABSENT_FREE. No exception from
+    either existence check is ever allowed to escape this function."""
+
+    try:
+        slot_exists = slot_dir.exists()
+    except OSError:
+        return ReservationStatus(state="RESERVED_METADATA_CORRUPT_INDETERMINATE")
+
+    if not slot_exists:
         return ReservationStatus(state="ABSENT_FREE")
 
     try:
         metadata = _read_slot_metadata(slot_dir)
     except ReservationMetadataUnavailableError:
         metadata_file = slot_dir / "reservation.yaml"
-        if not metadata_file.exists():
+        try:
+            metadata_exists = metadata_file.exists()
+        except OSError:
+            return ReservationStatus(state="RESERVED_METADATA_CORRUPT_INDETERMINATE")
+        if not metadata_exists:
             return ReservationStatus(state="RESERVED_METADATA_MISSING_INDETERMINATE")
         return ReservationStatus(state="RESERVED_METADATA_CORRUPT_INDETERMINATE")
 

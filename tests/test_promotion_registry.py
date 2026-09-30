@@ -896,6 +896,156 @@ def test_describe_reports_indeterminate_on_generic_read_failure(
     assert metadata_file.exists()
 
 
+# --- Checkpoint 2 final correction, MINOR-2: a filesystem failure while
+# checking a slot's own existence - or, one level down, while checking
+# whether its unreadable metadata file exists at all - must never be
+# mistaken for a confirmed absence. Only a *normal* `False` return from
+# `Path.exists()` means ABSENT_FREE; an `OSError`/`PermissionError` raised
+# by `exists()` itself means the platform could not even prove the
+# resource is gone, which is conservatively folded into
+# RESERVED_METADATA_CORRUPT_INDETERMINATE - never ABSENT_FREE, never an
+# escaped exception, never any attempt to create/repair/remove anything.
+# Section 11.6. ---
+
+
+@pytest.mark.parametrize(
+    "kind, acquire, describe, dir_helper",
+    [
+        (
+            "semantic",
+            lambda p, aid, tok: acquire_semantic_reservation(p, _SEMANTIC_KEY, attempt_id=aid, owner_token=tok),
+            describe_semantic_reservation,
+            lambda p: promotion_registry_module._promotion_reservations_dir(p) / _SEMANTIC_KEY,
+        ),
+        (
+            "entity",
+            lambda p, aid, tok: acquire_entity_claim(p, "curcumin", attempt_id=aid, owner_token=tok),
+            describe_entity_claim,
+            lambda p: promotion_registry_module._entity_claims_dir(p)
+            / promotion_registry_module._claim_hash("curcumin"),
+        ),
+        (
+            "state",
+            lambda p, aid, tok: acquire_state_claim(
+                p, "curcumin-pubchem-initial", attempt_id=aid, owner_token=tok
+            ),
+            describe_state_claim,
+            lambda p: promotion_registry_module._state_claims_dir(p)
+            / promotion_registry_module._claim_hash("curcumin-pubchem-initial"),
+        ),
+    ],
+    ids=["semantic", "entity", "state"],
+)
+def test_describe_reports_indeterminate_when_slot_exists_check_fails(
+    tmp_path, monkeypatch, kind, acquire, describe, dir_helper
+):
+    """Test A: `slot_dir.exists()` itself raises PermissionError. The slot
+    exists physically the whole time - only the ability to *confirm* that
+    via `exists()` is disrupted."""
+
+    raw_key = {"semantic": _SEMANTIC_KEY, "entity": "curcumin", "state": "curcumin-pubchem-initial"}[kind]
+    acquire(tmp_path, "a" * 32, "b" * 64)
+
+    slot_dir = dir_helper(tmp_path)
+    metadata_file = slot_dir / "reservation.yaml"
+    real_exists = Path.exists
+    # preconditions, checked with the real, not-yet-patched exists()
+    assert real_exists(slot_dir)
+    assert real_exists(metadata_file)
+
+    def _flaky_exists(self, *args, **kwargs):
+        if self == slot_dir:
+            raise PermissionError("simulated permission failure checking slot existence")
+        return real_exists(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "exists", _flaky_exists)
+
+    status = describe(tmp_path, raw_key)
+
+    assert status.state == "RESERVED_METADATA_CORRUPT_INDETERMINATE"
+    assert status.state != "ABSENT_FREE"
+    assert status.owner_attempt_id is None
+    # the slot and its metadata are left exactly as they were - confirmed
+    # via the real exists() captured above, never the patched one.
+    assert real_exists(slot_dir)
+    assert real_exists(metadata_file)
+
+
+@pytest.mark.parametrize(
+    "kind, acquire, describe, dir_helper",
+    [
+        (
+            "semantic",
+            lambda p, aid, tok: acquire_semantic_reservation(p, _SEMANTIC_KEY, attempt_id=aid, owner_token=tok),
+            describe_semantic_reservation,
+            lambda p: promotion_registry_module._promotion_reservations_dir(p) / _SEMANTIC_KEY,
+        ),
+        (
+            "entity",
+            lambda p, aid, tok: acquire_entity_claim(p, "curcumin", attempt_id=aid, owner_token=tok),
+            describe_entity_claim,
+            lambda p: promotion_registry_module._entity_claims_dir(p)
+            / promotion_registry_module._claim_hash("curcumin"),
+        ),
+        (
+            "state",
+            lambda p, aid, tok: acquire_state_claim(
+                p, "curcumin-pubchem-initial", attempt_id=aid, owner_token=tok
+            ),
+            describe_state_claim,
+            lambda p: promotion_registry_module._state_claims_dir(p)
+            / promotion_registry_module._claim_hash("curcumin-pubchem-initial"),
+        ),
+    ],
+    ids=["semantic", "entity", "state"],
+)
+def test_describe_reports_indeterminate_when_metadata_exists_check_also_fails(
+    tmp_path, monkeypatch, kind, acquire, describe, dir_helper
+):
+    """Test B: double failure. `Path.read_text()` fails for
+    `reservation.yaml` (so `_read_slot_metadata` raises
+    ReservationMetadataUnavailableError), and the fallback
+    `metadata_file.exists()` check *also* raises - so it cannot even be
+    determined whether the metadata is missing or merely corrupt. `slot_dir.
+    exists()` itself is left working normally (only the metadata file's own
+    existence check is disrupted), so this exercises the second failure
+    point in isolation from the first (Test A above)."""
+
+    raw_key = {"semantic": _SEMANTIC_KEY, "entity": "curcumin", "state": "curcumin-pubchem-initial"}[kind]
+    acquire(tmp_path, "a" * 32, "b" * 64)
+
+    slot_dir = dir_helper(tmp_path)
+    metadata_file = slot_dir / "reservation.yaml"
+    real_exists = Path.exists
+    real_read_text = Path.read_text
+    # preconditions, checked with the real, not-yet-patched functions
+    assert real_exists(slot_dir)
+    assert real_exists(metadata_file)
+
+    def _flaky_read_text(self, *args, **kwargs):
+        if self == metadata_file:
+            raise PermissionError("simulated permission failure reading metadata")
+        return real_read_text(self, *args, **kwargs)
+
+    def _flaky_exists(self, *args, **kwargs):
+        if self == metadata_file:
+            raise PermissionError("simulated permission failure checking metadata existence")
+        return real_exists(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _flaky_read_text)
+    monkeypatch.setattr(Path, "exists", _flaky_exists)
+
+    status = describe(tmp_path, raw_key)
+
+    assert status.state == "RESERVED_METADATA_CORRUPT_INDETERMINATE"
+    assert status.state != "ABSENT_FREE"
+    assert status.owner_attempt_id is None
+    # the slot and its metadata are left exactly as they were - confirmed
+    # via the real, captured-before-patching functions.
+    assert real_exists(slot_dir)
+    assert real_exists(metadata_file)
+
+
 def test_describe_never_exposes_owner_token(tmp_path):
     acquire_semantic_reservation(
         tmp_path, _SEMANTIC_KEY, attempt_id="a" * 32, owner_token="super-secret-token"
