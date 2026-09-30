@@ -19,6 +19,7 @@ import json
 import multiprocessing
 import os
 import secrets
+import shutil
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -570,12 +571,15 @@ def test_acquire_state_claim_rejects_casefold_collision_single_process(tmp_path)
         acquire_state_claim(tmp_path, "state-a", attempt_id="c" * 32, owner_token="d" * 64)
 
 
+# --- 166 (see also the two describe_* tests below, same item) ---
+
+
 def test_acquire_never_treats_an_existing_slot_without_metadata_as_free():
-    """Item 166: a slot directory created (e.g. by a crash mid-write, before
-    metadata was ever persisted) but lacking a readable reservation.yaml
-    must still refuse a second acquire - exclusivity is decided by
-    directory existence alone (`os.mkdir`), never by whether metadata can
-    be read."""
+    """§19.9-166: a slot directory created (e.g. by a crash mid-write,
+    before metadata was ever persisted) but lacking a readable
+    reservation.yaml must still refuse a second acquire - exclusivity is
+    decided by directory existence alone (`os.mkdir`), never by whether
+    metadata can be read."""
 
     import tempfile
 
@@ -736,6 +740,70 @@ def test_compensation_failure_produces_typed_residual_when_metadata_corrupted(tm
     assert entity_slot.is_dir()
 
 
+# --- Checkpoint 2 correction, MAJOR-1: a genuine infrastructure failure
+# during removal (shutil.rmtree raising OSError/PermissionError, e.g. a
+# file locked by another process or a transient disk error) must become a
+# typed residual too - exactly like ownership mismatch or unreadable
+# metadata - and must never stop the independent compensation of the other
+# two, unrelated resources. Section 11.10 / acceptance criterion 29. ---
+
+
+@pytest.mark.parametrize("failing_resource", ["state", "entity", "semantic"])
+def test_compensate_partial_acquisition_continues_after_infrastructure_failure(
+    tmp_path, monkeypatch, failing_resource
+):
+    attempt_id, owner_token = "a" * 32, "b" * 64
+    acquire_semantic_reservation(tmp_path, _SEMANTIC_KEY, attempt_id=attempt_id, owner_token=owner_token)
+    acquire_entity_claim(tmp_path, "curcumin", attempt_id=attempt_id, owner_token=owner_token)
+    acquire_state_claim(
+        tmp_path, "curcumin-pubchem-initial", attempt_id=attempt_id, owner_token=owner_token
+    )
+
+    semantic_slot = promotion_registry_module._promotion_reservations_dir(tmp_path) / _SEMANTIC_KEY
+    entity_slot = promotion_registry_module._entity_claims_dir(
+        tmp_path
+    ) / promotion_registry_module._claim_hash("curcumin")
+    state_slot = promotion_registry_module._state_claims_dir(
+        tmp_path
+    ) / promotion_registry_module._claim_hash("curcumin-pubchem-initial")
+    slots = {"semantic": semantic_slot, "entity": entity_slot, "state": state_slot}
+    raw_keys = {"semantic": _SEMANTIC_KEY, "entity": "curcumin", "state": "curcumin-pubchem-initial"}
+
+    failing_slot = slots[failing_resource]
+    real_rmtree = shutil.rmtree
+
+    def _flaky_rmtree(path, *args, **kwargs):
+        # Real shutil.rmtree is used for every path except the one under
+        # test - the other two resources must be genuinely, independently
+        # attempted and removed, never mocked away wholesale.
+        if Path(path) == failing_slot:
+            raise OSError("simulated infrastructure failure removing directory")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(promotion_registry_module.shutil, "rmtree", _flaky_rmtree)
+
+    residuals = compensate_partial_acquisition(
+        tmp_path,
+        attempt_id=attempt_id,
+        owner_token=owner_token,
+        semantic_key=_SEMANTIC_KEY,
+        entity_id="curcumin",
+        state_id="curcumin-pubchem-initial",
+    )
+
+    # no exception escaped (the call above already proves that), only the
+    # failing resource's raw key is reported as a residual...
+    assert residuals == (raw_keys[failing_resource],)
+    # ...the failing directory is left exactly as it was, never declared removed...
+    assert failing_slot.is_dir()
+    # ...and the other two, unrelated resources were still independently
+    # attempted and genuinely removed, in both directions relative to the
+    # failing one (order is always state -> entity -> semantic).
+    for resource, slot in slots.items():
+        if resource != failing_resource:
+            assert not slot.exists(), f"{resource} should have been removed independently"
+
+
 # --- describe_*: read-only inspection never mutates, never reports a
 # residue as free (Section 11.6) ---
 
@@ -747,6 +815,9 @@ def test_describe_reports_absent_free_when_nothing_exists(tmp_path):
 
 
 def test_describe_reports_corrupt_metadata_as_indeterminate_not_free(tmp_path):
+    """§19.9-166 (second angle): metadata present but unparseable is also
+    never reported as free."""
+
     acquire_semantic_reservation(
         tmp_path, _SEMANTIC_KEY, attempt_id="a" * 32, owner_token="b" * 64
     )
@@ -757,6 +828,72 @@ def test_describe_reports_corrupt_metadata_as_indeterminate_not_free(tmp_path):
 
     assert status.state == "RESERVED_METADATA_CORRUPT_INDETERMINATE"
     assert status.owner_attempt_id is None
+
+
+# --- Checkpoint 2 correction, MINOR-1: a generic filesystem read failure
+# (PermissionError/OSError) while reading an existing reservation.yaml -
+# distinct from the file being absent, and distinct from it being
+# syntactically corrupt YAML - must still be folded into the same
+# INDETERMINATE contract, never let a raw, untyped exception escape a
+# strictly read-only describe_* call, and never be reported as
+# RESERVED_METADATA_MISSING (the file *does* exist - "missing" would be
+# inaccurate) nor as ABSENT_FREE. Section 11.6. ---
+
+
+@pytest.mark.parametrize(
+    "kind, acquire, describe, dir_helper",
+    [
+        (
+            "semantic",
+            lambda p, aid, tok: acquire_semantic_reservation(p, _SEMANTIC_KEY, attempt_id=aid, owner_token=tok),
+            describe_semantic_reservation,
+            lambda p: promotion_registry_module._promotion_reservations_dir(p) / _SEMANTIC_KEY,
+        ),
+        (
+            "entity",
+            lambda p, aid, tok: acquire_entity_claim(p, "curcumin", attempt_id=aid, owner_token=tok),
+            describe_entity_claim,
+            lambda p: promotion_registry_module._entity_claims_dir(p)
+            / promotion_registry_module._claim_hash("curcumin"),
+        ),
+        (
+            "state",
+            lambda p, aid, tok: acquire_state_claim(
+                p, "curcumin-pubchem-initial", attempt_id=aid, owner_token=tok
+            ),
+            describe_state_claim,
+            lambda p: promotion_registry_module._state_claims_dir(p)
+            / promotion_registry_module._claim_hash("curcumin-pubchem-initial"),
+        ),
+    ],
+    ids=["semantic", "entity", "state"],
+)
+def test_describe_reports_indeterminate_on_generic_read_failure(
+    tmp_path, monkeypatch, kind, acquire, describe, dir_helper
+):
+    raw_key = {"semantic": _SEMANTIC_KEY, "entity": "curcumin", "state": "curcumin-pubchem-initial"}[kind]
+    acquire(tmp_path, "a" * 32, "b" * 64)
+
+    slot_dir = dir_helper(tmp_path)
+    metadata_file = slot_dir / "reservation.yaml"
+    real_read_text = Path.read_text
+
+    def _flaky_read_text(self, *args, **kwargs):
+        if self == metadata_file:
+            raise PermissionError("simulated permission failure reading metadata")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _flaky_read_text)
+
+    status = describe(tmp_path, raw_key)
+
+    assert status.state == "RESERVED_METADATA_CORRUPT_INDETERMINATE"
+    assert status.state != "ABSENT_FREE"
+    assert status.owner_attempt_id is None
+    # the resource itself, and its (unreadable, but present) metadata file,
+    # are both left completely untouched by a read-only inspection.
+    assert slot_dir.is_dir()
+    assert metadata_file.exists()
 
 
 def test_describe_never_exposes_owner_token(tmp_path):
@@ -821,6 +958,39 @@ def test_claim_hash_normalizes_nfc_and_casefold():
     assert promotion_registry_module._claim_hash("Entity-A") == promotion_registry_module._claim_hash(
         "entity-a"
     )
+
+
+def test_same_raw_value_as_entity_and_state_id_does_not_collide():
+    """Checkpoint 2 correction, cheap traceability (NOTE-3 of the
+    micro-review): the same raw string used as entity_id in one claim and
+    as state_id in another must not collide, even though `_claim_hash`
+    produces the exact same SHA-256 digest for both - `by-entity/` and
+    `by-state/` are distinct sibling namespaces (Section 11.4), so the
+    identical hash lands under two different parent directories."""
+
+    shared_value = "curcumin"
+    assert promotion_registry_module._claim_hash(shared_value) == promotion_registry_module._claim_hash(
+        shared_value
+    )
+
+    entity_slot = promotion_registry_module._entity_claims_dir(Path("x")) / promotion_registry_module._claim_hash(
+        shared_value
+    )
+    state_slot = promotion_registry_module._state_claims_dir(Path("x")) / promotion_registry_module._claim_hash(
+        shared_value
+    )
+    assert entity_slot != state_slot
+    assert entity_slot.parent != state_slot.parent
+
+
+def test_same_raw_value_as_entity_and_state_id_can_both_be_acquired(tmp_path):
+    shared_value = "curcumin"
+
+    acquire_entity_claim(tmp_path, shared_value, attempt_id="a" * 32, owner_token="b" * 64)
+    acquire_state_claim(tmp_path, shared_value, attempt_id="c" * 32, owner_token="d" * 64)
+
+    assert describe_entity_claim(tmp_path, shared_value).owner_attempt_id == "a" * 32
+    assert describe_state_claim(tmp_path, shared_value).owner_attempt_id == "c" * 32
 
 
 # --- project_dir isolation ---

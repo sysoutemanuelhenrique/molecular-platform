@@ -282,16 +282,25 @@ def _acquire_slot(
 def _read_slot_metadata(slot_dir: Path) -> _ReservationMetadata:
     """Read and validate a slot's metadata, or raise
     ReservationMetadataUnavailableError - never returns a partial or
-    best-guess result. Used by both `_release_slot` (Section 11.8) and
-    `_inspect_slot` (Section 11.6), which then decide independently what to
-    do with an unreadable result (refuse to release vs. report
-    INDETERMINATE)."""
+    best-guess result, and never lets a raw filesystem exception escape.
+    Covers three distinct causes uniformly, all folded into the same typed
+    "cannot confirm" outcome: the metadata file is missing
+    (FileNotFoundError, an OSError subclass), a generic I/O failure while
+    reading it (any other OSError/PermissionError - e.g. a transient
+    permission or disk error, distinct from "file absent"), or the content
+    being unreadable as valid metadata (yaml.YAMLError/ValidationError).
+    Used by both `_release_slot` (Section 11.8) and `_inspect_slot`
+    (Section 11.6), which then decide independently what to do with an
+    unreadable result (refuse to release vs. report INDETERMINATE) -
+    `_inspect_slot` further distinguishes "file absent" from "file present
+    but unreadable" by checking existence itself, since this function
+    intentionally reports both as the same exception type."""
 
     metadata_file = slot_dir / "reservation.yaml"
     try:
         data = yaml.safe_load(metadata_file.read_text(encoding="utf-8"))
         return _ReservationMetadata.model_validate(data)
-    except (FileNotFoundError, yaml.YAMLError, ValidationError) as exc:
+    except (OSError, yaml.YAMLError, ValidationError) as exc:
         raise ReservationMetadataUnavailableError(
             f"Metadata at {metadata_file} is missing or unreadable; "
             "ownership cannot be confirmed."
@@ -482,14 +491,36 @@ def compensate_partial_acquisition(
     one attempt already holds (Section 11.10 of the frozen spec): state
     claim, then entity claim, then semantic reservation. Pass only the ids
     actually acquired (`None` for anything never attempted or already lost
-    at a claim stage) - each is attempted independently.
+    at a claim stage) - each of the three is attempted **independently**:
+    a failure releasing one never skips the attempt to release the others,
+    in either direction (an earlier failure does not stop a later one from
+    being tried, and vice versa).
 
-    Never raises: a release that cannot be confirmed - ownership mismatch,
-    or metadata missing/unreadable at release time - contributes its raw
+    Never raises: a release that cannot be confirmed contributes its raw
     key (the same shape LigandPromotionError.residual_reservation_keys
-    validates) to the returned tuple instead of propagating. This function
-    never removes a resource belonging to another owner (ReservationOwnership
-    Error is exactly the guard against that) and never claims a resource was
+    validates) to the returned tuple instead of propagating. Three distinct
+    causes are folded into the same "could not confirm, treat as residual"
+    outcome here - and only here, never inside `_release_slot`/`release_*`
+    themselves, whose direct callers still see a real infrastructure
+    failure as the `OSError` it is:
+
+    1. ownership mismatch (`ReservationOwnershipError`);
+    2. metadata missing or unreadable at release time
+       (`ReservationMetadataUnavailableError`);
+    3. a genuine infrastructure fault during the removal itself - e.g.
+       `shutil.rmtree` failing with `OSError`/`PermissionError` because
+       another process holds an open handle, a transient disk/I-O error,
+       or a filesystem permission problem. Ownership was already confirmed
+       in this case; what failed is the removal, so the caller cannot
+       assume the resource was released, nor that it still fully belongs
+       to this attempt either (`rmtree` may have partially removed it) -
+       treating it as a residual, exactly like the other two causes, is
+       the only outcome that neither overclaims success nor aborts the
+       compensation of the other, independent resources.
+
+    This function never removes a resource belonging to another owner
+    (`ReservationOwnershipError` is exactly the guard against that, in
+    every one of the three blocks below) and never claims a resource was
     released when it could not confirm that it was - an empty return means
     full compensation; any entry means that resource is now a residual the
     caller must record, never silently retry or assume gone.
@@ -502,7 +533,7 @@ def compensate_partial_acquisition(
             release_state_claim(
                 project_dir, state_id, attempt_id=attempt_id, owner_token=owner_token
             )
-        except (ReservationOwnershipError, ReservationMetadataUnavailableError):
+        except (ReservationOwnershipError, ReservationMetadataUnavailableError, OSError):
             residuals.append(state_id)
 
     if entity_id is not None:
@@ -510,7 +541,7 @@ def compensate_partial_acquisition(
             release_entity_claim(
                 project_dir, entity_id, attempt_id=attempt_id, owner_token=owner_token
             )
-        except (ReservationOwnershipError, ReservationMetadataUnavailableError):
+        except (ReservationOwnershipError, ReservationMetadataUnavailableError, OSError):
             residuals.append(entity_id)
 
     if semantic_key is not None:
@@ -518,7 +549,7 @@ def compensate_partial_acquisition(
             release_semantic_reservation(
                 project_dir, semantic_key, attempt_id=attempt_id, owner_token=owner_token
             )
-        except (ReservationOwnershipError, ReservationMetadataUnavailableError):
+        except (ReservationOwnershipError, ReservationMetadataUnavailableError, OSError):
             residuals.append(semantic_key)
 
     return tuple(residuals)
