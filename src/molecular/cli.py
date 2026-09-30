@@ -17,7 +17,15 @@ from molecular.application import (
     register_derived_state,
     register_ligand_from_pubchem,
 )
-from molecular.atomic import atomic_write_text
+from molecular.atomic import (
+    RawArtifactIdentityUnstableError,
+    RawArtifactIntegrityError,
+    RawArtifactNoFollowUnavailableError,
+    RawArtifactSharingViolationError,
+    RawArtifactTypeError,
+    UnsafeRawArtifactPathError,
+    atomic_write_text,
+)
 from molecular.config import load_experiment
 from molecular.context import (
     AmbiguousExperimentError,
@@ -31,11 +39,29 @@ from molecular.execution import TautomerEnumerationPolicy
 from molecular.execution_registry import load_execution_attempt
 from molecular.inputs import validate_input_id
 from molecular.models import ExperimentConfig
+from molecular.promotion import LigandPromotionPolicy
+from molecular.promotion_registry import (
+    PromotionPublicationUnavailableError,
+    load_promotion_attempt,
+)
+from molecular.promotion_service import (
+    LigandPromotionAttemptFailedError,
+    LigandPromotionAttemptPersistenceError,
+    PromotionConsistencyError,
+    PromotionIdentityConflictError,
+    PromotionReservationConflictError,
+    PromotionRevisionRequiredError,
+    UnsupportedPromotionFormatError,
+    promote_ligand_input,
+)
 from molecular.pubchem import PubChemAcquisitionError, PubChemNotFoundError
 from molecular.rdkit_tautomer import (
+    DisconnectedStructureError,
     IncompleteEnumerationError,
+    InvalidPromotionSDFError,
     InvalidSDFError,
     MultipleMoleculesError,
+    PromotionRecordCountError,
     RDKitUnavailableError,
 )
 from molecular.registry import load_ligand, load_protein, register_ligand, register_protein
@@ -527,6 +553,242 @@ def ligand_fetch_pubchem(
         raise typer.Exit(code=1)
 
     typer.echo(f"Ligand '{ligand.id}' registered successfully.")
+
+
+def _promotion_failure_banner(error: BaseException) -> str:
+    """Map the structured original scientific/storage cause to the frozen
+    CLI vocabulary (Section 15.4/17 of Increment 018's frozen spec) -
+    mirrors `_tautomer_failure_banner`'s own structure exactly, for the
+    promotion workflow's own closed set of possible `original_error`
+    types. `promote_ligand_input` never lets anything else reach this
+    function as `original_error` once resolution/execution has begun."""
+
+    if isinstance(
+        error,
+        (
+            UnsafeRawArtifactPathError,
+            RawArtifactTypeError,
+            RawArtifactIntegrityError,
+            RawArtifactNoFollowUnavailableError,
+            RawArtifactIdentityUnstableError,
+            RawArtifactSharingViolationError,
+            PromotionReservationConflictError,
+            PromotionPublicationUnavailableError,
+        ),
+    ):
+        return "STORAGE ERROR"
+    if isinstance(error, (InvalidPromotionSDFError, DisconnectedStructureError, PromotionRecordCountError)):
+        return "EXECUTION ERROR"
+    if isinstance(error, (RDKitUnavailableError, PromotionConsistencyError)):
+        return "CONFIGURATION ERROR"
+    if isinstance(error, FileNotFoundError):
+        return "INPUT ERROR"
+    if isinstance(
+        error,
+        (UnsupportedPromotionFormatError, PromotionRevisionRequiredError, PromotionIdentityConflictError),
+    ):
+        return "INPUT ERROR"
+    if isinstance(error, ValueError):
+        return "INPUT ERROR"
+    if isinstance(error, (yaml.YAMLError, ValidationError)):
+        return "CONFIGURATION ERROR"
+    if isinstance(error, OSError):
+        return "STORAGE ERROR"
+    return "EXECUTION ERROR"
+
+
+def _echo_promotion_unconfirmed_removals(
+    residual_entity_ids: tuple,
+    residual_state_ids: tuple,
+    residual_reservation_keys: tuple,
+) -> None:
+    """Render only removals/releases whose cleanup could not be confirmed -
+    mirrors `_echo_unconfirmed_removals` exactly in spirit, one field wider
+    (reservations, Section 6.6 of the frozen spec)."""
+
+    if not residual_entity_ids and not residual_state_ids and not residual_reservation_keys:
+        return
+
+    typer.echo()
+    typer.echo(
+        "Unconfirmed removals: "
+        f"{len(residual_entity_ids)} entity(ies), "
+        f"{len(residual_state_ids)} state(s), "
+        f"{len(residual_reservation_keys)} reservation(s)"
+    )
+    for entity_id in residual_entity_ids:
+        typer.echo(f"  Entity '{entity_id}'")
+    for state_id in residual_state_ids:
+        typer.echo(f"  State '{state_id}'")
+    for reservation_key in residual_reservation_keys:
+        typer.echo(f"  Reservation '{reservation_key}'")
+
+
+@ligand_app.command("promote")
+def ligand_promote(
+    experiment: str,
+    input_id: str,
+    entity: str = typer.Option(..., "--entity"),
+    state: str = typer.Option(..., "--state"),
+    name: str = typer.Option(..., "--name"),
+    revision: Optional[str] = typer.Option(None, "--revision"),
+):
+    """Promote a registered ligand RAW artifact into an auditable
+    ScientificEntity/MolecularState pair (Section 15.1 of Increment 018's
+    frozen final specification)."""
+
+    context = _resolve_experiment_or_exit(experiment, error_sanitizer=_sanitize_cli_error_text)
+    validated_input_id = _validate_id_or_exit(
+        input_id,
+        project_dir=context.project_dir,
+        command="ligand-promote",
+        error_sanitizer=_sanitize_cli_error_text,
+    )
+    validated_entity_id = _validate_id_or_exit(
+        entity,
+        project_dir=context.project_dir,
+        command="ligand-promote",
+        error_sanitizer=_sanitize_cli_error_text,
+    )
+    validated_state_id = _validate_id_or_exit(
+        state,
+        project_dir=context.project_dir,
+        command="ligand-promote",
+        error_sanitizer=_sanitize_cli_error_text,
+    )
+    validated_revision: Optional[str] = None
+    if revision is not None:
+        validated_revision = _validate_id_or_exit(
+            revision,
+            project_dir=context.project_dir,
+            command="ligand-promote",
+            error_sanitizer=_sanitize_cli_error_text,
+        )
+
+    # Section 15.1: the CLI constructs exclusively the one profile RD-018-01
+    # confirmed correct - no individual RDKit flag is ever exposed here.
+    policy = LigandPromotionPolicy(sanitize=True, remove_hs=False, strict_parsing=True)
+
+    # No `_record_activity_safely` call surrounds this: `promote_ligand_input`
+    # itself already logs started/success/error for command="ligand-promote"
+    # once it is reached (Section 14.5) - adding another entry here for the
+    # same outcome would duplicate the activity log, which this command
+    # never does. Only the pre-call `_validate_id_or_exit` failures above
+    # log their own "error" entry, since the service is never reached then.
+    try:
+        attempt = promote_ligand_input(
+            context.project_dir,
+            input_id=validated_input_id,
+            entity_id=validated_entity_id,
+            state_id=validated_state_id,
+            entity_name=name,
+            policy=policy,
+            intentional_revision=validated_revision,
+        )
+
+    except LigandPromotionAttemptPersistenceError as error:
+        # Checkpoint 4 correction (BLOCKER-01): when intended_status is
+        # "succeeded", the promotion record/entity/state may already be
+        # durably published - this branch must never claim the promotion
+        # itself failed, only that this attempt's own bookkeeping status
+        # could not be written.
+        typer.echo("STORAGE ERROR")
+        typer.echo()
+        typer.echo("LIGAND PROMOTION STATUS NOT PERSISTED")
+        typer.echo()
+        typer.echo(f"Attempt ID: {error.attempt_id}")
+        typer.echo(f"Input: {error.input_id}")
+        typer.echo(f"Phase: {error.phase}")
+        typer.echo(f"Intended status: {error.intended_status}")
+        if error.intended_status == "succeeded":
+            typer.echo("Scientific commit: may already be published")
+            typer.echo("Operational status persisted: no")
+        else:
+            typer.echo("Terminal status persisted: no")
+        typer.echo(f"Original error: {_sanitize_cli_error_text(error.original_error)}")
+        typer.echo(f"Persistence error: {_sanitize_cli_error_text(error.persistence_error)}")
+        _echo_promotion_unconfirmed_removals(
+            error.residual_entity_ids,
+            error.residual_state_ids,
+            error.residual_reservation_keys,
+        )
+        raise typer.Exit(code=1)
+
+    except LigandPromotionAttemptFailedError as error:
+        typer.echo(_promotion_failure_banner(error.original_error))
+        typer.echo()
+
+        try:
+            failed_attempt = load_promotion_attempt(context.project_dir, error.attempt_id)
+        except Exception:
+            typer.echo("LIGAND PROMOTION FAILED")
+            typer.echo()
+            typer.echo(f"Attempt ID: {error.attempt_id}")
+            typer.echo(f"Input: {error.input_id}")
+            typer.echo(f"Status: {error.status}")
+            typer.echo(f"Error: {_sanitize_cli_error_text(error.original_error)}")
+            typer.echo()
+            typer.echo("(additional attempt details could not be loaded)")
+            raise typer.Exit(code=1)
+
+        typer.echo("LIGAND PROMOTION FAILED")
+        typer.echo()
+        typer.echo(f"Attempt ID: {error.attempt_id}")
+        typer.echo(f"Input: {error.input_id}")
+        typer.echo(f"Status: {error.status}")
+        typer.echo(f"Phase: {failed_attempt.error.phase}")
+        typer.echo(f"Error: {_sanitize_cli_error_text(failed_attempt.error.message)}")
+        _echo_promotion_unconfirmed_removals(
+            failed_attempt.error.residual_entity_ids,
+            failed_attempt.error.residual_state_ids,
+            failed_attempt.error.residual_reservation_keys,
+        )
+        raise typer.Exit(code=1)
+
+    except ValueError as error:
+        typer.echo("INPUT ERROR")
+        typer.echo(_sanitize_cli_error_text(error))
+        raise typer.Exit(code=1)
+
+    except OSError as error:
+        typer.echo("STORAGE ERROR")
+        typer.echo(_sanitize_cli_error_text(error))
+        raise typer.Exit(code=1)
+
+    # Section 15.5: nothing is echoed until every value the banner below
+    # needs is already sitting on the validated `attempt` object returned
+    # by the Application Service - there is no further I/O between here
+    # and the first `typer.echo` call, so no banner can ever be printed
+    # ahead of a subsequent failure to load/format something.
+    if attempt.result.reused_existing_promotion:
+        typer.echo("LIGAND PROMOTION")
+        typer.echo()
+        typer.echo(f"Attempt ID: {attempt.id}")
+        typer.echo(f"Promotion ID: {attempt.result.promotion_id}")
+        typer.echo("Result: existing promotion reused")
+        typer.echo(f"Entity: {attempt.result.entity_id}")
+        typer.echo(f"Initial state: {attempt.result.state_id}")
+        return
+
+    entity_annotation = "created" if attempt.result.entity_created else "reused"
+    state_annotation = "created" if attempt.result.state_created else "reused"
+
+    typer.echo("LIGAND PROMOTION")
+    typer.echo()
+    typer.echo(f"Attempt ID: {attempt.id}")
+    typer.echo(f"Promotion ID: {attempt.result.promotion_id}")
+    typer.echo(f"Input: {validated_input_id}")
+    typer.echo(f"Entity: {attempt.result.entity_id} ({entity_annotation})")
+    typer.echo(f"Initial state: {attempt.result.state_id} ({state_annotation})")
+    typer.echo(f"Representation: {attempt.result.representation.path}")
+    typer.echo(f"RAW checksum verified: {attempt.resolved.snapshot_checksum}")
+    typer.echo(f"Engine: {attempt.resolved.engine_name} {attempt.resolved.engine_version}")
+
+    if attempt.resolved.warnings:
+        typer.echo()
+        typer.echo("Warnings:")
+        for warning in attempt.resolved.warnings:
+            typer.echo(f"  {warning}")
 
 
 @protein_app.command("add")
@@ -1021,6 +1283,21 @@ def _sanitize_tautomer_error_text(value: object) -> str:
 
     pieces.append(_redact_tautomer_paths_outside_urls(text[cursor:]))
     return "".join(pieces)
+
+
+def _sanitize_cli_error_text(value: object) -> str:
+    """Generic alias for `_sanitize_tautomer_error_text` (Increment 018,
+    Checkpoint 5) - the redaction logic is not actually specific to
+    tautomer enumeration (it only ever inspected the TEXT of an error
+    message, never anything about tautomers), so it is reused verbatim,
+    under a name that does not misleadingly imply a different command, for
+    every other CLI command needing the same path-redaction/URL-and-
+    chemistry-preservation guarantee (e.g. `ligand promote`). The
+    Increment 016/017 tautomer command keeps calling
+    `_sanitize_tautomer_error_text` directly, byte-for-byte unchanged, so
+    its own approved behavior is never at risk of this alias's existence."""
+
+    return _sanitize_tautomer_error_text(value)
 
 
 def _echo_tautomer_validation_errors(error: ValidationError) -> None:

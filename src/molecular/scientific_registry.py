@@ -15,8 +15,22 @@ register_conformer never creates or modifies a MolecularState - state_id
 must already be registered, checked the same way. Conformer ids are
 globally unique at the project level, in the same flat namespace style as
 entities/states/transformations - never scoped per-state.
+
+Increment 018 (Checkpoint 4, Section 13.4 of
+``increments/018/11-final-specification/INCREMENT_018_FINAL_SPECIFICATION.md``,
+SHA-256 ``347632175991b1d72b9f193312b9629ce71697fb0c3d0de2285e52b7299d8023``)
+adds `remove_state_if_matches_and_unreferenced` and
+`remove_entity_if_matches_and_unreferenced`: narrow compensation
+primitives the promotion service uses to roll back a state/entity it just
+created earlier in the same attempt, gated by an explicit match-against-
+expected check and an explicit dependents check, with confirmed-removal
+semantics. Neither is `_remove_state_best_effort` reused nor wrapped by
+them - Section 13.4 is explicit that this pre-existing internal helper
+(scoped to Increment 016/017's own tautomer-enumeration compensation) must
+never be repurposed for the new promotion workflow.
 """
 
+import contextlib
 import logging
 import shutil
 import uuid
@@ -24,6 +38,7 @@ from pathlib import Path
 from typing import List
 
 import yaml
+from pydantic import ValidationError
 
 from molecular.atomic import (
     atomic_write_text,
@@ -310,6 +325,114 @@ def _remove_state_best_effort(project_dir: Path, state_id: str) -> None:
 
     artifact_dir = _state_artifacts_root(project_dir) / state_id
     _cleanup_directory_best_effort(artifact_dir, description="published representation directory")
+
+
+def remove_state_if_matches_and_unreferenced(
+    project_dir: Path, *, expected: MolecularState
+) -> bool:
+    """Remove a MolecularState, but only if it still matches `expected`
+    exactly and nothing currently references it (Section 13.3/13.4 of
+    Increment 018's frozen final specification).
+
+    This is the narrow compensation primitive Increment 018's promotion
+    service uses to roll back a state IT just registered, when a later
+    step of that same attempt subsequently fails - it never assumes
+    ownership from an id alone. Three independent conditions all gate the
+    removal, checked in this order:
+
+    1. **match**: the currently persisted state at `expected.id` must
+       compare equal to `expected` field-for-field (never removes a state
+       that has since diverged, or that a different actor created after
+       this one, or whose id was merely reused);
+    2. **unreferenced**: no Conformer currently lists `expected.id` as its
+       `state_id` (a state with dependents is never removed out from under
+       them);
+    3. **confirmed**: after attempting removal, both the metadata file and
+       the published representation directory are re-checked to have
+       actually disappeared - this function never claims success it could
+       not verify.
+
+    Returns True only when the state was actually removed and that removal
+    was confirmed; False in every other case (absent, mismatched, has
+    dependents, or removal could not be confirmed) - a caller must always
+    treat False as "this id may still exist", never as an error to ignore.
+
+    A state that cannot be loaded at all - corrupted YAML
+    (`yaml.YAMLError`) or a persisted document that no longer validates
+    (`pydantic.ValidationError`) - can never be proven to match `expected`,
+    so it is conservatively left untouched (returns False), exactly like a
+    reservation whose metadata is unreadable is never treated as free
+    (Section 11.6's same fail-closed principle, applied here to
+    compensation instead of reservation).
+
+    Deliberately independent of `_remove_state_best_effort`: that helper is
+    never reused nor wrapped by this function (Section 13.4's own
+    docstring note) - the two primitives now coexist for different
+    callers, the old one for its own pre-existing call site, this one for
+    the promotion service's compensation.
+    """
+
+    try:
+        current = load_state(project_dir, expected.id)
+    except (OSError, yaml.YAMLError, ValidationError):
+        return False
+
+    if current != expected:
+        return False
+
+    if list_state_conformers(project_dir, expected.id):
+        return False
+
+    metadata_file = _states_dir(project_dir) / f"{expected.id}.yaml"
+    with contextlib.suppress(OSError):
+        metadata_file.unlink(missing_ok=True)
+
+    artifact_dir = _state_artifacts_root(project_dir) / expected.id
+    _cleanup_directory_best_effort(artifact_dir, description="published representation directory")
+
+    return not metadata_file.exists() and not artifact_dir.exists()
+
+
+def remove_entity_if_matches_and_unreferenced(
+    project_dir: Path, *, expected: ScientificEntity
+) -> bool:
+    """Remove a ScientificEntity, but only if it still matches `expected`
+    exactly and no MolecularState currently references it (Section
+    13.3/13.4 of Increment 018's frozen final specification).
+
+    Mirrors `remove_state_if_matches_and_unreferenced` exactly in spirit,
+    one level up the dependency chain: match against `expected` field-for-
+    field, confirm no MolecularState lists `expected.id` as its own
+    `entity_id`, remove, then confirm the metadata file actually
+    disappeared. An entity has no artifact directory of its own (Section
+    6/`register_entity`'s own docstring: "There is no artifact to stage for
+    an entity"), so there is nothing beyond the metadata file to remove or
+    confirm.
+
+    Returns True only when the entity was actually removed and that
+    removal was confirmed; False in every other case (absent, mismatched,
+    has dependent states, or removal could not be confirmed). A
+    corrupted/unvalidatable persisted entity is conservatively left
+    untouched, for the same fail-closed reason
+    `remove_state_if_matches_and_unreferenced` is.
+    """
+
+    try:
+        current = load_entity(project_dir, expected.id)
+    except (OSError, yaml.YAMLError, ValidationError):
+        return False
+
+    if current != expected:
+        return False
+
+    if list_entity_states(project_dir, expected.id):
+        return False
+
+    metadata_file = _entities_dir(project_dir) / f"{expected.id}.yaml"
+    with contextlib.suppress(OSError):
+        metadata_file.unlink(missing_ok=True)
+
+    return not metadata_file.exists()
 
 
 def list_entity_states(project_dir: Path, entity_id: str) -> List[MolecularState]:

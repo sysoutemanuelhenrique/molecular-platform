@@ -13,11 +13,29 @@ from typer.testing import CliRunner
 
 import molecular.application as application_module
 import molecular.cli as cli_module
+from molecular.atomic import (
+    RawArtifactIdentityUnstableError,
+    RawArtifactSharingViolationError,
+    UnsafeRawArtifactPathError,
+)
 from molecular.cli import app
+from molecular.promotion_registry import PromotionPublicationUnavailableError
+from molecular.promotion_service import (
+    LigandPromotionAttemptFailedError,
+    LigandPromotionAttemptPersistenceError,
+    PromotionConsistencyError,
+    PromotionIdentityConflictError,
+    PromotionReservationConflictError,
+    PromotionRevisionRequiredError,
+    UnsupportedPromotionFormatError,
+)
 from molecular.rdkit_tautomer import (
+    DisconnectedStructureError,
     IncompleteEnumerationError,
+    InvalidPromotionSDFError,
     InvalidSDFError,
     MultipleMoleculesError,
+    PromotionRecordCountError,
     RDKitUnavailableError,
 )
 from molecular.scientific import ScientificEntity
@@ -5699,3 +5717,1018 @@ def test_tautomer_cli_redacts_path_with_connector_in_directory_name(
         assert "private data" not in stream
         assert "ligand.sdf" not in stream
         assert chemical_text in stream or stream == ""
+
+
+# =====================================================================
+# Increment 018 Checkpoint 5 - `ligand promote` CLI
+# =====================================================================
+
+
+def _fake_promotion_result(
+    *,
+    promotion_id="eee91465c48294045e34842e20df2142a5f159a8188b104fa701eb6fe4c5e795",
+    entity_id="curcumin",
+    state_id="curcumin-initial",
+    entity_created=True,
+    state_created=True,
+    reused_existing_promotion=False,
+    representation_path="scientific/artifacts/states/curcumin-initial/snapshot.sdf",
+):
+    return SimpleNamespace(
+        promotion_id=promotion_id,
+        entity_id=entity_id,
+        state_id=state_id,
+        entity_created=entity_created,
+        state_created=state_created,
+        reused_existing_promotion=reused_existing_promotion,
+        representation=SimpleNamespace(path=representation_path),
+    )
+
+
+def _fake_resolved(
+    *,
+    engine_name="rdkit",
+    engine_version="2026.03.6",
+    snapshot_checksum="0" * 64,
+    warnings=(),
+):
+    return SimpleNamespace(
+        engine_name=engine_name,
+        engine_version=engine_version,
+        snapshot_checksum=snapshot_checksum,
+        warnings=tuple(warnings),
+    )
+
+
+def _fake_promotion_attempt(*, attempt_id="attempt-promo-001", status="succeeded", result=None, resolved=None):
+    return SimpleNamespace(
+        id=attempt_id,
+        status=status,
+        result=result if result is not None else _fake_promotion_result(),
+        resolved=resolved if resolved is not None else _fake_resolved(),
+    )
+
+
+def _promote_cli_args(
+    experiment="exp001",
+    input_id="curcumin-pubchem",
+    *,
+    entity="curcumin",
+    state="curcumin-initial",
+    name="Curcumin",
+    revision=None,
+):
+    args = [
+        "ligand",
+        "promote",
+        experiment,
+        input_id,
+        "--entity",
+        entity,
+        "--state",
+        state,
+        "--name",
+        name,
+    ]
+    if revision is not None:
+        args += ["--revision", revision]
+    return args
+
+
+def _patch_promote_success(monkeypatch, *, attempt=None):
+    observed = {"calls": 0}
+    fake_attempt = attempt if attempt is not None else _fake_promotion_attempt()
+
+    def _promote(
+        project_dir, *, input_id, entity_id, state_id, entity_name, policy, intentional_revision=None
+    ):
+        observed["calls"] += 1
+        observed["project_dir"] = project_dir
+        observed["input_id"] = input_id
+        observed["entity_id"] = entity_id
+        observed["state_id"] = state_id
+        observed["entity_name"] = entity_name
+        observed["policy"] = policy
+        observed["intentional_revision"] = intentional_revision
+        return fake_attempt
+
+    monkeypatch.setattr(cli_module, "promote_ligand_input", _promote)
+    return observed
+
+
+def _promotion_failed_wrapper(
+    original_error,
+    *,
+    attempt_id="attempt-promo-failed",
+    input_id="curcumin-pubchem",
+    status="execution_failed",
+):
+    error = LigandPromotionAttemptFailedError(
+        attempt_id=attempt_id,
+        input_id=input_id,
+        status=status,
+        original_error=original_error,
+    )
+    error.__cause__ = original_error
+    return error
+
+
+def _patch_promote_failure(
+    monkeypatch,
+    original_error,
+    *,
+    attempt_id="attempt-promo-failed",
+    status="execution_failed",
+):
+    wrapper = _promotion_failed_wrapper(original_error, attempt_id=attempt_id, status=status)
+    observed = {"calls": 0}
+
+    def _promote(*args, **kwargs):
+        observed["calls"] += 1
+        raise wrapper
+
+    monkeypatch.setattr(cli_module, "promote_ligand_input", _promote)
+    return observed, wrapper
+
+
+def _fake_loaded_failed_attempt(
+    *,
+    phase="execution",
+    message="scientific failure",
+    residual_entity_ids=(),
+    residual_state_ids=(),
+    residual_reservation_keys=(),
+):
+    return SimpleNamespace(
+        error=SimpleNamespace(
+            phase=phase,
+            message=message,
+            residual_entity_ids=tuple(residual_entity_ids),
+            residual_state_ids=tuple(residual_state_ids),
+            residual_reservation_keys=tuple(residual_reservation_keys),
+        )
+    )
+
+
+def _patch_promote_persistence_failure(
+    monkeypatch,
+    *,
+    intended_status="execution_failed",
+    attempt_id="attempt-promo-persist",
+    input_id="curcumin-pubchem",
+    phase="execution",
+    original_error=None,
+    persistence_error=None,
+    residual_entity_ids=(),
+    residual_state_ids=(),
+    residual_reservation_keys=(),
+):
+    original_error = original_error if original_error is not None else RuntimeError("original scientific error")
+    persistence_error = (
+        persistence_error if persistence_error is not None else OSError("could not write attempt status")
+    )
+    wrapper = LigandPromotionAttemptPersistenceError(
+        attempt_id=attempt_id,
+        input_id=input_id,
+        phase=phase,
+        intended_status=intended_status,
+        original_error=original_error,
+        persistence_error=persistence_error,
+        residual_entity_ids=residual_entity_ids,
+        residual_state_ids=residual_state_ids,
+        residual_reservation_keys=residual_reservation_keys,
+    )
+    wrapper.__cause__ = persistence_error
+
+    def _promote(*args, **kwargs):
+        raise wrapper
+
+    monkeypatch.setattr(cli_module, "promote_ligand_input", _promote)
+    return wrapper
+
+
+# --- item 111: help and signature ---
+
+
+def test_ligand_promote_appears_in_ligand_help():
+    result = runner.invoke(app, ["ligand", "--help"])
+
+    assert result.exit_code == 0
+    assert "promote" in result.output
+
+
+def test_ligand_promote_help_shows_frozen_signature():
+    result = runner.invoke(app, ["ligand", "promote", "--help"])
+
+    assert result.exit_code == 0
+    assert "experiment" in result.output
+    assert "input_id" in result.output
+    assert "--entity" in result.output
+    assert "--state" in result.output
+    assert "--name" in result.output
+    assert "--revision" in result.output
+    # Section 15.1: no individual RDKit flag is ever exposed.
+    assert "--sanitize" not in result.output
+    assert "--remove-hs" not in result.output
+    assert "--strict-parsing" not in result.output
+    assert "--snapshot" not in result.output
+
+
+# --- items 112/113: success - new promotion, mixed reuse, idempotent ---
+
+
+def test_ligand_promote_new_success_renders_frozen_fields(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    observed = _patch_promote_success(
+        monkeypatch,
+        attempt=_fake_promotion_attempt(
+            attempt_id="attempt-promo-new",
+            result=_fake_promotion_result(entity_created=True, state_created=True),
+            resolved=_fake_resolved(warnings=("sd-name-property-absent",)),
+        ),
+    )
+
+    result = runner.invoke(app, _promote_cli_args())
+
+    assert result.exit_code == 0
+    assert observed["calls"] == 1
+    assert "LIGAND PROMOTION" in result.output
+    assert "Attempt ID: attempt-promo-new" in result.output
+    assert (
+        "Promotion ID: eee91465c48294045e34842e20df2142a5f159a8188b104fa701eb6fe4c5e795"
+        in result.output
+    )
+    assert "Input: curcumin-pubchem" in result.output
+    assert "Entity: curcumin (created)" in result.output
+    assert "Initial state: curcumin-initial (created)" in result.output
+    assert "Representation: scientific/artifacts/states/curcumin-initial/snapshot.sdf" in result.output
+    assert f"RAW checksum verified: {'0' * 64}" in result.output
+    assert "Engine: rdkit 2026.03.6" in result.output
+    assert "Warnings:" in result.output
+    assert "sd-name-property-absent" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_ligand_promote_new_success_with_reused_entity_shows_reused_annotation(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    _patch_promote_success(
+        monkeypatch,
+        attempt=_fake_promotion_attempt(
+            result=_fake_promotion_result(entity_created=False, state_created=True)
+        ),
+    )
+
+    result = runner.invoke(app, _promote_cli_args())
+
+    assert result.exit_code == 0
+    assert "Entity: curcumin (reused)" in result.output
+    assert "Initial state: curcumin-initial (created)" in result.output
+
+
+def test_ligand_promote_idempotent_success_renders_frozen_fields(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    observed = _patch_promote_success(
+        monkeypatch,
+        attempt=_fake_promotion_attempt(
+            attempt_id="attempt-promo-retry",
+            result=_fake_promotion_result(entity_created=False, state_created=False, reused_existing_promotion=True),
+        ),
+    )
+
+    result = runner.invoke(app, _promote_cli_args())
+
+    assert result.exit_code == 0
+    assert observed["calls"] == 1
+    assert "LIGAND PROMOTION" in result.output
+    assert "Attempt ID: attempt-promo-retry" in result.output
+    assert "Result: existing promotion reused" in result.output
+    assert "Entity: curcumin" in result.output
+    assert "Initial state: curcumin-initial" in result.output
+    # the idempotent template never claims a fresh (created) annotation.
+    assert "(created)" not in result.output
+    assert "Traceback" not in result.output
+
+
+def test_ligand_promote_success_passes_frozen_policy_and_revision(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    observed = _patch_promote_success(monkeypatch)
+
+    result = runner.invoke(app, _promote_cli_args(revision="revision-1"))
+
+    assert result.exit_code == 0
+    assert observed["input_id"] == "curcumin-pubchem"
+    assert observed["entity_id"] == "curcumin"
+    assert observed["state_id"] == "curcumin-initial"
+    assert observed["entity_name"] == "Curcumin"
+    assert observed["intentional_revision"] == "revision-1"
+    policy = observed["policy"]
+    assert policy.sanitize is True
+    assert policy.remove_hs is False
+    assert policy.strict_parsing is True
+
+
+def test_ligand_promote_success_omits_revision_when_not_given(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    observed = _patch_promote_success(monkeypatch)
+
+    result = runner.invoke(app, _promote_cli_args())
+
+    assert result.exit_code == 0
+    assert observed["intentional_revision"] is None
+
+
+# --- item 114: four banners and exit code, for the promotion workflow's
+# own closed set of possible original_error types ---
+
+
+@pytest.mark.parametrize(
+    "original_error,expected_banner",
+    [
+        (FileNotFoundError("LigandInput not found"), "INPUT ERROR"),
+        (UnsupportedPromotionFormatError("format is not sdf"), "INPUT ERROR"),
+        (PromotionIdentityConflictError("ids diverge from the existing record"), "INPUT ERROR"),
+        (PromotionRevisionRequiredError("a revision token is required"), "INPUT ERROR"),
+        (InvalidPromotionSDFError("the SDF source could not be parsed"), "EXECUTION ERROR"),
+        (PromotionRecordCountError(2), "EXECUTION ERROR"),
+        (DisconnectedStructureError("more than one connected fragment"), "EXECUTION ERROR"),
+        (RDKitUnavailableError("rdkit is not installed"), "CONFIGURATION ERROR"),
+        (PromotionConsistencyError("lineage and filesystem diverge"), "CONFIGURATION ERROR"),
+        (UnsafeRawArtifactPathError("unsafe raw artifact path"), "STORAGE ERROR"),
+        (RawArtifactIdentityUnstableError("identity changed"), "STORAGE ERROR"),
+        (RawArtifactSharingViolationError("the OS denied the operation"), "STORAGE ERROR"),
+        (PromotionReservationConflictError("another attempt holds the reservation"), "STORAGE ERROR"),
+        (PromotionPublicationUnavailableError("no exclusive publication primitive"), "STORAGE ERROR"),
+    ],
+    ids=[
+        "input-not-found",
+        "unsupported-format",
+        "identity-conflict",
+        "revision-required",
+        "invalid-sdf",
+        "record-count",
+        "disconnected-structure",
+        "rdkit-unavailable",
+        "consistency-error",
+        "unsafe-raw-path",
+        "raw-identity-unstable",
+        "raw-sharing-violation",
+        "reservation-conflict",
+        "promotion-primitive-unavailable",
+    ],
+)
+def test_ligand_promote_failure_banners_cover_the_frozen_taxonomy(
+    tmp_path, monkeypatch, original_error, expected_banner
+):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    _patch_promote_failure(monkeypatch, original_error, attempt_id="attempt-taxonomy")
+    monkeypatch.setattr(
+        cli_module,
+        "load_promotion_attempt",
+        lambda *a, **k: _fake_loaded_failed_attempt(message=str(original_error)),
+    )
+
+    result = runner.invoke(app, _promote_cli_args())
+
+    assert result.exit_code == 1
+    assert expected_banner in result.output
+    assert "Traceback" not in result.output
+
+
+# --- item 115: attempt ID/status/phase ---
+
+
+def test_ligand_promote_failure_shows_attempt_id_status_phase(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    _patch_promote_failure(
+        monkeypatch,
+        InvalidPromotionSDFError("the SDF source could not be parsed"),
+        attempt_id="attempt-detail-001",
+        status="execution_failed",
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "load_promotion_attempt",
+        lambda *a, **k: _fake_loaded_failed_attempt(phase="execution", message="the SDF source could not be parsed"),
+    )
+
+    result = runner.invoke(app, _promote_cli_args())
+
+    assert result.exit_code == 1
+    assert "Attempt ID: attempt-detail-001" in result.output
+    assert "Input: curcumin-pubchem" in result.output
+    assert "Status: execution_failed" in result.output
+    assert "Phase: execution" in result.output
+
+
+# --- item 116: unconfirmed removals ---
+
+
+def test_ligand_promote_failure_shows_unconfirmed_removals(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    _patch_promote_failure(
+        monkeypatch,
+        PromotionConsistencyError("lineage and filesystem diverge"),
+        attempt_id="attempt-residual-001",
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "load_promotion_attempt",
+        lambda *a, **k: _fake_loaded_failed_attempt(
+            message="lineage and filesystem diverge",
+            residual_entity_ids=("curcumin",),
+            residual_state_ids=("curcumin-initial",),
+            residual_reservation_keys=("semkey123",),
+        ),
+    )
+
+    result = runner.invoke(app, _promote_cli_args())
+
+    assert result.exit_code == 1
+    assert "Unconfirmed removals: 1 entity(ies), 1 state(s), 1 reservation(s)" in result.output
+    assert "Entity 'curcumin'" in result.output
+    assert "State 'curcumin-initial'" in result.output
+    assert "Reservation 'semkey123'" in result.output
+
+
+def test_ligand_promote_failure_omits_unconfirmed_removals_when_empty(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    _patch_promote_failure(monkeypatch, FileNotFoundError("not found"), attempt_id="attempt-clean-001")
+    monkeypatch.setattr(
+        cli_module, "load_promotion_attempt", lambda *a, **k: _fake_loaded_failed_attempt()
+    )
+
+    result = runner.invoke(app, _promote_cli_args())
+
+    assert "Unconfirmed removals" not in result.output
+
+
+# --- item 117: no traceback, no absolute path ---
+
+
+@pytest.mark.parametrize(
+    "case_id,absolute_path,rendered_path",
+    [
+        ("windows-drive", r"C:\Users\Jane\private\ligand.sdf", r"C:\Users\Jane\private\ligand.sdf"),
+        (
+            "windows-drive-spaces",
+            r"C:\Users\Jane Doe\private data\ligand.sdf",
+            r"C:\Users\Jane Doe\private data\ligand.sdf",
+        ),
+        ("unc", r"\\server\share\patient\record.sdf", r"\\server\share\patient\record.sdf"),
+        (
+            "unc-spaces",
+            r"\\server\clinical data\Jane Doe\record.sdf",
+            r"\\server\clinical data\Jane Doe\record.sdf",
+        ),
+        ("posix", "/home/jane/private/ligand.sdf", "/home/jane/private/ligand.sdf"),
+        (
+            "posix-spaces",
+            "/home/jane/private data/ligand sample.sdf",
+            "/home/jane/private data/ligand sample.sdf",
+        ),
+        (
+            "single-quoted",
+            "/home/jane/private data/ligand sample.sdf",
+            "'/home/jane/private data/ligand sample.sdf'",
+        ),
+        (
+            "double-quoted",
+            r"C:\Users\Jane Doe\private data\ligand.sdf",
+            '"C:\\Users\\Jane Doe\\private data\\ligand.sdf"',
+        ),
+        (
+            "repr-escaped",
+            r"C:\Users\Jane Doe\private data\ligand.sdf",
+            repr(r"C:\Users\Jane Doe\private data\ligand.sdf"),
+        ),
+        (
+            "multiple-paths",
+            "/home/jane/a.sdf",
+            "copied /home/jane/a.sdf to /home/jane/b.sdf",
+        ),
+    ],
+)
+def test_ligand_promote_failure_never_exposes_absolute_path(
+    tmp_path, monkeypatch, case_id, absolute_path, rendered_path
+):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    _patch_promote_failure(
+        monkeypatch,
+        InvalidPromotionSDFError(f"could not parse SDF at {rendered_path}"),
+        attempt_id=f"attempt-path-{case_id}",
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "load_promotion_attempt",
+        lambda *a, **k: _fake_loaded_failed_attempt(message=f"could not parse SDF at {rendered_path}"),
+    )
+
+    result = runner.invoke(app, _promote_cli_args())
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "[redacted-path]" in result.output
+    for stream in _result_streams(result):
+        assert absolute_path not in stream
+
+
+# --- item 118: persistence wrapper - no retry, no compensation from the CLI ---
+
+
+def test_ligand_promote_persistence_wrapper_execution_failed(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    _patch_promote_persistence_failure(
+        monkeypatch,
+        intended_status="execution_failed",
+        attempt_id="attempt-persist-exec",
+        phase="execution",
+        original_error=RuntimeError("register_promotion failed"),
+        persistence_error=OSError("disk full while marking execution_failed"),
+        residual_entity_ids=("curcumin",),
+    )
+
+    result = runner.invoke(app, _promote_cli_args())
+
+    assert result.exit_code == 1
+    assert "STORAGE ERROR" in result.output
+    assert "Attempt ID: attempt-persist-exec" in result.output
+    assert "Input: curcumin-pubchem" in result.output
+    assert "Phase: execution" in result.output
+    assert "Intended status: execution_failed" in result.output
+    assert "Terminal status persisted: no" in result.output
+    assert "register_promotion failed" in result.output
+    assert "disk full while marking execution_failed" in result.output
+    assert "Entity 'curcumin'" in result.output
+    assert "Traceback" not in result.output
+    # never reclassified as a false success/failure claim.
+    assert "PROMOTION FAILED" not in result.output
+
+
+def test_ligand_promote_persistence_wrapper_resolution_failed(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    _patch_promote_persistence_failure(
+        monkeypatch,
+        intended_status="resolution_failed",
+        attempt_id="attempt-persist-resolve",
+        phase="resolution",
+    )
+
+    result = runner.invoke(app, _promote_cli_args())
+
+    assert result.exit_code == 1
+    assert "STORAGE ERROR" in result.output
+    assert "Phase: resolution" in result.output
+    assert "Intended status: resolution_failed" in result.output
+    assert "Terminal status persisted: no" in result.output
+
+
+def test_ligand_promote_calls_application_service_exactly_once_on_persistence_failure(
+    tmp_path, monkeypatch
+):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    calls = {"n": 0}
+    wrapper = LigandPromotionAttemptPersistenceError(
+        attempt_id="attempt-once",
+        input_id="curcumin-pubchem",
+        phase="execution",
+        intended_status="execution_failed",
+        original_error=RuntimeError("x"),
+        persistence_error=OSError("y"),
+    )
+
+    def _promote(*args, **kwargs):
+        calls["n"] += 1
+        raise wrapper
+
+    monkeypatch.setattr(cli_module, "promote_ligand_input", _promote)
+
+    result = runner.invoke(app, _promote_cli_args())
+
+    assert result.exit_code == 1
+    assert calls["n"] == 1
+
+
+# --- explicit requirement: intended_status="succeeded" presented honestly ---
+
+
+def test_ligand_promote_persistence_wrapper_succeeded_never_claims_failure(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    _patch_promote_persistence_failure(
+        monkeypatch,
+        intended_status="succeeded",
+        attempt_id="attempt-persist-succeeded",
+        phase="execution",
+        original_error=RuntimeError("mark_succeeded failed"),
+        persistence_error=RuntimeError("mark_succeeded failed"),
+    )
+
+    result = runner.invoke(app, _promote_cli_args())
+
+    assert result.exit_code == 1
+    assert "STORAGE ERROR" in result.output
+    assert "Intended status: succeeded" in result.output
+    assert "Scientific commit: may already be published" in result.output
+    assert "Operational status persisted: no" in result.output
+    # never claims the promotion itself failed.
+    assert "PROMOTION FAILED" not in result.output
+    assert "the promotion failed" not in result.output.lower()
+    assert "Traceback" not in result.output
+
+
+# --- fallback when the attempt cannot be reloaded ---
+
+
+def test_ligand_promote_failure_fallback_when_attempt_cannot_be_reloaded(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    original_error = InvalidPromotionSDFError("the SDF source could not be parsed")
+    _patch_promote_failure(monkeypatch, original_error, attempt_id="attempt-fallback-001")
+
+    def _raise_on_reload(*args, **kwargs):
+        raise FileNotFoundError("attempt metadata vanished")
+
+    monkeypatch.setattr(cli_module, "load_promotion_attempt", _raise_on_reload)
+
+    result = runner.invoke(app, _promote_cli_args())
+
+    assert result.exit_code == 1
+    assert "EXECUTION ERROR" in result.output
+    assert "Attempt ID: attempt-fallback-001" in result.output
+    assert "Input: curcumin-pubchem" in result.output
+    assert "Status: execution_failed" in result.output
+    assert "the SDF source could not be parsed" in result.output
+    assert "(additional attempt details could not be loaded)" in result.output
+    assert "Traceback" not in result.output
+
+
+# --- item 119: KeyboardInterrupt/SystemExit propagate, never absorbed ---
+
+
+def test_ligand_promote_propagates_keyboard_interrupt(tmp_path, monkeypatch):
+    context = SimpleNamespace(project_dir=tmp_path)
+    interruption = KeyboardInterrupt()
+
+    monkeypatch.setattr(cli_module, "_resolve_experiment_or_exit", lambda identifier, **kwargs: context)
+
+    def _interrupt(*args, **kwargs):
+        raise interruption
+
+    monkeypatch.setattr(cli_module, "promote_ligand_input", _interrupt)
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        cli_module.ligand_promote(
+            "exp001",
+            "curcumin-pubchem",
+            entity="curcumin",
+            state="curcumin-initial",
+            name="Curcumin",
+            revision=None,
+        )
+
+    assert caught.value is interruption
+
+
+def test_ligand_promote_propagates_system_exit(tmp_path, monkeypatch):
+    context = SimpleNamespace(project_dir=tmp_path)
+    interruption = SystemExit(17)
+
+    monkeypatch.setattr(cli_module, "_resolve_experiment_or_exit", lambda identifier, **kwargs: context)
+
+    def _interrupt(*args, **kwargs):
+        raise interruption
+
+    monkeypatch.setattr(cli_module, "promote_ligand_input", _interrupt)
+
+    with pytest.raises(SystemExit) as caught:
+        cli_module.ligand_promote(
+            "exp001",
+            "curcumin-pubchem",
+            entity="curcumin",
+            state="curcumin-initial",
+            name="Curcumin",
+            revision=None,
+        )
+
+    assert caught.value is interruption
+
+
+# --- item 120: Application Service called exactly once (success path too) ---
+
+
+def test_ligand_promote_calls_application_service_exactly_once_on_success(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    observed = _patch_promote_success(monkeypatch)
+
+    result = runner.invoke(app, _promote_cli_args())
+
+    assert result.exit_code == 0
+    assert observed["calls"] == 1
+
+
+# --- item 121: CLI never imports RDKit directly (static source check) ---
+
+
+def test_cli_module_never_imports_rdkit_directly():
+    source = inspect.getsource(cli_module)
+    assert "import rdkit" not in source
+    assert "from rdkit" not in source
+
+
+# --- item 122: CLI never discovers attempts by listing/diffing ---
+
+
+def test_cli_module_never_lists_or_diffs_promotions():
+    source = inspect.getsource(cli_module)
+    assert "list_promotions_by_input" not in source
+    assert "list_promotions_by_state" not in source
+
+
+def test_cli_module_never_acquires_or_releases_reservations_or_compensates():
+    source = inspect.getsource(cli_module)
+    for forbidden in (
+        "acquire_semantic_reservation",
+        "acquire_entity_claim",
+        "acquire_state_claim",
+        "release_semantic_reservation",
+        "release_entity_claim",
+        "release_state_claim",
+        "compensate_partial_acquisition",
+        "register_promotion",
+        "compute_semantic_key",
+        "build_semantic_key_payload",
+    ):
+        assert forbidden not in source
+
+
+def test_cli_module_never_catches_bare_base_exception():
+    source = inspect.getsource(cli_module)
+    assert "except BaseException" not in source
+
+
+# --- item 123: --revision valid/invalid ---
+
+
+def test_ligand_promote_invalid_revision_rejected_before_calling_service(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    observed = _patch_promote_success(monkeypatch)
+
+    result = runner.invoke(app, _promote_cli_args(revision="not a valid id!"))
+
+    assert result.exit_code == 1
+    assert "INPUT ERROR" in result.output
+    assert observed["calls"] == 0
+
+
+def test_ligand_promote_valid_revision_is_forwarded(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    observed = _patch_promote_success(monkeypatch)
+
+    result = runner.invoke(app, _promote_cli_args(revision="revision-b"))
+
+    assert result.exit_code == 0
+    assert observed["intentional_revision"] == "revision-b"
+
+
+def test_ligand_promote_invalid_entity_id_rejected_before_calling_service(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    observed = _patch_promote_success(monkeypatch)
+
+    result = runner.invoke(app, _promote_cli_args(entity="../escape"))
+
+    assert result.exit_code == 1
+    assert "INPUT ERROR" in result.output
+    assert observed["calls"] == 0
+    assert "Traceback" not in result.output
+
+
+# --- item 124: human identity conflict ---
+
+
+def test_ligand_promote_identity_conflict_is_human_readable_input_error(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    _patch_promote_failure(
+        monkeypatch,
+        PromotionIdentityConflictError(
+            "a promotion record already exists for this semantic_key with "
+            "different entity_id/state_id than requested"
+        ),
+        attempt_id="attempt-conflict-001",
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "load_promotion_attempt",
+        lambda *a, **k: _fake_loaded_failed_attempt(
+            message="a promotion record already exists for this semantic_key with "
+            "different entity_id/state_id than requested"
+        ),
+    )
+
+    result = runner.invoke(app, _promote_cli_args(entity="different-entity", state="different-state"))
+
+    assert result.exit_code == 1
+    assert "INPUT ERROR" in result.output
+    assert "different entity_id/state_id" in result.output
+    assert "Traceback" not in result.output
+
+
+# --- item 125: STORAGE ERROR distinctly covers raw-permission-denied/
+# raw-sharing-violation and promotion-primitive-unavailable ---
+
+
+def test_ligand_promote_storage_error_covers_raw_sharing_violation(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    _patch_promote_failure(
+        monkeypatch,
+        RawArtifactSharingViolationError("the operating system denied opening the RAW artifact"),
+        attempt_id="attempt-storage-sharing",
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "load_promotion_attempt",
+        lambda *a, **k: _fake_loaded_failed_attempt(message="the operating system denied opening the RAW artifact"),
+    )
+
+    result = runner.invoke(app, _promote_cli_args())
+
+    assert result.exit_code == 1
+    assert "STORAGE ERROR" in result.output
+
+
+def test_ligand_promote_storage_error_covers_promotion_primitive_unavailable(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+    _patch_promote_failure(
+        monkeypatch,
+        PromotionPublicationUnavailableError("no exclusive publication primitive available"),
+        attempt_id="attempt-storage-primitive",
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "load_promotion_attempt",
+        lambda *a, **k: _fake_loaded_failed_attempt(message="no exclusive publication primitive available"),
+    )
+
+    result = runner.invoke(app, _promote_cli_args())
+
+    assert result.exit_code == 1
+    assert "STORAGE ERROR" in result.output
+
+
+# --- sanitizer reuse/generalization: _sanitize_cli_error_text ---
+
+
+def test_sanitize_cli_error_text_is_an_alias_of_the_tautomer_sanitizer():
+    assert cli_module._sanitize_cli_error_text is not cli_module._sanitize_tautomer_error_text
+    sample = r"failure at C:\Users\Jane\ligand.sdf"
+    assert cli_module._sanitize_cli_error_text(sample) == cli_module._sanitize_tautomer_error_text(sample)
+
+
+@pytest.mark.parametrize(
+    "message,redacted_fragment",
+    [
+        (r"C:\Users\Jane\private\ligand.sdf", "Jane"),
+        (r"C:\Users\Jane Doe\private data\ligand.sdf", "Jane Doe"),
+        (r"\\server\share\patient\record.sdf", "patient"),
+        (r"\\server\clinical data\Jane Doe\record.sdf", "clinical data"),
+        ("/home/jane/private/ligand.sdf", "private"),
+        ("/home/jane/private data/ligand sample.sdf", "private data"),
+        ("'/home/jane/private data/ligand sample.sdf'", "private data"),
+        ('"C:\\Users\\Jane Doe\\private data\\ligand.sdf"', "Jane Doe"),
+        (repr(r"C:\Users\Jane Doe\private data\ligand.sdf"), "Jane Doe"),
+        ("/home/jane/private data/ligand sample.sdf,", "private data"),
+    ],
+    ids=[
+        "windows-drive",
+        "windows-drive-spaces",
+        "unc",
+        "unc-spaces",
+        "posix",
+        "posix-spaces",
+        "single-quoted",
+        "double-quoted",
+        "repr-escaped",
+        "trailing-punctuation",
+    ],
+)
+def test_sanitize_cli_error_text_redacts_every_absolute_path_shape(message, redacted_fragment):
+    sanitized = cli_module._sanitize_cli_error_text(message)
+
+    assert "[redacted-path]" in sanitized
+    assert redacted_fragment not in sanitized
+
+
+def test_sanitize_cli_error_text_redacts_multiple_paths_in_one_message():
+    sanitized = cli_module._sanitize_cli_error_text("copied /home/jane/a.sdf to /home/jane/b.sdf")
+
+    assert sanitized.count("[redacted-path]") == 2
+    assert "jane" not in sanitized
+
+
+@pytest.mark.parametrize(
+    "message,expected",
+    [
+        ("https://example.org/path/ligand.sdf", "https://example.org/path/ligand.sdf"),
+        (
+            "https://example.org/path/ligand.sdf?download=1",
+            "https://example.org/path/ligand.sdf?download=1",
+        ),
+        ("https://example.org/path/ligand.sdf#record", "https://example.org/path/ligand.sdf#record"),
+        ("http://example.org/a/b/file.sdf", "http://example.org/a/b/file.sdf"),
+        (
+            "https://example.org/path/ligand.sdf and /home/jane/a.sdf",
+            "https://example.org/path/ligand.sdf and [redacted-path]",
+        ),
+    ],
+    ids=["https", "https-query", "https-fragment", "http", "url-and-path"],
+)
+def test_sanitize_cli_error_text_preserves_urls_exactly(message, expected):
+    assert cli_module._sanitize_cli_error_text(message) == expected
+
+
+@pytest.mark.parametrize(
+    "chemical_text",
+    [
+        "C(=O)/N=C/C",
+        "H+/OH- equilibrium",
+        r"N/C=C\C",
+        "SMILES C/C=C/C",
+        "ratio H2O/EtOH",
+        "pH+/OH- equilibrium",
+    ],
+)
+def test_sanitize_cli_error_text_preserves_chemical_slash_expressions(chemical_text):
+    sanitized = cli_module._sanitize_cli_error_text(chemical_text)
+
+    assert sanitized == chemical_text
+    assert "[redacted-path]" not in sanitized
+
+
+def test_sanitize_cli_error_text_leaves_pathless_messages_intact():
+    message = "the RAW artifact's registered checksum changed since resolution"
+    assert cli_module._sanitize_cli_error_text(message) == message
+
+
+def test_ligand_promote_never_weakens_tautomer_command_behavior(tmp_path, monkeypatch):
+    """Increment 017's own tautomer command must keep calling its own
+    named sanitizer, completely unaffected by the generic alias added for
+    Increment 018."""
+
+    _init_valid_experiment(tmp_path, monkeypatch)
+    absolute_path = r"C:\Users\Jane\private\ligand.sdf"
+    _patch_tautomer_failure(
+        monkeypatch,
+        InvalidSDFError(f"could not parse SDF at {absolute_path}"),
+        attempt_id="attempt-tautomer-unaffected",
+    )
+
+    result = runner.invoke(app, _tautomer_cli_args())
+
+    assert result.exit_code == 1
+    assert "EXECUTION ERROR" in result.output
+    assert "[redacted-path]" in result.output
+    assert "Jane" not in result.output
+
+
+# --- end-to-end real RDKit flow ---
+
+
+def test_ligand_promote_end_to_end_real_rdkit_flow(tmp_path, monkeypatch):
+    pytest.importorskip("rdkit")
+    from rdkit import Chem
+
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+
+    raw_file = tmp_path / "curcumin.sdf"
+    mol = Chem.MolFromSmiles("CCO")
+    writer = Chem.SDWriter(str(raw_file))
+    writer.write(mol)
+    writer.close()
+
+    add_result = runner.invoke(
+        app,
+        [
+            "ligand",
+            "add",
+            "exp001",
+            "curcumin-pubchem",
+            "--name",
+            "Curcumin",
+            "--acquisition-method",
+            "uploaded",
+            "--raw-file",
+            str(raw_file),
+            "--format",
+            "sdf",
+        ],
+    )
+    assert add_result.exit_code == 0
+
+    first = runner.invoke(app, _promote_cli_args())
+    assert first.exit_code == 0, first.output
+    assert "LIGAND PROMOTION" in first.output
+    assert "Entity: curcumin (created)" in first.output
+    assert "Initial state: curcumin-initial (created)" in first.output
+    assert "Engine: rdkit" in first.output
+    assert str(project) not in first.output
+
+    second = runner.invoke(app, _promote_cli_args())
+    assert second.exit_code == 0, second.output
+    assert "Result: existing promotion reused" in second.output
