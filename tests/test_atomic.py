@@ -200,12 +200,15 @@ def _make_raw_input(tmp_path, *, input_id=_INPUT_ID, filename="raw.sdf", content
     return project_dir, raw_artifact_path, checksum, snapshot_path
 
 
-def _snapshot(project_dir, raw_artifact_path, checksum, snapshot_path, *, input_id=_INPUT_ID):
+def _snapshot(
+    project_dir, raw_artifact_path, checksum, snapshot_path, *, input_id=_INPUT_ID, snapshot_root=None
+):
     return create_verified_raw_snapshot(
         project_dir=project_dir,
         input_id=input_id,
         raw_artifact_path=raw_artifact_path,
         raw_artifact_checksum=checksum,
+        snapshot_root=snapshot_root if snapshot_root is not None else snapshot_path.parent,
         snapshot_path=snapshot_path,
     )
 
@@ -350,6 +353,7 @@ def test_sibling_prefix_collision_rejected_end_to_end(tmp_path):
             input_id=_INPUT_ID,
             raw_artifact_path=f"inputs/ligands/{_INPUT_ID}_EVIL/raw.sdf",
             raw_artifact_checksum=checksum,
+            snapshot_root=tmp_path,
             snapshot_path=tmp_path / "snap.sdf",
         )
 
@@ -378,6 +382,7 @@ def test_rejects_junction_as_root_ancestor(tmp_path):
             input_id=_INPUT_ID,
             raw_artifact_path=f"inputs/ligands/{_INPUT_ID}/raw.sdf",
             raw_artifact_checksum=checksum,
+            snapshot_root=tmp_path,
             snapshot_path=tmp_path / "snap.sdf",
         )
 
@@ -402,6 +407,7 @@ def test_rejects_junction_as_intermediate_ancestor(tmp_path):
             input_id=_INPUT_ID,
             raw_artifact_path=f"inputs/ligands/{_INPUT_ID}/subdir/raw.sdf",
             raw_artifact_checksum=checksum,
+            snapshot_root=tmp_path,
             snapshot_path=tmp_path / "snap.sdf",
         )
 
@@ -485,6 +491,7 @@ def test_rejects_directory_as_final_path(tmp_path):
             input_id=_INPUT_ID,
             raw_artifact_path=f"inputs/ligands/{_INPUT_ID}/raw.sdf",
             raw_artifact_checksum="0" * 64,
+            snapshot_root=tmp_path,
             snapshot_path=tmp_path / "snap.sdf",
         )
 
@@ -500,6 +507,7 @@ def test_rejects_missing_raw_file(tmp_path):
             input_id=_INPUT_ID,
             raw_artifact_path=f"inputs/ligands/{_INPUT_ID}/missing.sdf",
             raw_artifact_checksum="0" * 64,
+            snapshot_root=tmp_path,
             snapshot_path=tmp_path / "snap.sdf",
         )
 
@@ -641,6 +649,7 @@ def test_ancestor_chain_redirected_outside_root_rejected(tmp_path):
             input_id=_INPUT_ID,
             raw_artifact_path=f"inputs/ligands/{_INPUT_ID}/raw.sdf",
             raw_artifact_checksum=checksum,
+            snapshot_root=tmp_path,
             snapshot_path=tmp_path / "snap.sdf",
         )
 
@@ -929,6 +938,7 @@ def test_platform_check_runs_before_touching_raw_file(tmp_path, monkeypatch):
             input_id=_INPUT_ID,
             raw_artifact_path=f"inputs/ligands/{_INPUT_ID}/raw.sdf",
             raw_artifact_checksum="0" * 64,
+            snapshot_root=tmp_path,
             snapshot_path=tmp_path / "snap.sdf",
         )
 
@@ -1452,3 +1462,230 @@ def test_publication_conflict_os_error_message_never_leaks_path(tmp_path, monkey
 
     assert str(snapshot_path) not in str(exc_info.value)
     assert str(project_dir) not in str(exc_info.value)
+
+
+# =============================================================================
+# Checkpoint 4 correction - MINOR-C1: snapshot_path's own ancestor chain
+# (from the caller-supplied, already-existing `snapshot_root` down to its
+# immediate parent) receives exactly the same fail-closed reparse-point/
+# identity discipline the RAW side already has (Section 8.3.1).
+# =============================================================================
+
+
+# --- MINOR-C1 item 1: a normal, nested ancestor chain is accepted ---
+
+
+def test_minor_c1_normal_nested_snapshot_ancestor_chain_accepted(tmp_path):
+    project_dir, raw_path, checksum, _ = _make_raw_input(tmp_path)
+    snapshot_root = tmp_path / "promotion_snapshots" / "attempt-1"
+    nested_dir = snapshot_root / "nested"
+    nested_dir.mkdir(parents=True)
+    snapshot_path = nested_dir / "snapshot.sdf"
+
+    result = create_verified_raw_snapshot(
+        project_dir=project_dir,
+        input_id=_INPUT_ID,
+        raw_artifact_path=raw_path,
+        raw_artifact_checksum=checksum,
+        snapshot_root=snapshot_root,
+        snapshot_path=snapshot_path,
+    )
+
+    assert snapshot_path.read_bytes() == _CONTENT
+    assert result.snapshot_checksum == checksum
+    assert _staging_leftovers(nested_dir) == []
+
+
+# --- MINOR-C1 item 2: a symlink ancestor is rejected (injected - real
+# symlinks are not constructible without elevation on this platform) ---
+
+
+def test_minor_c1_symlink_ancestor_rejected_via_injection(tmp_path, monkeypatch):
+    project_dir, raw_path, checksum, _ = _make_raw_input(tmp_path)
+    snapshot_root = tmp_path / "promotion_snapshots"
+    snapshot_root.mkdir(parents=True)
+    snapshot_path = snapshot_root / "snapshot.sdf"
+
+    real_capture = atomic_module._capture_identity
+
+    def _fake_capture(path):
+        token = real_capture(path)
+        if Path(path) == snapshot_root:
+            return atomic_module._IdentityToken(
+                st_dev=token.st_dev,
+                st_ino=token.st_ino,
+                is_reparse_point=True,
+                file_attributes=(token.file_attributes or 0) | 0x400,
+                reparse_tag=0xA000000C,  # IO_REPARSE_TAG_SYMLINK
+                is_regular_file=token.is_regular_file,
+                is_directory=token.is_directory,
+                size=token.size,
+            )
+        return token
+
+    monkeypatch.setattr(atomic_module, "_capture_identity", _fake_capture)
+
+    with pytest.raises(UnsafeRawArtifactPathError):
+        create_verified_raw_snapshot(
+            project_dir=project_dir,
+            input_id=_INPUT_ID,
+            raw_artifact_path=raw_path,
+            raw_artifact_checksum=checksum,
+            snapshot_root=snapshot_root,
+            snapshot_path=snapshot_path,
+        )
+
+
+# --- MINOR-C1 item 3: a real junction ancestor is rejected ---
+
+
+def test_minor_c1_junction_ancestor_rejected(tmp_path):
+    project_dir, raw_path, checksum, _ = _make_raw_input(tmp_path)
+    real_target = tmp_path / "real_snapshot_target"
+    real_target.mkdir()
+    snapshot_root = tmp_path / "promotion_snapshots"
+    _make_junction(snapshot_root, real_target)
+    snapshot_path = snapshot_root / "snapshot.sdf"
+
+    with pytest.raises(UnsafeRawArtifactPathError):
+        create_verified_raw_snapshot(
+            project_dir=project_dir,
+            input_id=_INPUT_ID,
+            raw_artifact_path=raw_path,
+            raw_artifact_checksum=checksum,
+            snapshot_root=snapshot_root,
+            snapshot_path=snapshot_path,
+        )
+
+
+# --- MINOR-C1 item 4: an unavailable reparse attribute fails closed ---
+
+
+def test_minor_c1_snapshot_ancestor_missing_file_attributes_fails_closed(tmp_path, monkeypatch):
+    project_dir, raw_path, checksum, _ = _make_raw_input(tmp_path)
+    snapshot_root = tmp_path / "promotion_snapshots"
+    snapshot_root.mkdir(parents=True)
+    snapshot_path = snapshot_root / "snapshot.sdf"
+
+    real_lstat = os.lstat
+
+    def _fake_lstat(path, *args, **kwargs):
+        result = real_lstat(path, *args, **kwargs)
+        if Path(path) == snapshot_root:
+            return _FakeLstatResult(
+                st_dev=result.st_dev,
+                st_ino=result.st_ino,
+                st_mode=result.st_mode,
+                st_size=result.st_size,
+                st_file_attributes=None,
+            )
+        return result
+
+    monkeypatch.setattr(atomic_module.os, "lstat", _fake_lstat)
+
+    with pytest.raises(RawArtifactNoFollowUnavailableError):
+        create_verified_raw_snapshot(
+            project_dir=project_dir,
+            input_id=_INPUT_ID,
+            raw_artifact_path=raw_path,
+            raw_artifact_checksum=checksum,
+            snapshot_root=snapshot_root,
+            snapshot_path=snapshot_path,
+        )
+
+
+# --- MINOR-C1 item 5: ancestor substitution between validation and
+# publication is detected ---
+
+
+def test_minor_c1_ancestor_substitution_between_validation_and_publish_detected(
+    tmp_path, monkeypatch
+):
+    project_dir, raw_path, checksum, _ = _make_raw_input(tmp_path)
+    snapshot_root = tmp_path / "promotion_snapshots"
+    snapshot_root.mkdir(parents=True)
+    snapshot_path = snapshot_root / "snapshot.sdf"
+
+    real_reverify = atomic_module._reverify_ancestor_chain
+
+    def _mutating_reverify(ancestor_paths, previous_tokens):
+        if ancestor_paths == [snapshot_root]:
+            import shutil as _shutil
+
+            _shutil.rmtree(snapshot_root)
+            snapshot_root.mkdir()
+        return real_reverify(ancestor_paths, previous_tokens)
+
+    monkeypatch.setattr(atomic_module, "_reverify_ancestor_chain", _mutating_reverify)
+
+    with pytest.raises(RawArtifactIdentityUnstableError):
+        create_verified_raw_snapshot(
+            project_dir=project_dir,
+            input_id=_INPUT_ID,
+            raw_artifact_path=raw_path,
+            raw_artifact_checksum=checksum,
+            snapshot_root=snapshot_root,
+            snapshot_path=snapshot_path,
+        )
+
+
+# --- MINOR-C1 item 6: sibling-prefix-collision destination rejected ---
+
+
+def test_minor_c1_sibling_prefix_collision_destination_rejected(tmp_path):
+    project_dir, raw_path, checksum, _ = _make_raw_input(tmp_path)
+    snapshot_root = tmp_path / "promotion_snapshots" / "attempt"
+    snapshot_root.mkdir(parents=True)
+    evil_dir = tmp_path / "promotion_snapshots" / "attempt_EVIL"
+    evil_dir.mkdir()
+    snapshot_path = evil_dir / "snapshot.sdf"
+
+    with pytest.raises(UnsafeRawArtifactPathError):
+        create_verified_raw_snapshot(
+            project_dir=project_dir,
+            input_id=_INPUT_ID,
+            raw_artifact_path=raw_path,
+            raw_artifact_checksum=checksum,
+            snapshot_root=snapshot_root,
+            snapshot_path=snapshot_path,
+        )
+
+
+# --- MINOR-C1 item 7 (snapshot_path never accepted from an external/public
+# API caller) is exercised at the Application Service boundary - see
+# test_promote_ligand_input_signature_has_no_snapshot_path_parameter in
+# tests/test_promotion_service.py, since this module's own
+# create_verified_raw_snapshot is an internal primitive, not the public
+# surface that requirement is about. ---
+
+
+# --- MINOR-C1 item 8: rejection leaves every preexisting file untouched ---
+
+
+def test_minor_c1_rejection_leaves_preexisting_files_untouched(tmp_path):
+    project_dir, raw_path, checksum, _ = _make_raw_input(tmp_path)
+    final_path = project_dir / "inputs" / "ligands" / _INPUT_ID / "raw.sdf"
+    raw_before = final_path.read_bytes()
+
+    real_target = tmp_path / "real_snapshot_target"
+    real_target.mkdir()
+    marker = real_target / "preexisting.txt"
+    marker.write_text("do not touch", encoding="utf-8")
+
+    snapshot_root = tmp_path / "promotion_snapshots"
+    _make_junction(snapshot_root, real_target)
+    snapshot_path = snapshot_root / "snapshot.sdf"
+
+    with pytest.raises(UnsafeRawArtifactPathError):
+        create_verified_raw_snapshot(
+            project_dir=project_dir,
+            input_id=_INPUT_ID,
+            raw_artifact_path=raw_path,
+            raw_artifact_checksum=checksum,
+            snapshot_root=snapshot_root,
+            snapshot_path=snapshot_path,
+        )
+
+    assert final_path.read_bytes() == raw_before
+    assert marker.read_text(encoding="utf-8") == "do not touch"
+    assert _staging_leftovers(real_target) == []

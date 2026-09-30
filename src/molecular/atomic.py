@@ -560,6 +560,7 @@ def create_verified_raw_snapshot(
     input_id: str,
     raw_artifact_path: str,
     raw_artifact_checksum: str,
+    snapshot_root: Path,
     snapshot_path: Path,
 ) -> RawSnapshot:
     """Validate, open, read, and verify a LigandInput RAW artifact via the
@@ -591,8 +592,29 @@ def create_verified_raw_snapshot(
     at all - there is no cleanup path that can delete a file this call did
     not create.
 
+    `snapshot_root` (Checkpoint 4 correction, MINOR-C1) is the caller's own
+    private, already-existing directory that `snapshot_path` MUST resolve
+    within - never supplied by a CLI, a user, or untrusted metadata; only
+    an internal caller (the Application Service) that itself owns and
+    creates this directory may pass it. Every directory between
+    `snapshot_root` (inclusive) and `snapshot_path`'s immediate parent
+    (inclusive) receives EXACTLY the same ancestor-chain discipline already
+    normative for the RAW side (Section 8.3.1): `lstat`-only identity
+    capture, fail-closed rejection of any reparse point or indeterminate
+    file-attribute result, containment via `Path.is_relative_to()` alone
+    (never `startswith()`, defeating the `allowed_root_EVIL`-style sibling-
+    prefix-collision case here exactly as on the RAW side, via
+    `Path.relative_to()`'s own component-wise semantics), captured once
+    before the staging file is created and reverified once more immediately
+    before publication - closing the window in which an ancestor could be
+    substituted between validation and publication. `snapshot_path` itself
+    is never lstat'd for this purpose (it must not exist yet, per the
+    "never overwrite" rule above) - once its parent chain is proven safe,
+    `snapshot_path` being that parent's own direct child is structural, not
+    something a symlink could redirect.
+
     Order of operations (Section 8.3.2 / 8.3.2.1, extended by the
-    Checkpoint 3 correction for the destination side):
+    Checkpoint 3/4 corrections for the destination side):
 
     1. fail closed if the RAW-side platform/filesystem is not the
        validated one;
@@ -603,9 +625,12 @@ def create_verified_raw_snapshot(
        final file (all via `lstat`, never following);
     4. reverify the ancestor chain immediately before opening;
     5. fail closed if the destination's platform/filesystem is not the
-       validated one, and reject `snapshot_path` if anything already
-       exists there (`_reject_existing_snapshot_destination`) - both
-       before the RAW is ever opened;
+       validated one; capture and validate `snapshot_path`'s own ancestor
+       chain, from `snapshot_root` down to its immediate parent, with the
+       same reparse-point/identity discipline as the RAW side (MINOR-C1);
+       reject `snapshot_path` if anything already exists there
+       (`_reject_existing_snapshot_destination`) - all before the RAW is
+       ever opened;
     6. create the private staging file exclusively;
     7. open the final file by its validated path, `fstat` the descriptor,
        and compare its identity against the pre-open `lstat` - divergence
@@ -618,7 +643,9 @@ def create_verified_raw_snapshot(
         identity and the full ancestor chain once more, compare the size
         actually read against the pre-open `lstat`'s `st_size`, then
         compare the SHA-256 against `raw_artifact_checksum`;
-    11. only then publish the staging file to `snapshot_path` via
+    11. reverify `snapshot_path`'s own ancestor chain once more (MINOR-C1),
+        immediately before publication;
+    12. only then publish the staging file to `snapshot_path` via
         exclusive `os.link`, remove the staging name, and return the
         `RawSnapshot`.
     """
@@ -657,12 +684,33 @@ def create_verified_raw_snapshot(
 
     # --- destination side: same "never overwrite, never alias" discipline
     # as the RAW side, applied before the RAW is ever opened for reading
-    # (Checkpoint 3 correction, BLOCKER-A1/BLOCKER-A2) ---
+    # (Checkpoint 3 correction, BLOCKER-A1/BLOCKER-A2), plus the same
+    # ancestor-chain reparse-point discipline (Checkpoint 4 correction,
+    # MINOR-C1) ---
+    snapshot_root = Path(snapshot_root)
     snapshot_path = Path(snapshot_path)
     _require_validated_platform(snapshot_path)
+
+    try:
+        resolved_snapshot_root = snapshot_root.resolve(strict=True)
+    except OSError as exc:
+        raise UnsafeRawArtifactPathError(
+            f"the snapshot root does not exist: {exc.__class__.__name__}"
+        ) from exc
+
+    try:
+        snapshot_ancestor_paths = _build_ancestor_chain(snapshot_root, snapshot_path)
+    except ValueError as exc:
+        raise UnsafeRawArtifactPathError(
+            "snapshot_path is not lexically contained within snapshot_root"
+        ) from exc
+
+    initial_snapshot_ancestor_tokens = _capture_and_validate_ancestor_chain(
+        snapshot_ancestor_paths, resolved_snapshot_root
+    )
+
     _reject_existing_snapshot_destination(snapshot_path)
 
-    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
     staging_path = snapshot_path.parent / f".raw-snapshot-{uuid.uuid4().hex}.tmp"
 
     try:
@@ -754,6 +802,12 @@ def create_verified_raw_snapshot(
                 "the SHA-256 computed over the bytes actually read does not "
                 "match the checksum persisted for this input"
             )
+
+        # --- MINOR-C1: reverify the destination's own ancestor chain one
+        # more time, immediately before publication, closing the window in
+        # which an ancestor could have been substituted between the initial
+        # validation above and this exact moment ---
+        _reverify_ancestor_chain(snapshot_ancestor_paths, initial_snapshot_ancestor_tokens)
 
         # --- publish: exclusive create-once, never overwrite (Section
         # 8's "RAW imutável" pillar extended to the destination side) ---

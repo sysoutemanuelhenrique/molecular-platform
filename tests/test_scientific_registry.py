@@ -24,6 +24,8 @@ from molecular.scientific_registry import (
     register_conformer,
     register_entity,
     register_state,
+    remove_entity_if_matches_and_unreferenced,
+    remove_state_if_matches_and_unreferenced,
 )
 
 
@@ -1036,3 +1038,156 @@ def test_register_conformer_relative_representation_path_uses_posix_style(tmp_pa
         "scientific/artifacts/conformers/curcumin-initial-conf-001/conf.sdf"
     )
     assert "\\" not in conformer.representation.path
+
+
+# =============================================================================
+# Increment 018 Checkpoint 4 (Section 13.4): narrow compensation primitives
+# - remove_state_if_matches_and_unreferenced / remove_entity_if_matches_
+# and_unreferenced. Never _remove_state_best_effort, never a wrapper of it.
+# =============================================================================
+
+
+def test_remove_state_if_matches_and_unreferenced_removes_when_matched(tmp_path):
+    _setup_entity_and_state(tmp_path)
+    expected = load_state(tmp_path, "curcumin-initial")
+
+    removed = remove_state_if_matches_and_unreferenced(tmp_path, expected=expected)
+
+    assert removed is True
+    with pytest.raises(FileNotFoundError):
+        load_state(tmp_path, "curcumin-initial")
+    artifact_dir = tmp_path / "scientific" / "artifacts" / "states" / "curcumin-initial"
+    assert not artifact_dir.exists()
+
+
+def test_remove_state_if_matches_and_unreferenced_false_when_absent(tmp_path):
+    _setup_entity_and_state(tmp_path)
+    expected = load_state(tmp_path, "curcumin-initial")
+    # Remove it out from under the function first, via the real API.
+    metadata_file = tmp_path / "scientific" / "states" / "curcumin-initial.yaml"
+    metadata_file.unlink()
+
+    removed = remove_state_if_matches_and_unreferenced(tmp_path, expected=expected)
+
+    assert removed is False
+
+
+def test_remove_state_if_matches_and_unreferenced_refuses_on_mismatch(tmp_path):
+    _setup_entity_and_state(tmp_path)
+    current = load_state(tmp_path, "curcumin-initial")
+    diverged_expected = MolecularState(
+        schema_version="1.0",
+        id=current.id,
+        entity_id=current.entity_id,
+        representation=current.representation.model_copy(update={"checksum": "0" * 64}),
+    )
+
+    removed = remove_state_if_matches_and_unreferenced(tmp_path, expected=diverged_expected)
+
+    assert removed is False
+    # untouched: the real, still-current state loads exactly as before.
+    assert load_state(tmp_path, "curcumin-initial") == current
+
+
+def test_remove_state_if_matches_and_unreferenced_refuses_with_dependent_conformer(tmp_path):
+    _setup_entity_and_state(tmp_path)
+    expected = load_state(tmp_path, "curcumin-initial")
+    register_conformer(
+        tmp_path,
+        conformer_id="curcumin-initial-conf-001",
+        state_id="curcumin-initial",
+        source_file=_write_source_file(tmp_path, name="conf.sdf"),
+        format="sdf",
+    )
+
+    removed = remove_state_if_matches_and_unreferenced(tmp_path, expected=expected)
+
+    assert removed is False
+    assert load_state(tmp_path, "curcumin-initial") == expected
+    assert load_conformer(tmp_path, "curcumin-initial-conf-001") is not None
+
+
+def test_remove_state_if_matches_and_unreferenced_refuses_on_corrupted_metadata(tmp_path):
+    _setup_entity_and_state(tmp_path)
+    expected = load_state(tmp_path, "curcumin-initial")
+    metadata_file = tmp_path / "scientific" / "states" / "curcumin-initial.yaml"
+    metadata_file.write_text("not: [valid, yaml structure for a state", encoding="utf-8")
+
+    removed = remove_state_if_matches_and_unreferenced(tmp_path, expected=expected)
+
+    assert removed is False
+
+
+def test_remove_entity_if_matches_and_unreferenced_removes_when_matched(tmp_path):
+    register_entity(tmp_path, _entity())
+    expected = load_entity(tmp_path, "curcumin")
+
+    removed = remove_entity_if_matches_and_unreferenced(tmp_path, expected=expected)
+
+    assert removed is True
+    with pytest.raises(FileNotFoundError):
+        load_entity(tmp_path, "curcumin")
+
+
+def test_remove_entity_if_matches_and_unreferenced_false_when_absent(tmp_path):
+    register_entity(tmp_path, _entity())
+    expected = load_entity(tmp_path, "curcumin")
+    (tmp_path / "scientific" / "entities" / "curcumin.yaml").unlink()
+
+    removed = remove_entity_if_matches_and_unreferenced(tmp_path, expected=expected)
+
+    assert removed is False
+
+
+def test_remove_entity_if_matches_and_unreferenced_refuses_on_mismatch(tmp_path):
+    register_entity(tmp_path, _entity(name="Curcumin"))
+    current = load_entity(tmp_path, "curcumin")
+    diverged_expected = ScientificEntity(schema_version="1.0", id=current.id, name="Different Name")
+
+    removed = remove_entity_if_matches_and_unreferenced(tmp_path, expected=diverged_expected)
+
+    assert removed is False
+    assert load_entity(tmp_path, "curcumin") == current
+
+
+def test_remove_entity_if_matches_and_unreferenced_refuses_with_dependent_state(tmp_path):
+    _setup_entity_and_state(tmp_path)
+    expected = load_entity(tmp_path, "curcumin")
+
+    removed = remove_entity_if_matches_and_unreferenced(tmp_path, expected=expected)
+
+    assert removed is False
+    assert load_entity(tmp_path, "curcumin") == expected
+    assert load_state(tmp_path, "curcumin-initial") is not None
+
+
+def test_remove_entity_if_matches_and_unreferenced_refuses_on_corrupted_metadata(tmp_path):
+    register_entity(tmp_path, _entity())
+    expected = load_entity(tmp_path, "curcumin")
+    metadata_file = tmp_path / "scientific" / "entities" / "curcumin.yaml"
+    metadata_file.write_text("not: [valid, yaml structure for an entity", encoding="utf-8")
+
+    removed = remove_entity_if_matches_and_unreferenced(tmp_path, expected=expected)
+
+    assert removed is False
+
+
+def test_remove_state_and_remove_entity_never_call_remove_state_best_effort(
+    tmp_path, monkeypatch
+):
+    """Section 13.4's own explicit rule: `_remove_state_best_effort` is
+    never reused, not even indirectly, by the new compensation
+    primitives."""
+
+    def _poisoned(*args, **kwargs):
+        raise AssertionError("_remove_state_best_effort must never be called")
+
+    monkeypatch.setattr(scientific_registry_module, "_remove_state_best_effort", _poisoned)
+
+    _setup_entity_and_state(tmp_path)
+    expected_state = load_state(tmp_path, "curcumin-initial")
+    assert remove_state_if_matches_and_unreferenced(tmp_path, expected=expected_state) is True
+
+    register_entity(tmp_path, _entity(entity_id="separate-entity"))
+    expected_entity = load_entity(tmp_path, "separate-entity")
+    assert remove_entity_if_matches_and_unreferenced(tmp_path, expected=expected_entity) is True
