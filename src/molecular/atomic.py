@@ -42,7 +42,7 @@ import tempfile
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import FrozenSet, List, Optional, Type
+from typing import FrozenSet, List, Optional, Sequence, Type
 
 
 def compute_sha256(path: Path) -> str:
@@ -554,6 +554,142 @@ def _reject_existing_snapshot_destination(snapshot_path: Path) -> None:
     )
 
 
+def _validate_directory_component(
+    candidate: Path, resolved_project_dir: Path, description: str
+) -> _IdentityToken:
+    """`lstat` `candidate` and apply the same fail-closed discipline used
+    throughout this module: reject any reparse point or indeterminate
+    file-attribute result (`_capture_identity` itself raises
+    `RawArtifactNoFollowUnavailableError` for the latter), require a
+    regular directory, and require containment within
+    `resolved_project_dir` via `Path.is_relative_to()` - never
+    `startswith()`. Raises `FileNotFoundError` (propagated from
+    `_capture_identity`/`os.lstat`) when `candidate` does not exist yet -
+    callers use that specifically to decide whether to attempt creation."""
+
+    token = _capture_identity(candidate)
+    _reject_reparse_point(token, description)
+    if not token.is_directory:
+        raise UnsafeRawArtifactPathError(f"{description} does not name a directory")
+    _require_relative_to_root(candidate, resolved_project_dir)
+    return token
+
+
+def _ensure_shared_directory_component(
+    parent: Path, resolved_project_dir: Path, name: str
+) -> Path:
+    """Ensure one SHARED ancestor component exists and is safe (Checkpoint
+    4 correction, MAJOR-02, item 6-7): if it does not exist, create it via
+    plain (non-recursive) exclusive `os.mkdir`; if a concurrent attempt
+    wins that race, this never treats `FileExistsError` as its own
+    failure - it simply re-inspects whatever now exists at `candidate` and
+    applies the exact same validation either way, accepting it only if it
+    is a normal directory within the authorized chain. A reparse point -
+    whether it predates this call or appears via the race - is rejected
+    identically in both cases; nothing here ever follows one."""
+
+    candidate = parent / name
+    description = f"the shared directory component {name!r}"
+
+    try:
+        token = _validate_directory_component(candidate, resolved_project_dir, description)
+    except FileNotFoundError:
+        try:
+            os.mkdir(candidate)
+        except FileExistsError:
+            # Lost a creation race to a concurrent attempt - fall through
+            # to the same validation a preexisting component would get,
+            # never assuming our own create won or that the race's winner
+            # produced something safe.
+            pass
+        token = _validate_directory_component(candidate, resolved_project_dir, description)
+
+    del token  # identity captured for validation only; chain reverification
+    # (Section 8.3.1) is performed independently by create_verified_raw_snapshot.
+    return candidate
+
+
+def _ensure_exclusive_directory_component(
+    parent: Path, resolved_project_dir: Path, name: str
+) -> Path:
+    """Create the ONE component that must be privately owned by this call
+    and this call alone (Checkpoint 4 correction, MAJOR-02, item 8) - e.g.
+    an attempt's own snapshot directory, named by its own freshly-generated
+    id. Exclusive `os.mkdir` is the sole arbiter: a preexisting entry at
+    this exact path is never reused, never silently accepted as "close
+    enough" - `name` is expected to be unpredictable/fresh (a uuid4 hex),
+    so any collision is treated as suspicious rather than a benign race."""
+
+    candidate = parent / name
+    description = "this attempt's own private directory"
+
+    try:
+        os.mkdir(candidate)
+    except FileExistsError as exc:
+        raise FileExistsError(
+            f"{description} already exists - refusing to reuse a path this "
+            "call did not itself just create"
+        ) from exc
+
+    _validate_directory_component(candidate, resolved_project_dir, description)
+    return candidate
+
+
+def create_verified_private_directory(
+    project_dir: Path, *, shared_parts: Sequence[str], exclusive_part: str
+) -> Path:
+    """Safely create (or join) a private, per-attempt directory nested
+    under `project_dir`, one path component at a time, never via a single
+    `Path.mkdir(parents=True, exist_ok=True)` call that would silently
+    cross any unvalidated ancestor - including one redirected outside the
+    project by a symlink or junction (Checkpoint 4 correction, MAJOR-02,
+    extending MINOR-C1 to the full chain).
+
+    `project_dir` is the trusted containment root - inspected via `lstat`
+    itself (through the ancestor-chain machinery below) and never accepted
+    if it is a reparse point or has an indeterminate identity. Each
+    directory in `shared_parts` (e.g. `("scientific", "promotion_snapshots")`)
+    is created if absent and otherwise validated in place - concurrent
+    attempts safely share these; `exclusive_part` (e.g. a fresh attempt id)
+    is always created by exclusive `os.mkdir`, never reused, never shared.
+
+    Every component - including `project_dir` itself - is validated with
+    the same fail-closed discipline already normative for the RAW side
+    (Section 8.3.1): `lstat`-only identity capture, rejection of any
+    reparse point or indeterminate file-attribute result, and containment
+    via `Path.is_relative_to()` alone, never `startswith()`. If any
+    component redirects outside `project_dir` - most importantly
+    `scientific` or `promotion_snapshots` themselves - this fails before
+    creating anything further down the chain: no `exclusive_part`
+    directory is created at (or through) the redirected target, no
+    staging file, no snapshot, and no preexisting file anywhere is ever
+    touched.
+
+    Returns the fully validated, existing directory path (`project_dir /
+    shared_parts... / exclusive_part`). The caller (typically immediately
+    followed by `create_verified_raw_snapshot`, passing this same path as
+    `snapshot_root`) is responsible for any further use of it; this
+    function only ever creates empty directories, never a file.
+    """
+
+    _require_validated_platform(project_dir)
+
+    try:
+        resolved_project_dir = project_dir.resolve(strict=True)
+    except OSError as exc:
+        raise UnsafeRawArtifactPathError(
+            f"project_dir does not exist: {exc.__class__.__name__}"
+        ) from exc
+
+    _validate_directory_component(project_dir, resolved_project_dir, "project_dir")
+
+    current = project_dir
+    for part in shared_parts:
+        current = _ensure_shared_directory_component(current, resolved_project_dir, part)
+
+    return _ensure_exclusive_directory_component(current, resolved_project_dir, exclusive_part)
+
+
 def create_verified_raw_snapshot(
     *,
     project_dir: Path,
@@ -592,26 +728,34 @@ def create_verified_raw_snapshot(
     at all - there is no cleanup path that can delete a file this call did
     not create.
 
-    `snapshot_root` (Checkpoint 4 correction, MINOR-C1) is the caller's own
-    private, already-existing directory that `snapshot_path` MUST resolve
-    within - never supplied by a CLI, a user, or untrusted metadata; only
-    an internal caller (the Application Service) that itself owns and
-    creates this directory may pass it. Every directory between
-    `snapshot_root` (inclusive) and `snapshot_path`'s immediate parent
-    (inclusive) receives EXACTLY the same ancestor-chain discipline already
+    `snapshot_root` (Checkpoint 4, MINOR-C1) is the caller's own private,
+    already-existing directory that `snapshot_path` MUST be a direct child
+    of - never supplied by a CLI, a user, or untrusted metadata; only an
+    internal caller (the Application Service) that itself owns and creates
+    this directory (via `create_verified_private_directory`, below) may
+    pass it. The TRUSTED ROOT for containment, however, is `project_dir`
+    itself, never `snapshot_root` resolved against its own value
+    (Checkpoint 4 correction, MAJOR-02: comparing `snapshot_root` against
+    `snapshot_root.resolve()` is tautological - it proves nothing about
+    where `snapshot_root` sits relative to the project). Every directory
+    between `project_dir` (inclusive) and `snapshot_path`'s immediate
+    parent (inclusive) - e.g. `project_dir`, `project_dir/scientific`,
+    `project_dir/scientific/promotion_snapshots`, and the attempt's own
+    directory - receives EXACTLY the same ancestor-chain discipline already
     normative for the RAW side (Section 8.3.1): `lstat`-only identity
     capture, fail-closed rejection of any reparse point or indeterminate
-    file-attribute result, containment via `Path.is_relative_to()` alone
-    (never `startswith()`, defeating the `allowed_root_EVIL`-style sibling-
-    prefix-collision case here exactly as on the RAW side, via
-    `Path.relative_to()`'s own component-wise semantics), captured once
-    before the staging file is created and reverified once more immediately
-    before publication - closing the window in which an ancestor could be
-    substituted between validation and publication. `snapshot_path` itself
-    is never lstat'd for this purpose (it must not exist yet, per the
-    "never overwrite" rule above) - once its parent chain is proven safe,
-    `snapshot_path` being that parent's own direct child is structural, not
-    something a symlink could redirect.
+    file-attribute result at ANY level including `project_dir` itself,
+    containment via `Path.is_relative_to()` alone (never `startswith()`,
+    defeating the `allowed_root_EVIL`-style sibling-prefix-collision case
+    here exactly as on the RAW side, via `Path.relative_to()`'s own
+    component-wise semantics), captured once before the staging file is
+    created and reverified once more immediately before publication -
+    closing the window in which an ancestor could be substituted between
+    validation and publication. `snapshot_path` itself is never lstat'd for
+    this purpose (it must not exist yet, per the "never overwrite" rule
+    above) - once its parent chain is proven safe, `snapshot_path` being
+    that parent's own direct child is structural, not something a symlink
+    could redirect.
 
     Order of operations (Section 8.3.2 / 8.3.2.1, extended by the
     Checkpoint 3/4 corrections for the destination side):
@@ -626,9 +770,9 @@ def create_verified_raw_snapshot(
     4. reverify the ancestor chain immediately before opening;
     5. fail closed if the destination's platform/filesystem is not the
        validated one; capture and validate `snapshot_path`'s own ancestor
-       chain, from `snapshot_root` down to its immediate parent, with the
-       same reparse-point/identity discipline as the RAW side (MINOR-C1);
-       reject `snapshot_path` if anything already exists there
+       chain, from `project_dir` down to its immediate parent, with the
+       same reparse-point/identity discipline as the RAW side (MAJOR-02/
+       MINOR-C1); reject `snapshot_path` if anything already exists there
        (`_reject_existing_snapshot_destination`) - all before the RAW is
        ever opened;
     6. create the private staging file exclusively;
@@ -651,6 +795,13 @@ def create_verified_raw_snapshot(
     """
 
     _require_validated_platform(project_dir)
+
+    try:
+        resolved_project_dir = project_dir.resolve(strict=True)
+    except OSError as exc:
+        raise UnsafeRawArtifactPathError(
+            f"project_dir does not exist: {exc.__class__.__name__}"
+        ) from exc
 
     validated_relative_path = _validate_raw_path_lexical(raw_artifact_path, input_id=input_id)
     root = project_dir / _AUTHORIZED_ROOT_TEMPLATE.format(input_id=input_id)
@@ -685,28 +836,28 @@ def create_verified_raw_snapshot(
     # --- destination side: same "never overwrite, never alias" discipline
     # as the RAW side, applied before the RAW is ever opened for reading
     # (Checkpoint 3 correction, BLOCKER-A1/BLOCKER-A2), plus the same
-    # ancestor-chain reparse-point discipline (Checkpoint 4 correction,
-    # MINOR-C1) ---
+    # ancestor-chain reparse-point discipline, now anchored at `project_dir`
+    # itself - never at `snapshot_root` resolved against its own value,
+    # which proves nothing about real containment (Checkpoint 4 correction,
+    # MAJOR-02/MINOR-C1) ---
     snapshot_root = Path(snapshot_root)
     snapshot_path = Path(snapshot_path)
     _require_validated_platform(snapshot_path)
 
-    try:
-        resolved_snapshot_root = snapshot_root.resolve(strict=True)
-    except OSError as exc:
+    if snapshot_path.parent != snapshot_root:
         raise UnsafeRawArtifactPathError(
-            f"the snapshot root does not exist: {exc.__class__.__name__}"
-        ) from exc
+            "snapshot_path must be a direct child of snapshot_root"
+        )
 
     try:
-        snapshot_ancestor_paths = _build_ancestor_chain(snapshot_root, snapshot_path)
+        snapshot_ancestor_paths = _build_ancestor_chain(project_dir, snapshot_path)
     except ValueError as exc:
         raise UnsafeRawArtifactPathError(
-            "snapshot_path is not lexically contained within snapshot_root"
+            "snapshot_path is not lexically contained within project_dir"
         ) from exc
 
     initial_snapshot_ancestor_tokens = _capture_and_validate_ancestor_chain(
-        snapshot_ancestor_paths, resolved_snapshot_root
+        snapshot_ancestor_paths, resolved_project_dir
     )
 
     _reject_existing_snapshot_destination(snapshot_path)

@@ -15,6 +15,7 @@ from molecular.atomic import (
     RawArtifactTypeError,
     UnsafeRawArtifactPathError,
     atomic_write_text,
+    create_verified_private_directory,
     create_verified_raw_snapshot,
     publish_staged_directory,
 )
@@ -187,7 +188,13 @@ _CONTENT = b"the quick brown fox jumps over the lazy dog\n"
 def _make_raw_input(tmp_path, *, input_id=_INPUT_ID, filename="raw.sdf", content=_CONTENT):
     """Build a minimal `inputs/ligands/<input_id>/<filename>` RAW artifact
     under a fresh project_dir, returning (project_dir, raw_artifact_path,
-    checksum, snapshot_path)."""
+    checksum, snapshot_path). `snapshot_path` is nested INSIDE project_dir
+    (Checkpoint 4 correction, MAJOR-02: the trusted containment root for
+    the destination side is project_dir itself, never a sibling directory
+    of it) - under the same `scientific/promotion_snapshots/<attempt>/`
+    shape the real Application Service uses, pre-created here since
+    `create_verified_raw_snapshot` only ever validates an already-existing
+    ancestor chain, never creates one itself."""
 
     project_dir = tmp_path / "project"
     root = project_dir / "inputs" / "ligands" / input_id
@@ -196,7 +203,9 @@ def _make_raw_input(tmp_path, *, input_id=_INPUT_ID, filename="raw.sdf", content
     raw_file.write_bytes(content)
     checksum = hashlib.sha256(content).hexdigest()
     raw_artifact_path = f"inputs/ligands/{input_id}/{filename}"
-    snapshot_path = tmp_path / "snapshot.sdf"
+    snapshot_root = project_dir / "scientific" / "promotion_snapshots" / "test-attempt"
+    snapshot_root.mkdir(parents=True)
+    snapshot_path = snapshot_root / "snapshot.sdf"
     return project_dir, raw_artifact_path, checksum, snapshot_path
 
 
@@ -1465,23 +1474,51 @@ def test_publication_conflict_os_error_message_never_leaks_path(tmp_path, monkey
 
 
 # =============================================================================
-# Checkpoint 4 correction - MINOR-C1: snapshot_path's own ancestor chain
-# (from the caller-supplied, already-existing `snapshot_root` down to its
-# immediate parent) receives exactly the same fail-closed reparse-point/
-# identity discipline the RAW side already has (Section 8.3.1).
+# Checkpoint 4 correction - MAJOR-02 (extends MINOR-C1): the destination
+# ancestor chain is validated from `project_dir` itself - never from
+# `snapshot_root` resolved against its own value, which proves nothing
+# about real containment - all the way down through `scientific`,
+# `promotion_snapshots`, and the attempt's own directory. Covers both
+# `create_verified_private_directory` (the safe, incremental,
+# validate-then-create primitive) and `create_verified_raw_snapshot`'s own
+# project_dir-anchored chain capture/reverification.
 # =============================================================================
 
 
-# --- MINOR-C1 item 1: a normal, nested ancestor chain is accepted ---
+_SHARED_PARTS = ("scientific", "promotion_snapshots")
 
 
-def test_minor_c1_normal_nested_snapshot_ancestor_chain_accepted(tmp_path):
-    project_dir, raw_path, checksum, _ = _make_raw_input(tmp_path)
-    snapshot_root = tmp_path / "promotion_snapshots" / "attempt-1"
-    nested_dir = snapshot_root / "nested"
-    nested_dir.mkdir(parents=True)
-    snapshot_path = nested_dir / "snapshot.sdf"
+def _make_raw_project(tmp_path, *, input_id=_INPUT_ID, filename="raw.sdf", content=_CONTENT):
+    """Like `_make_raw_input`, but never pre-creates any snapshot
+    directory - these tests need full, explicit control over `scientific`/
+    `promotion_snapshots`/the attempt directory themselves."""
 
+    project_dir = tmp_path / "project"
+    root = project_dir / "inputs" / "ligands" / input_id
+    root.mkdir(parents=True)
+    raw_file = root / filename
+    raw_file.write_bytes(content)
+    checksum = hashlib.sha256(content).hexdigest()
+    raw_artifact_path = f"inputs/ligands/{input_id}/{filename}"
+    return project_dir, raw_artifact_path, checksum
+
+
+# --- item 1: full normal chain, created and validated end to end ---
+
+
+def test_major02_full_normal_chain_created_and_snapshot_succeeds(tmp_path):
+    project_dir, raw_path, checksum = _make_raw_project(tmp_path)
+
+    snapshot_root = create_verified_private_directory(
+        project_dir, shared_parts=_SHARED_PARTS, exclusive_part="attempt-1"
+    )
+
+    assert snapshot_root == project_dir / "scientific" / "promotion_snapshots" / "attempt-1"
+    assert snapshot_root.is_dir()
+
+    snapshot_path = snapshot_root / "snapshot.sdf"
+
+    # item 15: success still publishes exactly the verified bytes.
     result = create_verified_raw_snapshot(
         project_dir=project_dir,
         input_id=_INPUT_ID,
@@ -1493,30 +1530,131 @@ def test_minor_c1_normal_nested_snapshot_ancestor_chain_accepted(tmp_path):
 
     assert snapshot_path.read_bytes() == _CONTENT
     assert result.snapshot_checksum == checksum
-    assert _staging_leftovers(nested_dir) == []
+    assert result.snapshot_size_bytes == len(_CONTENT)
+    assert _staging_leftovers(snapshot_root) == []
 
 
-# --- MINOR-C1 item 2: a symlink ancestor is rejected (injected - real
-# symlinks are not constructible without elevation on this platform) ---
+def test_major02_shared_components_reused_across_two_attempts(tmp_path):
+    """`scientific`/`promotion_snapshots` are correctly shared - creating a
+    second attempt's directory never fails merely because a first attempt
+    already created them."""
+
+    project_dir, _, _ = _make_raw_project(tmp_path)
+
+    first = create_verified_private_directory(
+        project_dir, shared_parts=_SHARED_PARTS, exclusive_part="attempt-1"
+    )
+    second = create_verified_private_directory(
+        project_dir, shared_parts=_SHARED_PARTS, exclusive_part="attempt-2"
+    )
+
+    assert first.parent == second.parent
+    assert first != second
+    assert first.is_dir() and second.is_dir()
 
 
-def test_minor_c1_symlink_ancestor_rejected_via_injection(tmp_path, monkeypatch):
-    project_dir, raw_path, checksum, _ = _make_raw_input(tmp_path)
-    snapshot_root = tmp_path / "promotion_snapshots"
-    snapshot_root.mkdir(parents=True)
-    snapshot_path = snapshot_root / "snapshot.sdf"
+def test_major02_exclusive_part_collision_rejected(tmp_path):
+    project_dir, _, _ = _make_raw_project(tmp_path)
+    create_verified_private_directory(
+        project_dir, shared_parts=_SHARED_PARTS, exclusive_part="attempt-1"
+    )
+
+    with pytest.raises(FileExistsError):
+        create_verified_private_directory(
+            project_dir, shared_parts=_SHARED_PARTS, exclusive_part="attempt-1"
+        )
+
+
+# --- item 2: project_dir itself is a reparse point ---
+
+
+def test_major02_project_dir_junction_rejected(tmp_path):
+    real_project = tmp_path / "real_project"
+    root = real_project / "inputs" / "ligands" / _INPUT_ID
+    root.mkdir(parents=True)
+    (root / "raw.sdf").write_bytes(_CONTENT)
+
+    project_dir = tmp_path / "project_link"
+    _make_junction(project_dir, real_project)
+
+    with pytest.raises(UnsafeRawArtifactPathError):
+        create_verified_private_directory(
+            project_dir, shared_parts=_SHARED_PARTS, exclusive_part="attempt-1"
+        )
+
+    # nothing was created through the junction.
+    assert not (real_project / "scientific").exists()
+
+
+# --- item 3: `scientific` is a reparse point ---
+
+
+def test_major02_scientific_junction_rejected_nothing_created_outside(tmp_path):
+    project_dir, raw_path, checksum = _make_raw_project(tmp_path)
+    final_path = project_dir / "inputs" / "ligands" / _INPUT_ID / "raw.sdf"
+    external_target = tmp_path / "external_scientific"
+    external_target.mkdir()
+    marker = external_target / "marker.txt"
+    marker.write_text("do not touch", encoding="utf-8")
+    _make_junction(project_dir / "scientific", external_target)
+
+    with pytest.raises(UnsafeRawArtifactPathError):
+        create_verified_private_directory(
+            project_dir, shared_parts=_SHARED_PARTS, exclusive_part="attempt-1"
+        )
+
+    # item 12/13: nothing created in the external target, marker intact.
+    assert not (external_target / "promotion_snapshots").exists()
+    assert marker.read_text(encoding="utf-8") == "do not touch"
+    # item 14: RAW untouched.
+    assert final_path.read_bytes() == _CONTENT
+
+
+# --- item 4: `promotion_snapshots` is a reparse point ---
+
+
+def test_major02_promotion_snapshots_junction_rejected_nothing_created_outside(tmp_path):
+    project_dir, raw_path, checksum = _make_raw_project(tmp_path)
+    final_path = project_dir / "inputs" / "ligands" / _INPUT_ID / "raw.sdf"
+    (project_dir / "scientific").mkdir()
+    external_target = tmp_path / "external_promotion_snapshots"
+    external_target.mkdir()
+    marker = external_target / "marker.txt"
+    marker.write_text("do not touch", encoding="utf-8")
+    _make_junction(project_dir / "scientific" / "promotion_snapshots", external_target)
+
+    with pytest.raises(UnsafeRawArtifactPathError):
+        create_verified_private_directory(
+            project_dir, shared_parts=_SHARED_PARTS, exclusive_part="attempt-1"
+        )
+
+    assert not (external_target / "attempt-1").exists()
+    assert marker.read_text(encoding="utf-8") == "do not touch"
+    assert final_path.read_bytes() == _CONTENT
+
+
+# --- item 5: the attempt directory itself as a reparse point ---
+
+
+def test_major02_attempt_directory_reparse_immediately_after_creation_rejected(tmp_path, monkeypatch):
+    """A tight-race variant: the attempt directory is reported as a
+    reparse point at the very moment its own post-creation identity is
+    captured."""
+
+    project_dir, _, _ = _make_raw_project(tmp_path)
+    attempt_dir = project_dir / "scientific" / "promotion_snapshots" / "attempt-1"
 
     real_capture = atomic_module._capture_identity
 
     def _fake_capture(path):
         token = real_capture(path)
-        if Path(path) == snapshot_root:
+        if Path(path) == attempt_dir:
             return atomic_module._IdentityToken(
                 st_dev=token.st_dev,
                 st_ino=token.st_ino,
                 is_reparse_point=True,
                 file_attributes=(token.file_attributes or 0) | 0x400,
-                reparse_tag=0xA000000C,  # IO_REPARSE_TAG_SYMLINK
+                reparse_tag=0xA000000C,
                 is_regular_file=token.is_regular_file,
                 is_directory=token.is_directory,
                 size=token.size,
@@ -1526,52 +1664,51 @@ def test_minor_c1_symlink_ancestor_rejected_via_injection(tmp_path, monkeypatch)
     monkeypatch.setattr(atomic_module, "_capture_identity", _fake_capture)
 
     with pytest.raises(UnsafeRawArtifactPathError):
-        create_verified_raw_snapshot(
-            project_dir=project_dir,
-            input_id=_INPUT_ID,
-            raw_artifact_path=raw_path,
-            raw_artifact_checksum=checksum,
-            snapshot_root=snapshot_root,
-            snapshot_path=snapshot_path,
+        create_verified_private_directory(
+            project_dir, shared_parts=_SHARED_PARTS, exclusive_part="attempt-1"
         )
 
 
-# --- MINOR-C1 item 3: a real junction ancestor is rejected ---
+def test_major02_preexisting_reparse_point_at_attempt_path_rejected(tmp_path):
+    """A junction already sitting at the exact attempt path is rejected by
+    exclusive creation itself - `os.mkdir` fails with `FileExistsError`
+    before any reparse-point check is even reached, since the name is
+    already taken."""
 
+    project_dir, _, _ = _make_raw_project(tmp_path)
+    (project_dir / "scientific" / "promotion_snapshots").mkdir(parents=True)
+    external_target = tmp_path / "external_attempt_target"
+    external_target.mkdir()
+    _make_junction(
+        project_dir / "scientific" / "promotion_snapshots" / "attempt-1", external_target
+    )
 
-def test_minor_c1_junction_ancestor_rejected(tmp_path):
-    project_dir, raw_path, checksum, _ = _make_raw_input(tmp_path)
-    real_target = tmp_path / "real_snapshot_target"
-    real_target.mkdir()
-    snapshot_root = tmp_path / "promotion_snapshots"
-    _make_junction(snapshot_root, real_target)
-    snapshot_path = snapshot_root / "snapshot.sdf"
-
-    with pytest.raises(UnsafeRawArtifactPathError):
-        create_verified_raw_snapshot(
-            project_dir=project_dir,
-            input_id=_INPUT_ID,
-            raw_artifact_path=raw_path,
-            raw_artifact_checksum=checksum,
-            snapshot_root=snapshot_root,
-            snapshot_path=snapshot_path,
+    with pytest.raises(FileExistsError):
+        create_verified_private_directory(
+            project_dir, shared_parts=_SHARED_PARTS, exclusive_part="attempt-1"
         )
 
 
-# --- MINOR-C1 item 4: an unavailable reparse attribute fails closed ---
+# --- item 6: reparse attribute unavailable fails closed, at every level ---
 
 
-def test_minor_c1_snapshot_ancestor_missing_file_attributes_fails_closed(tmp_path, monkeypatch):
-    project_dir, raw_path, checksum, _ = _make_raw_input(tmp_path)
-    snapshot_root = tmp_path / "promotion_snapshots"
-    snapshot_root.mkdir(parents=True)
-    snapshot_path = snapshot_root / "snapshot.sdf"
+@pytest.mark.parametrize("level", ["project_dir", "scientific", "promotion_snapshots", "attempt"])
+def test_major02_missing_file_attributes_fails_closed_at_every_level(tmp_path, monkeypatch, level):
+    project_dir, _, _ = _make_raw_project(tmp_path)
+    (project_dir / "scientific" / "promotion_snapshots").mkdir(parents=True)
+
+    target = {
+        "project_dir": project_dir,
+        "scientific": project_dir / "scientific",
+        "promotion_snapshots": project_dir / "scientific" / "promotion_snapshots",
+        "attempt": project_dir / "scientific" / "promotion_snapshots" / "attempt-1",
+    }[level]
 
     real_lstat = os.lstat
 
     def _fake_lstat(path, *args, **kwargs):
         result = real_lstat(path, *args, **kwargs)
-        if Path(path) == snapshot_root:
+        if Path(path) == target:
             return _FakeLstatResult(
                 st_dev=result.st_dev,
                 st_ino=result.st_ino,
@@ -1584,36 +1721,62 @@ def test_minor_c1_snapshot_ancestor_missing_file_attributes_fails_closed(tmp_pat
     monkeypatch.setattr(atomic_module.os, "lstat", _fake_lstat)
 
     with pytest.raises(RawArtifactNoFollowUnavailableError):
+        create_verified_private_directory(
+            project_dir, shared_parts=_SHARED_PARTS, exclusive_part="attempt-1"
+        )
+
+
+# --- item 7: sibling-prefix-collision, fully outside the project ---
+
+
+def test_major02_sibling_prefix_collision_outside_project_rejected(tmp_path):
+    project_dir, raw_path, checksum = _make_raw_project(tmp_path)
+    evil_project_dir = tmp_path / "project_EVIL"
+    evil_project_dir.mkdir()
+
+    with pytest.raises(UnsafeRawArtifactPathError):
         create_verified_raw_snapshot(
             project_dir=project_dir,
             input_id=_INPUT_ID,
             raw_artifact_path=raw_path,
             raw_artifact_checksum=checksum,
-            snapshot_root=snapshot_root,
-            snapshot_path=snapshot_path,
+            snapshot_root=evil_project_dir,
+            snapshot_path=evil_project_dir / "snapshot.sdf",
         )
 
 
-# --- MINOR-C1 item 5: ancestor substitution between validation and
-# publication is detected ---
+# MINOR-C1 item 7 of the ORIGINAL Checkpoint 4 list (snapshot_path never
+# accepted from an external/public API caller) is exercised at the
+# Application Service boundary - see
+# test_promote_ligand_input_signature_has_no_snapshot_path_parameter in
+# tests/test_promotion_service.py.
 
 
-def test_minor_c1_ancestor_substitution_between_validation_and_publish_detected(
-    tmp_path, monkeypatch
-):
-    project_dir, raw_path, checksum, _ = _make_raw_input(tmp_path)
-    snapshot_root = tmp_path / "promotion_snapshots"
-    snapshot_root.mkdir(parents=True)
+# --- items 8-9: scientific/promotion_snapshots substituted between
+# create_verified_raw_snapshot's own initial capture and its pre-publish
+# reverify ---
+
+
+def _swap_directory_in_place(path):
+    import shutil as _shutil
+
+    _shutil.rmtree(path)
+    path.mkdir()
+
+
+def test_major02_scientific_substituted_between_validation_and_publish_detected(tmp_path, monkeypatch):
+    project_dir, raw_path, checksum = _make_raw_project(tmp_path)
+    snapshot_root = create_verified_private_directory(
+        project_dir, shared_parts=_SHARED_PARTS, exclusive_part="attempt-1"
+    )
     snapshot_path = snapshot_root / "snapshot.sdf"
+    scientific_dir = project_dir / "scientific"
 
     real_reverify = atomic_module._reverify_ancestor_chain
 
     def _mutating_reverify(ancestor_paths, previous_tokens):
-        if ancestor_paths == [snapshot_root]:
-            import shutil as _shutil
-
-            _shutil.rmtree(snapshot_root)
-            snapshot_root.mkdir()
+        if scientific_dir in ancestor_paths:
+            _swap_directory_in_place(scientific_dir)
         return real_reverify(ancestor_paths, previous_tokens)
 
     monkeypatch.setattr(atomic_module, "_reverify_ancestor_chain", _mutating_reverify)
@@ -1629,16 +1792,54 @@ def test_minor_c1_ancestor_substitution_between_validation_and_publish_detected(
         )
 
 
-# --- MINOR-C1 item 6: sibling-prefix-collision destination rejected ---
+def test_major02_promotion_snapshots_substituted_between_validation_and_publish_detected(
+    tmp_path, monkeypatch
+):
+    project_dir, raw_path, checksum = _make_raw_project(tmp_path)
+    snapshot_root = create_verified_private_directory(
+        project_dir, shared_parts=_SHARED_PARTS, exclusive_part="attempt-1"
+    )
+    snapshot_path = snapshot_root / "snapshot.sdf"
+    promotion_snapshots_dir = project_dir / "scientific" / "promotion_snapshots"
+
+    real_reverify = atomic_module._reverify_ancestor_chain
+
+    def _mutating_reverify(ancestor_paths, previous_tokens):
+        if promotion_snapshots_dir in ancestor_paths:
+            _swap_directory_in_place(promotion_snapshots_dir)
+        return real_reverify(ancestor_paths, previous_tokens)
+
+    monkeypatch.setattr(atomic_module, "_reverify_ancestor_chain", _mutating_reverify)
+
+    with pytest.raises(RawArtifactIdentityUnstableError):
+        create_verified_raw_snapshot(
+            project_dir=project_dir,
+            input_id=_INPUT_ID,
+            raw_artifact_path=raw_path,
+            raw_artifact_checksum=checksum,
+            snapshot_root=snapshot_root,
+            snapshot_path=snapshot_path,
+        )
 
 
-def test_minor_c1_sibling_prefix_collision_destination_rejected(tmp_path):
-    project_dir, raw_path, checksum, _ = _make_raw_input(tmp_path)
-    snapshot_root = tmp_path / "promotion_snapshots" / "attempt"
-    snapshot_root.mkdir(parents=True)
-    evil_dir = tmp_path / "promotion_snapshots" / "attempt_EVIL"
-    evil_dir.mkdir()
-    snapshot_path = evil_dir / "snapshot.sdf"
+# --- item 10: the attempt directory replaced by a junction between its
+# own creation and create_verified_raw_snapshot's use of it ---
+
+
+def test_major02_attempt_directory_replaced_by_junction_before_staging_rejected(tmp_path):
+    project_dir, raw_path, checksum = _make_raw_project(tmp_path)
+    snapshot_root = create_verified_private_directory(
+        project_dir, shared_parts=_SHARED_PARTS, exclusive_part="attempt-1"
+    )
+    snapshot_path = snapshot_root / "snapshot.sdf"
+
+    external_target = tmp_path / "external_attempt_swap_target"
+    external_target.mkdir()
+    marker = external_target / "marker.txt"
+    marker.write_text("do not touch", encoding="utf-8")
+
+    snapshot_root.rmdir()
+    _make_junction(snapshot_root, external_target)
 
     with pytest.raises(UnsafeRawArtifactPathError):
         create_verified_raw_snapshot(
@@ -1650,33 +1851,31 @@ def test_minor_c1_sibling_prefix_collision_destination_rejected(tmp_path):
             snapshot_path=snapshot_path,
         )
 
-
-# --- MINOR-C1 item 7 (snapshot_path never accepted from an external/public
-# API caller) is exercised at the Application Service boundary - see
-# test_promote_ligand_input_signature_has_no_snapshot_path_parameter in
-# tests/test_promotion_service.py, since this module's own
-# create_verified_raw_snapshot is an internal primitive, not the public
-# surface that requirement is about. ---
+    assert not (external_target / "snapshot.sdf").exists()
+    assert marker.read_text(encoding="utf-8") == "do not touch"
 
 
-# --- MINOR-C1 item 8: rejection leaves every preexisting file untouched ---
+# --- item 11: the attempt directory substituted between validation and
+# the exclusive os.link publish itself ---
 
 
-def test_minor_c1_rejection_leaves_preexisting_files_untouched(tmp_path):
-    project_dir, raw_path, checksum, _ = _make_raw_input(tmp_path)
-    final_path = project_dir / "inputs" / "ligands" / _INPUT_ID / "raw.sdf"
-    raw_before = final_path.read_bytes()
-
-    real_target = tmp_path / "real_snapshot_target"
-    real_target.mkdir()
-    marker = real_target / "preexisting.txt"
-    marker.write_text("do not touch", encoding="utf-8")
-
-    snapshot_root = tmp_path / "promotion_snapshots"
-    _make_junction(snapshot_root, real_target)
+def test_major02_attempt_directory_substituted_before_publish_detected(tmp_path, monkeypatch):
+    project_dir, raw_path, checksum = _make_raw_project(tmp_path)
+    snapshot_root = create_verified_private_directory(
+        project_dir, shared_parts=_SHARED_PARTS, exclusive_part="attempt-1"
+    )
     snapshot_path = snapshot_root / "snapshot.sdf"
 
-    with pytest.raises(UnsafeRawArtifactPathError):
+    real_reverify = atomic_module._reverify_ancestor_chain
+
+    def _mutating_reverify(ancestor_paths, previous_tokens):
+        if snapshot_root in ancestor_paths:
+            _swap_directory_in_place(snapshot_root)
+        return real_reverify(ancestor_paths, previous_tokens)
+
+    monkeypatch.setattr(atomic_module, "_reverify_ancestor_chain", _mutating_reverify)
+
+    with pytest.raises(RawArtifactIdentityUnstableError):
         create_verified_raw_snapshot(
             project_dir=project_dir,
             input_id=_INPUT_ID,
@@ -1684,8 +1883,33 @@ def test_minor_c1_rejection_leaves_preexisting_files_untouched(tmp_path):
             raw_artifact_checksum=checksum,
             snapshot_root=snapshot_root,
             snapshot_path=snapshot_path,
+        )
+
+
+# --- items 12-14 (no files at all in an external target after rejection;
+# a preexisting marker file in that target stays intact; RAW stays intact)
+# are exercised directly as part of the scientific/promotion_snapshots
+# junction tests above - repeated once more here end to end for the
+# clearest single scenario the checklist names. ---
+
+
+def test_major02_rejection_leaves_everything_preexisting_untouched(tmp_path):
+    project_dir, raw_path, checksum = _make_raw_project(tmp_path)
+    final_path = project_dir / "inputs" / "ligands" / _INPUT_ID / "raw.sdf"
+    raw_before = final_path.read_bytes()
+
+    external_target = tmp_path / "real_snapshot_target"
+    external_target.mkdir()
+    marker = external_target / "preexisting.txt"
+    marker.write_text("do not touch", encoding="utf-8")
+    _make_junction(project_dir / "scientific", external_target)
+
+    with pytest.raises(UnsafeRawArtifactPathError):
+        create_verified_private_directory(
+            project_dir, shared_parts=_SHARED_PARTS, exclusive_part="attempt-1"
         )
 
     assert final_path.read_bytes() == raw_before
     assert marker.read_text(encoding="utf-8") == "do not touch"
-    assert _staging_leftovers(real_target) == []
+    assert _staging_leftovers(external_target) == []
+    assert list(external_target.iterdir()) == [marker]

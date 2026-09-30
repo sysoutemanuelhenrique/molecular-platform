@@ -49,7 +49,15 @@ Algorithm (Section 12, literally):
   itself created/acquired) and persists `execution_failed` with whatever
   residuals could not be confirmed removed/released. Once the promotion
   record is committed, NOTHING compensates it, its entity, or its state -
-  Section 13.3's own rule, mirrored exactly.
+  Section 13.3's own rule, mirrored exactly. If `mark_succeeded` itself
+  then fails to persist the attempt's own terminal status - the record,
+  entity, and state are already durable - this is never reclassified as
+  `execution_failed` (Checkpoint 4 correction, BLOCKER-01): Section 13.3's
+  own last sentence calls this an operational persistence failure, so
+  `LigandPromotionAttemptPersistenceError` is raised directly
+  (`intended_status="succeeded"`), with no compensation and no attempt to
+  persist any other terminal status - the attempt simply stays at its last
+  honestly-persisted status ("resolved").
 
 KeyboardInterrupt/SystemExit are never converted into a scientific error at
 any point (Section 12.4): they still trigger the same best-effort
@@ -64,7 +72,7 @@ import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple
 
 from molecular.activity import record_activity
 from molecular.atomic import (
@@ -74,6 +82,7 @@ from molecular.atomic import (
     RawArtifactSharingViolationError,
     RawArtifactTypeError,
     UnsafeRawArtifactPathError,
+    create_verified_private_directory,
     create_verified_raw_snapshot,
 )
 from molecular.inputs import validate_input_id
@@ -198,7 +207,19 @@ class LigandPromotionAttemptFailedError(RuntimeError):
 
 class LigandPromotionAttemptPersistenceError(RuntimeError):
     """A promotion attempt's terminal status could not itself be persisted
-    (Section 14.4 of the frozen spec)."""
+    (Section 14.4 of the frozen spec).
+
+    `intended_status` widens the spec's own illustrative
+    `Literal["resolution_failed", "execution_failed"]` (Section 14.4) to
+    also include `"succeeded"` (Checkpoint 4 correction, BLOCKER-01): a
+    `mark_succeeded` failure occurring AFTER the promotion record has
+    already been committed (Section 13.3's own explicit rule - "falha ao
+    gravar status do attempt produz erro de persistência operacional") is
+    exactly this class of failure, and the spec's own literal simply never
+    named the case where the intended status was success. Widening the type
+    is the minimal change that lets this class honestly describe that
+    scenario, without inventing a new status value or altering the frozen
+    specification itself."""
 
     def __init__(
         self,
@@ -206,7 +227,7 @@ class LigandPromotionAttemptPersistenceError(RuntimeError):
         attempt_id: str,
         input_id: str,
         phase: PromotionPhase,
-        intended_status: str,
+        intended_status: Literal["resolution_failed", "execution_failed", "succeeded"],
         original_error: BaseException,
         persistence_error: Exception,
         residual_entity_ids: Tuple[str, ...] = (),
@@ -332,8 +353,14 @@ def _resolve_snapshot(
             f"LigandInput '{input_id}' has RAW format {declared_format!r}, expected 'sdf'"
         )
 
-    snapshot_root = _snapshot_root(project_dir, attempt_id)
-    snapshot_root.mkdir(parents=True, exist_ok=True)
+    # Checkpoint 4 correction (MAJOR-02): the whole chain from project_dir
+    # down to this attempt's own directory is created and validated one
+    # component at a time - never a single Path.mkdir(parents=True,
+    # exist_ok=True) that would silently cross an unvalidated (and
+    # possibly redirected) `scientific` or `promotion_snapshots` ancestor.
+    snapshot_root = create_verified_private_directory(
+        project_dir, shared_parts=("scientific", "promotion_snapshots"), exclusive_part=attempt_id
+    )
     snapshot_path = snapshot_root / "snapshot.sdf"
 
     raw_snapshot = create_verified_raw_snapshot(
@@ -801,7 +828,60 @@ def promote_ligand_input(
             attempt_id=attempt.id, input_id=input_id, status="resolution_failed", original_error=error
         ) from error
 
-    mark_resolved(project_dir, attempt.id, semantic_key=semantic_key, resolved=resolved)
+    # Checkpoint 4 correction (MINOR-01): this call sits between the two
+    # phase try/except blocks and must never be allowed to raise a bare,
+    # untyped exception, abandon the private snapshot, or skip activity
+    # logging - mirrored on the resolution phase's own handling above.
+    try:
+        mark_resolved(project_dir, attempt.id, semantic_key=semantic_key, resolved=resolved)
+    except (KeyboardInterrupt, SystemExit) as interrupt:
+        _release_error_frames(interrupt)
+        _cleanup_snapshot_root(_snapshot_root(project_dir, attempt.id))
+        persistence_error: Optional[Exception] = None
+        try:
+            mark_resolution_failed(
+                project_dir,
+                attempt.id,
+                error=LigandPromotionError(
+                    phase="resolution",
+                    code="consistency-error",
+                    message=_describe_error(interrupt),
+                ),
+            )
+        except Exception as error:
+            persistence_error = error
+        _record_activity_safely(project_dir, outcome="error", details=activity_details)
+        if persistence_error is not None:
+            raise interrupt from persistence_error
+        raise
+    except Exception as error:
+        _release_error_frames(error)
+        _cleanup_snapshot_root(_snapshot_root(project_dir, attempt.id))
+        try:
+            mark_resolution_failed(
+                project_dir,
+                attempt.id,
+                error=LigandPromotionError(
+                    phase="resolution",
+                    code="promotion-persistence-failed",
+                    message=_describe_error(error),
+                ),
+            )
+        except Exception as persistence_error:
+            _record_activity_safely(project_dir, outcome="error", details=activity_details)
+            raise LigandPromotionAttemptPersistenceError(
+                attempt_id=attempt.id,
+                input_id=input_id,
+                phase="resolution",
+                intended_status="resolution_failed",
+                original_error=error,
+                persistence_error=persistence_error,
+            ) from persistence_error
+
+        _record_activity_safely(project_dir, outcome="error", details=activity_details)
+        raise LigandPromotionAttemptFailedError(
+            attempt_id=attempt.id, input_id=input_id, status="resolution_failed", original_error=error
+        ) from error
 
     # ============================= execution =================================
     owner_token = secrets.token_hex(32)
@@ -844,33 +924,43 @@ def promote_ligand_input(
         try:
             succeeded = mark_succeeded(project_dir, attempt.id, result=result)
         except Exception as persist_error:
-            try:
-                succeeded = mark_execution_failed(
-                    project_dir,
-                    attempt.id,
-                    error=LigandPromotionError(
-                        phase="execution",
-                        code="promotion-persistence-failed",
-                        message=_describe_error(persist_error),
-                    ),
-                )
-            except Exception as fallback_error:
-                _record_activity_safely(project_dir, outcome="error", details=activity_details)
-                raise LigandPromotionAttemptPersistenceError(
-                    attempt_id=attempt.id,
-                    input_id=input_id,
-                    phase="execution",
-                    intended_status="execution_failed",
-                    original_error=persist_error,
-                    persistence_error=fallback_error,
-                ) from fallback_error
-
+            # Checkpoint 4 correction (BLOCKER-01): `register_promotion`
+            # already returned successfully above - the
+            # ScientificInputPromotionRecord, its ScientificEntity, and its
+            # MolecularState are ALL durably committed. Section 13.3's own
+            # last sentence is explicit and unconditional: "depois que o
+            # record foi comprometido, nenhuma compensação remove record,
+            # state ou entity; falha ao gravar status do attempt produz
+            # erro de persistência operacional." This is that exact
+            # scenario - the only thing that failed is writing the
+            # ATTEMPT's own bookkeeping status, never the science itself.
+            # Reclassifying the attempt as `execution_failed` here would
+            # assert a false, permanent audit claim that the promotion
+            # failed when it did not - so this NEVER calls
+            # mark_execution_failed (nor mark_resolution_failed), NEVER
+            # compensates entity/state/reservations, and NEVER touches the
+            # commit marker. The attempt simply stays at its last honestly-
+            # persisted status ("resolved") - never a false terminal one -
+            # while the caller is told directly, via a persistence error,
+            # that only the bookkeeping write failed.
+            _release_error_frames(persist_error)
+            _release_reservations_best_effort(
+                project_dir,
+                attempt_id=attempt.id,
+                owner_token=owner_token,
+                semantic_key=semantic_key if progress.semantic_reserved else None,
+                entity_id=entity_id if progress.entity_claimed else None,
+                state_id=state_id if progress.state_claimed else None,
+            )
+            _cleanup_snapshot_root(_snapshot_root(project_dir, attempt.id))
             _record_activity_safely(project_dir, outcome="error", details=activity_details)
-            raise LigandPromotionAttemptFailedError(
+            raise LigandPromotionAttemptPersistenceError(
                 attempt_id=attempt.id,
                 input_id=input_id,
-                status="execution_failed",
+                phase="execution",
+                intended_status="succeeded",
                 original_error=persist_error,
+                persistence_error=persist_error,
             ) from persist_error
 
     except (KeyboardInterrupt, SystemExit) as interrupt:

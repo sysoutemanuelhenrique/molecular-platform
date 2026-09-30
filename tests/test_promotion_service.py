@@ -396,6 +396,98 @@ def test_promote_execution_persistence_failure_uses_wrapper(tmp_path, monkeypatc
     assert exc_info.value.phase == "execution"
 
 
+# --- MINOR-01: mark_resolved itself failing, between the two phases ---
+
+
+def test_promote_mark_resolved_failure_falls_back_to_resolution_failed(tmp_path, monkeypatch):
+    project_dir = _new_project(tmp_path)
+    _register_ligand(project_dir, tmp_path)
+
+    poisoned_error = RuntimeError("simulated mark_resolved failure")
+
+    def _poisoned_mark_resolved(*args, **kwargs):
+        raise poisoned_error
+
+    monkeypatch.setattr(promotion_service_module, "mark_resolved", _poisoned_mark_resolved)
+
+    with pytest.raises(LigandPromotionAttemptFailedError) as exc_info:
+        _promote(project_dir)
+
+    assert exc_info.value.status == "resolution_failed"
+    assert exc_info.value.original_error is poisoned_error
+    assert exc_info.value.__cause__ is poisoned_error
+    assert exc_info.value.input_id == "curcumin-pubchem"
+
+    # the private snapshot was cleaned up.
+    snapshot_dir = project_dir / "scientific" / "promotion_snapshots" / exc_info.value.attempt_id
+    assert not snapshot_dir.exists()
+
+    # no reservation was ever acquired (the execution phase is never
+    # reached at all), no scientific object published.
+    assert not (project_dir / "scientific" / "promotion_reservations").exists()
+    with pytest.raises(FileNotFoundError):
+        load_entity(project_dir, "curcumin")
+    with pytest.raises(FileNotFoundError):
+        load_state(project_dir, "curcumin-initial")
+    assert list_promotions_by_input(project_dir, "curcumin-pubchem") == []
+
+    log_file = project_dir / "logs" / "activity.log"
+    lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert any("outcome=error" in line for line in lines)
+
+
+def test_promote_mark_resolved_and_fallback_both_fail_raises_persistence_error(tmp_path, monkeypatch):
+    project_dir = _new_project(tmp_path)
+    _register_ligand(project_dir, tmp_path)
+
+    mark_resolved_error = RuntimeError("simulated mark_resolved failure")
+    mark_resolution_failed_error = OSError("simulated fallback persistence failure")
+
+    def _poisoned_mark_resolved(*args, **kwargs):
+        raise mark_resolved_error
+
+    def _poisoned_mark_resolution_failed(*args, **kwargs):
+        raise mark_resolution_failed_error
+
+    monkeypatch.setattr(promotion_service_module, "mark_resolved", _poisoned_mark_resolved)
+    monkeypatch.setattr(
+        promotion_service_module, "mark_resolution_failed", _poisoned_mark_resolution_failed
+    )
+
+    with pytest.raises(LigandPromotionAttemptPersistenceError) as exc_info:
+        _promote(project_dir)
+
+    assert exc_info.value.intended_status == "resolution_failed"
+    assert exc_info.value.phase == "resolution"
+    assert exc_info.value.original_error is mark_resolved_error
+    assert exc_info.value.persistence_error is mark_resolution_failed_error
+    assert exc_info.value.__cause__ is mark_resolution_failed_error
+    assert exc_info.value.attempt_id
+    assert exc_info.value.input_id == "curcumin-pubchem"
+
+    with pytest.raises(FileNotFoundError):
+        load_entity(project_dir, "curcumin")
+    assert list_promotions_by_input(project_dir, "curcumin-pubchem") == []
+
+
+def test_promote_mark_resolved_failure_leaves_raw_untouched(tmp_path, monkeypatch):
+    project_dir = _new_project(tmp_path)
+    ligand = _register_ligand(project_dir, tmp_path)
+    raw_path = project_dir / ligand.acquisition.raw_artifact.path
+    raw_before = raw_path.read_bytes()
+
+    monkeypatch.setattr(
+        promotion_service_module,
+        "mark_resolved",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("simulated mark_resolved failure")),
+    )
+
+    with pytest.raises(LigandPromotionAttemptFailedError):
+        _promote(project_dir)
+
+    assert raw_path.read_bytes() == raw_before
+
+
 # --- item 101/102: KeyboardInterrupt/SystemExit ---
 
 
@@ -523,25 +615,78 @@ def test_promote_publication_record_conflict_while_holding_reservation_is_consis
 # is never removed ---
 
 
-def test_promote_status_persistence_fails_after_commit_never_removes_promotion(tmp_path, monkeypatch):
+def test_promote_status_persistence_fails_after_commit_raises_persistence_error_not_execution_failed(
+    tmp_path, monkeypatch
+):
+    """BLOCKER-01 correction: once `register_promotion` has committed the
+    record, a `mark_succeeded` failure must NEVER be reclassified as
+    `execution_failed` (Section 13.3's own literal rule: "falha ao gravar
+    status do attempt produz erro de persistência operacional"). It must
+    raise `LigandPromotionAttemptPersistenceError` directly, with
+    `intended_status="succeeded"`, never attempting `mark_execution_failed`
+    at all - proven here by making `mark_execution_failed` itself explode
+    if called."""
+
     project_dir = _new_project(tmp_path)
     _register_ligand(project_dir, tmp_path)
 
-    def _poisoned_mark_succeeded(*args, **kwargs):
-        raise RuntimeError("simulated status persistence failure")
+    real_mark_succeeded = promotion_service_module.mark_succeeded
+    call_count = {"n": 0}
+    poisoned_error = RuntimeError("simulated status persistence failure")
 
-    monkeypatch.setattr(promotion_service_module, "mark_succeeded", _poisoned_mark_succeeded)
+    def _flaky_mark_succeeded(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise poisoned_error
+        return real_mark_succeeded(*args, **kwargs)
 
-    with pytest.raises(LigandPromotionAttemptFailedError) as exc_info:
+    def _forbidden_mark_execution_failed(*args, **kwargs):
+        raise AssertionError(
+            "mark_execution_failed must never be called once the promotion "
+            "record is already committed"
+        )
+
+    monkeypatch.setattr(promotion_service_module, "mark_succeeded", _flaky_mark_succeeded)
+    monkeypatch.setattr(
+        promotion_service_module, "mark_execution_failed", _forbidden_mark_execution_failed
+    )
+
+    with pytest.raises(LigandPromotionAttemptPersistenceError) as exc_info:
         _promote(project_dir)
 
-    assert exc_info.value.status == "execution_failed"
+    failed_attempt_id = exc_info.value.attempt_id
+    assert exc_info.value.input_id == "curcumin-pubchem"
+    assert exc_info.value.phase == "execution"
+    assert exc_info.value.intended_status == "succeeded"
+    assert exc_info.value.persistence_error is poisoned_error
+    assert exc_info.value.original_error is poisoned_error
+    assert exc_info.value.__cause__ is poisoned_error
+
     # the promotion record, entity, and state are ALL intact - a status
-    # persistence failure after commit never undoes the commit.
+    # persistence failure after commit never undoes the commit, and never
+    # compensates anything.
     records = list_promotions_by_input(project_dir, "curcumin-pubchem")
     assert len(records) == 1
     assert load_entity(project_dir, "curcumin").name == "Curcumin"
     assert load_state(project_dir, "curcumin-initial") is not None
+
+    # the ORIGINAL attempt is never persisted with a false terminal status -
+    # it simply stays at its last honestly-persisted status ("resolved").
+    from molecular.promotion_registry import load_promotion_attempt
+
+    original_attempt = load_promotion_attempt(project_dir, failed_attempt_id)
+    assert original_attempt.status == "resolved"
+    assert original_attempt.error is None
+
+    # a subsequent retry is idempotent: it finds the commit marker and
+    # returns success, without duplicating entity, state, or record.
+    retry = _promote(project_dir)
+    assert retry.status == "succeeded"
+    assert retry.id != failed_attempt_id
+    assert retry.result.reused_existing_promotion is True
+    assert retry.result.entity_created is False
+    assert retry.result.state_created is False
+    assert list_promotions_by_input(project_dir, "curcumin-pubchem") == records
 
 
 # --- item 106: residuals survive a persistence failure; the promotion
