@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import typer
 import yaml
 from typer.testing import CliRunner
 
@@ -7217,6 +7218,23 @@ def test_conditions_commands_never_prompt_interactively(tmp_path, monkeypatch): 
 
 
 def test_conditions_app_has_no_forbidden_subcommands(tmp_path, monkeypatch):  # T-089
+    """T-089's own normative intent is that the `conditions` group exposes
+    exactly {add, revise, show, list} - never a fifth command, and never
+    fewer than these four. The primary proof below inspects the Typer
+    app's actually-registered Click commands directly (never the text
+    `--help` happens to render, which could pass even if an unexpected
+    command were hidden from help, or fail on a cosmetic wording change
+    unrelated to which commands exist) - so it fails the moment any fifth
+    command is registered, and fails the moment any of the four required
+    ones is removed. The forbidden-name check below it is kept as
+    additional, non-primary coverage, consistent with Checkpoint 4's
+    CP3-N2 correction (which strengthens, rather than replaces, the
+    original check)."""
+
+    registered_commands = typer.main.get_command(cli_module.conditions_app).commands
+
+    assert set(registered_commands.keys()) == {"add", "revise", "show", "list"}
+
     _init_valid_experiment(tmp_path, monkeypatch)
 
     result = runner.invoke(app, ["conditions", "--help"])
@@ -7295,7 +7313,7 @@ def test_conditions_no_unhandled_exception_escapes_any_command(tmp_path, monkeyp
 # not mocks.
 
 
-def test_conditions_add_produces_exactly_started_then_success_log_entries(tmp_path, monkeypatch):
+def test_conditions_add_produces_exactly_started_then_success_log_entries(tmp_path, monkeypatch):  # additional coverage: CLI-Service-activity boundary
     project = _init_valid_experiment(tmp_path, monkeypatch)
 
     runner.invoke(
@@ -7311,7 +7329,7 @@ def test_conditions_add_produces_exactly_started_then_success_log_entries(tmp_pa
     assert "reused=False" in lines[1]
 
 
-def test_conditions_add_retry_via_cli_logs_reused_true(tmp_path, monkeypatch):
+def test_conditions_add_retry_via_cli_logs_reused_true(tmp_path, monkeypatch):  # additional coverage: CLI-Service-activity boundary
     project = _init_valid_experiment(tmp_path, monkeypatch)
 
     runner.invoke(
@@ -7330,7 +7348,7 @@ def test_conditions_add_retry_via_cli_logs_reused_true(tmp_path, monkeypatch):
     assert "reused=True" in lines[3]
 
 
-def test_conditions_add_fresh_and_retry_log_lines_are_distinguishable(tmp_path, monkeypatch):
+def test_conditions_add_fresh_and_retry_log_lines_are_distinguishable(tmp_path, monkeypatch):  # additional coverage: CLI-Service-activity boundary
     project = _init_valid_experiment(tmp_path, monkeypatch)
 
     runner.invoke(
@@ -7348,7 +7366,7 @@ def test_conditions_add_fresh_and_retry_log_lines_are_distinguishable(tmp_path, 
     assert _strip_timestamp(lines[1]) != _strip_timestamp(lines[3])
 
 
-def test_conditions_cli_never_logs_under_its_own_command_name(tmp_path, monkeypatch):
+def test_conditions_cli_never_logs_under_its_own_command_name(tmp_path, monkeypatch):  # additional coverage: CLI-Service-activity boundary
     """Only command=conditions-declare entries (declare_conditions's own)
     may ever appear - never command=conditions-add/-revise/-show/-list,
     proving the CLI never calls record_activity itself."""
@@ -7380,7 +7398,7 @@ def test_conditions_cli_never_logs_under_its_own_command_name(tmp_path, monkeypa
         assert "command=conditions-declare" in line
 
 
-def test_conditions_add_conflict_does_not_log_false_success(tmp_path, monkeypatch):
+def test_conditions_add_conflict_does_not_log_false_success(tmp_path, monkeypatch):  # additional coverage: CLI-Service-activity boundary
     project = _init_valid_experiment(tmp_path, monkeypatch)
 
     runner.invoke(
@@ -7403,7 +7421,7 @@ def test_conditions_add_conflict_does_not_log_false_success(tmp_path, monkeypatc
     assert all("outcome=success" not in line for line in new_lines)
 
 
-def test_conditions_add_invalid_input_does_not_log_false_success(tmp_path, monkeypatch):
+def test_conditions_add_invalid_input_does_not_log_false_success(tmp_path, monkeypatch):  # additional coverage: CLI-Service-activity boundary
     project = _init_valid_experiment(tmp_path, monkeypatch)
 
     result = runner.invoke(
@@ -7419,7 +7437,7 @@ def test_conditions_add_invalid_input_does_not_log_false_success(tmp_path, monke
     assert "outcome=success" not in (project / "logs" / "activity.log").read_text(encoding="utf-8")
 
 
-def test_conditions_cli_error_banner_matches_service_level_error(tmp_path, monkeypatch):
+def test_conditions_cli_error_banner_matches_service_level_error(tmp_path, monkeypatch):  # additional coverage: CLI-Service-activity boundary
     """The banner the CLI prints is exactly the message the typed
     exception declare_conditions itself raised - not a generic/guessed
     banner invented at the CLI layer."""
@@ -7452,7 +7470,7 @@ def test_conditions_cli_error_banner_matches_service_level_error(tmp_path, monke
 # log pair the frozen spec requires.
 
 
-def test_cli_source_contains_no_declared_at_timestamp_comparison(tmp_path, monkeypatch):
+def test_cli_source_contains_no_declared_at_timestamp_comparison(tmp_path, monkeypatch):  # additional coverage: CP3-M1
     """Static proof for the Checkpoint 3 correction task's own item (11):
     no `declared_at <`/`declared_at >` heuristic, and no `datetime.now`
     call of any kind, remains anywhere in the conditions command block of
@@ -7470,7 +7488,7 @@ def test_cli_source_contains_no_declared_at_timestamp_comparison(tmp_path, monke
     )
 
 
-def test_cli_never_constructs_phpoint_or_phrange_directly(tmp_path, monkeypatch):
+def test_cli_never_constructs_phpoint_or_phrange_directly(tmp_path, monkeypatch):  # additional coverage: CP3-M2
     """Static proof for CP3-M2: PhPoint(...)/PhRange(...) construction no
     longer appears anywhere in cli.py - only PhDeclaration remains, used
     solely to read back and format an already-persisted/returned
@@ -7481,7 +7499,7 @@ def test_cli_never_constructs_phpoint_or_phrange_directly(tmp_path, monkeypatch)
     assert "PhRange(" not in source
 
 
-def test_conditions_add_output_reused_matches_frozen_clock_service_outcome(tmp_path, monkeypatch):
+def test_conditions_add_output_reused_matches_frozen_clock_service_outcome(tmp_path, monkeypatch):  # additional coverage: CP3-M1
     """Adversarial scenario, now via the real CLI: with the Application
     Service's own clock frozen (so the pre-correction CLI heuristic would
     have failed, as proven in INCREMENT_019_CHECKPOINT_3_MICRO_REVIEW.md,
@@ -7520,7 +7538,7 @@ def test_conditions_add_output_reused_matches_frozen_clock_service_outcome(tmp_p
 
 def test_conditions_add_output_reused_matches_service_outcome_for_future_dated_record(
     tmp_path, monkeypatch
-):
+):  # additional coverage: CP3-M1
     """Adversarial scenario, now via the real CLI: a pre-existing, valid
     record with declared_at ten years in the future (nothing in the
     schema forbids this) must still be announced by the CLI as a
@@ -7556,7 +7574,7 @@ def test_conditions_add_output_reused_matches_service_outcome_for_future_dated_r
     assert "Result: existing declaration reused" in result.output
 
 
-def test_conditions_add_output_never_shows_reused_for_a_genuine_fresh_creation(tmp_path, monkeypatch):
+def test_conditions_add_output_never_shows_reused_for_a_genuine_fresh_creation(tmp_path, monkeypatch):  # additional coverage: CP3-M1
     _init_valid_experiment(tmp_path, monkeypatch)
 
     result = runner.invoke(
@@ -7567,7 +7585,7 @@ def test_conditions_add_output_never_shows_reused_for_a_genuine_fresh_creation(t
     assert "Result: existing declaration reused" not in result.output
 
 
-def test_conditions_add_decimal_constraint_violation_logs_started_then_error(tmp_path, monkeypatch):
+def test_conditions_add_decimal_constraint_violation_logs_started_then_error(tmp_path, monkeypatch):  # additional coverage: CP3-M2
     """T-075 reconciled against the Checkpoint 3 correction: the three
     decimal_* constraint violations now flow through
     declare_conditions_from_values (the Application Service), so the
@@ -7603,7 +7621,7 @@ def test_conditions_add_decimal_constraint_violation_logs_started_then_error(tmp
 )
 def test_conditions_add_each_decimal_constraint_logs_started_then_error(
     tmp_path, monkeypatch, ph_value
-):
+):  # additional coverage: CP3-M2
     """T-075, all three constraints individually, each confirmed to
     reach the Application Service's own logging boundary."""
 

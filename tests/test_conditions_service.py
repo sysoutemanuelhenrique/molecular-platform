@@ -633,7 +633,7 @@ def _freeze_service_clock(monkeypatch, frozen_instant: datetime) -> None:
     monkeypatch.setattr("molecular.conditions_service.datetime", _FrozenDateTime)
 
 
-def test_declare_from_values_fresh_creation_returns_outcome_with_reused_false(tmp_path):
+def test_declare_from_values_fresh_creation_returns_outcome_with_reused_false(tmp_path):  # additional coverage: CP3-M1
     outcome = declare_conditions_from_values(
         tmp_path,
         conditions_id="ph-values-001",
@@ -648,7 +648,7 @@ def test_declare_from_values_fresh_creation_returns_outcome_with_reused_false(tm
     assert load_conditions(tmp_path, "ph-values-001") == outcome.declaration
 
 
-def test_declare_from_values_equivalent_retry_returns_outcome_with_reused_true(tmp_path):
+def test_declare_from_values_equivalent_retry_returns_outcome_with_reused_true(tmp_path):  # additional coverage: CP3-M1
     first = declare_conditions_from_values(
         tmp_path,
         conditions_id="ph-values-001",
@@ -669,7 +669,7 @@ def test_declare_from_values_equivalent_retry_returns_outcome_with_reused_true(t
     assert retried.declaration == first.declaration
 
 
-def test_frozen_clock_creation_and_retry_classify_correctly(tmp_path, monkeypatch):
+def test_frozen_clock_creation_and_retry_classify_correctly(tmp_path, monkeypatch):  # additional coverage: CP3-M1
     """Adversarial scenarios (3)/(4)/(7) from the Checkpoint 3 correction
     task: a completely frozen (or arbitrarily low-resolution) clock means
     the original creation's declared_at and any later retry's own
@@ -701,7 +701,7 @@ def test_frozen_clock_creation_and_retry_classify_correctly(tmp_path, monkeypatc
     assert first.declaration.declared_at == second.declaration.declared_at == frozen
 
 
-def test_retry_against_a_future_dated_existing_record_is_still_recognized_as_reused(tmp_path):
+def test_retry_against_a_future_dated_existing_record_is_still_recognized_as_reused(tmp_path):  # additional coverage: CP3-M1
     """Adversarial scenario (5): a persisted record with declared_at set
     in the future - nothing in the schema forbids this; only
     tz-awareness is validated (Section 15 of conditions.py) - must still
@@ -739,7 +739,7 @@ def test_retry_against_a_future_dated_existing_record_is_still_recognized_as_reu
     assert outcome.reused is True
 
 
-def test_retry_recognized_regardless_of_persisted_record_utc_offset_representation(tmp_path):
+def test_retry_recognized_regardless_of_persisted_record_utc_offset_representation(tmp_path):  # additional coverage: CP3-M1
     """Adversarial scenario (6): a persisted record whose declared_at was
     authored with a non-UTC offset must not affect retry classification
     - declared_at of any kind, any offset, never participates in the
@@ -773,7 +773,7 @@ def test_retry_recognized_regardless_of_persisted_record_utc_offset_representati
     assert outcome.reused is True
 
 
-def test_retry_recognized_after_a_real_elapsed_delay(tmp_path):
+def test_retry_recognized_after_a_real_elapsed_delay(tmp_path):  # additional coverage: CP3-M1
     """Adversarial scenario (8): a retry separated by a real elapsed
     delay (standing in for "a later process") must classify identically
     to an immediate retry - proving correctness never depended on timing
@@ -801,7 +801,7 @@ def test_retry_recognized_after_a_real_elapsed_delay(tmp_path):
     assert second.declaration == first.declaration
 
 
-def test_conflict_from_values_raises_instead_of_returning_an_outcome(tmp_path):
+def test_conflict_from_values_raises_instead_of_returning_an_outcome(tmp_path):  # additional coverage: CP3-M1
     """Adversarial scenario (9): a genuine conflict never returns a
     ConditionsDeclarationOutcome at all - it raises, exactly like
     declare_conditions already did."""
@@ -824,7 +824,7 @@ def test_conflict_from_values_raises_instead_of_returning_an_outcome(tmp_path):
         )
 
 
-def test_corrupted_existing_record_from_values_raises_instead_of_returning_an_outcome(tmp_path):
+def test_corrupted_existing_record_from_values_raises_instead_of_returning_an_outcome(tmp_path):  # additional coverage: CP3-M1
     """Adversarial scenario (10): a corrupted colliding record never
     returns a ConditionsDeclarationOutcome - it raises
     ConditionsRecordInvalidError, exactly like declare_conditions
@@ -856,7 +856,7 @@ def test_corrupted_existing_record_from_values_raises_instead_of_returning_an_ou
 )
 def test_declare_from_values_decimal_constraint_violation_raises_conditions_validation_error(
     tmp_path, ph_kwargs, expected_native_error
-):
+):  # additional coverage: CP3-M2
     """CP3-M2: the three decimal_* constraint violations, exercised via
     declare_conditions_from_values (the Application Service builds
     PhPoint itself), raise ConditionsValidationError with the original
@@ -876,7 +876,7 @@ def test_declare_from_values_decimal_constraint_violation_raises_conditions_vali
     assert expected_native_error in str(excinfo.value)
 
 
-def test_declare_from_values_inverted_range_raises_validation_error_with_cause(tmp_path):
+def test_declare_from_values_inverted_range_raises_validation_error_with_cause(tmp_path):  # additional coverage: CP3-M2
     with pytest.raises(ConditionsValidationError) as excinfo:
         declare_conditions_from_values(
             tmp_path,
@@ -890,7 +890,7 @@ def test_declare_from_values_inverted_range_raises_validation_error_with_cause(t
     assert isinstance(excinfo.value.__cause__, ValidationError)
 
 
-def test_declare_from_values_point_and_range_both_given_raises_validation_error(tmp_path):
+def test_declare_from_values_point_and_range_both_given_raises_validation_error(tmp_path):  # additional coverage: CP3-M2
     with pytest.raises(ConditionsValidationError):
         declare_conditions_from_values(
             tmp_path,
@@ -903,7 +903,7 @@ def test_declare_from_values_point_and_range_both_given_raises_validation_error(
         )
 
 
-def test_declare_from_values_neither_point_nor_range_given_raises_validation_error(tmp_path):
+def test_declare_from_values_neither_point_nor_range_given_raises_validation_error(tmp_path):  # additional coverage: CP3-M2
     with pytest.raises(ConditionsValidationError):
         declare_conditions_from_values(
             tmp_path,
@@ -913,7 +913,7 @@ def test_declare_from_values_neither_point_nor_range_given_raises_validation_err
         )
 
 
-def test_declare_from_values_decimal_violation_logs_started_then_error_never_success(tmp_path):
+def test_declare_from_values_decimal_violation_logs_started_then_error_never_success(tmp_path):  # additional coverage: CP3-M2
     """CP3-M2's core proof: unlike the pre-correction CLI (which built
     PhPoint one layer up and never called the Service at all for this
     failure), this failure now produces exactly the started+error pair
@@ -935,7 +935,7 @@ def test_declare_from_values_decimal_violation_logs_started_then_error_never_suc
     assert all("outcome=success" not in line for line in lines)
 
 
-def test_declare_from_values_validation_failure_leaves_no_partial_file(tmp_path):
+def test_declare_from_values_validation_failure_leaves_no_partial_file(tmp_path):  # additional coverage: CP3-M2
     with pytest.raises(ConditionsValidationError):
         declare_conditions_from_values(
             tmp_path,
@@ -948,7 +948,7 @@ def test_declare_from_values_validation_failure_leaves_no_partial_file(tmp_path)
     assert not (_conditions_dir(tmp_path) / "ph-bad-006.yaml").exists()
 
 
-def test_declare_from_values_keyboard_interrupt_is_never_swallowed(tmp_path, monkeypatch):
+def test_declare_from_values_keyboard_interrupt_is_never_swallowed(tmp_path, monkeypatch):  # additional coverage: CP3-M2
     def _interrupt(*args, **kwargs):
         raise KeyboardInterrupt()
 
@@ -964,7 +964,7 @@ def test_declare_from_values_keyboard_interrupt_is_never_swallowed(tmp_path, mon
         )
 
 
-def test_declare_from_values_system_exit_is_never_swallowed(tmp_path, monkeypatch):
+def test_declare_from_values_system_exit_is_never_swallowed(tmp_path, monkeypatch):  # additional coverage: CP3-M2
     def _exit(*args, **kwargs):
         raise SystemExit(1)
 
@@ -980,7 +980,7 @@ def test_declare_from_values_system_exit_is_never_swallowed(tmp_path, monkeypatc
         )
 
 
-def test_declare_conditions_and_declare_conditions_from_values_share_one_core(tmp_path):
+def test_declare_conditions_and_declare_conditions_from_values_share_one_core(tmp_path):  # additional coverage: CP3-M1
     """Proves there are not two declaration algorithms: a declaration
     created via the pre-built-ph entry point (declare_conditions) is
     recognized as an equivalent retry by the raw-values entry point
