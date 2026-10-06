@@ -239,6 +239,11 @@ def test_naive_declared_at_rejected():  # T-027
         _declaration(declared_at=datetime(2026, 1, 1))
 
 
+def test_declared_by_whitespace_only_rejected():  # CP1-M1
+    with pytest.raises(ValidationError):
+        _declaration(declared_by="   ")
+
+
 def test_missing_declared_by_rejected():  # T-029
     with pytest.raises(ValidationError):
         ScientificConditionsDeclaration(
