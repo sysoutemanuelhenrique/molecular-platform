@@ -26,7 +26,11 @@ This module owns:
     a FileExistsError/OSError subtype);
   - best-effort activity logging (started/success/error), via the
     project's existing record_activity primitive - a logging failure can
-    never change this function's own outcome or returned value.
+    never change this function's own outcome or returned value. A
+    recognized retry's success entry carries reused=True (Section 19.1
+    step 6's "reused" annotation); every other logged event - fresh
+    creation's success entry included - carries reused=False, so the two
+    kinds of success are never byte-identical in the activity log.
 
 declare_conditions never catches KeyboardInterrupt or SystemExit: every
 except clause below names a specific Exception subtype, never a bare
@@ -41,7 +45,7 @@ ExecutionResult/Evidence remain untouched and unmodeled (Section 7.2 of
 the frozen spec).
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Optional, Tuple
@@ -113,11 +117,18 @@ class ConditionsActivityDetails:
     DerivedStateActivityDetails/TautomerEnumerationActivityDetails in
     application.py: every field is a specific, known correlation value,
     never arbitrary metadata.
+
+    reused distinguishes, in the activity log itself, a recognized-retry
+    success (Section 19.1 step 6's "reused" annotation, reused=True) from
+    every other logged event, including a fresh creation's own success
+    (reused=False) - the default, and the only value ever used outside
+    step 6's reuse branch.
     """
 
     conditions_id: str
     supersedes_id: Optional[str]
     declared_by: str
+    reused: bool = False
 
 
 def _record_activity_safely(
@@ -237,7 +248,9 @@ def declare_conditions(
 
         diverging = _diverging_fields(existing, candidate)
         if not diverging:
-            _record_activity_safely(project_dir, outcome="success", details=details)
+            _record_activity_safely(
+                project_dir, outcome="success", details=replace(details, reused=True)
+            )
             return existing
 
         _record_activity_safely(project_dir, outcome="error", details=details)
