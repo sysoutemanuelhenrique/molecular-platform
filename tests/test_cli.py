@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -6744,10 +6745,13 @@ def test_ligand_promote_end_to_end_real_rdkit_flow(tmp_path, monkeypatch):
 # own in this range is marked "additional coverage" instead, never given
 # a T-NNN it does not actually prove.
 #
-# declare_conditions already owns its own best-effort started/success/
-# error activity logging (Section 22.6) - several tests below exist
-# specifically to prove the CLI never adds a second, duplicate logging
-# path of its own (Section 11 of the governing Checkpoint 3 task).
+# declare_conditions_from_values already owns its own best-effort
+# started/success/error activity logging (Section 22.6) AND already
+# decides the factual created/reused outcome itself - several tests
+# below exist specifically to prove the CLI never adds a second,
+# duplicate logging path of its own (Section 11 of the governing
+# Checkpoint 3 task), and never re-derives created/reused from a clock
+# reading (the Checkpoint 3 correction task, resolving CP3-M1/CP3-M2).
 
 
 def _corrupt_conditions_record(project: Path, conditions_id: str) -> Path:
@@ -7434,3 +7438,185 @@ def test_conditions_cli_error_banner_matches_service_level_error(tmp_path, monke
     assert result.exit_code == 1
     assert "STORAGE ERROR" in result.output
     assert "failed to persist conditions declaration 'ph-001'" in result.output
+
+
+# --- conditions: Checkpoint 3 correction (CP3-M1/CP3-M2) ---
+#
+# CP3-M1: the CLI no longer infers created-vs-reused from any clock
+# reading - it uses the Application Service's own explicit, factual
+# ConditionsDeclarationOutcome.reused. CP3-M2: PhPoint/PhRange/
+# PhDeclaration are no longer constructed in the CLI at all - the three
+# decimal_* constraints, an inverted range, and the point/range
+# exclusivity rule are all Application Service concerns now, reachable
+# via declare_conditions_from_values, with the started/error activity
+# log pair the frozen spec requires.
+
+
+def test_cli_source_contains_no_declared_at_timestamp_comparison(tmp_path, monkeypatch):
+    """Static proof for the Checkpoint 3 correction task's own item (11):
+    no `declared_at <`/`declared_at >` heuristic, and no `datetime.now`
+    call of any kind, remains anywhere in the conditions command block of
+    cli.py - the clock is never consulted by the CLI to classify
+    created-vs-reused."""
+
+    source = inspect.getsource(cli_module)
+    conditions_block = source[source.index("# --- conditions add/revise/show/list ---"):]
+
+    assert "declared_at <" not in conditions_block
+    assert "declared_at >" not in conditions_block
+    assert "datetime.now" not in conditions_block
+    assert "record_activity" not in conditions_block.replace(
+        "# calls record_activity, directly or via _record_activity_safely, at any", ""
+    )
+
+
+def test_cli_never_constructs_phpoint_or_phrange_directly(tmp_path, monkeypatch):
+    """Static proof for CP3-M2: PhPoint(...)/PhRange(...) construction no
+    longer appears anywhere in cli.py - only PhDeclaration remains, used
+    solely to read back and format an already-persisted/returned
+    declaration's ph field (_format_ph), never to build one."""
+
+    source = inspect.getsource(cli_module)
+    assert "PhPoint(" not in source
+    assert "PhRange(" not in source
+
+
+def test_conditions_add_output_reused_matches_frozen_clock_service_outcome(tmp_path, monkeypatch):
+    """Adversarial scenario, now via the real CLI: with the Application
+    Service's own clock frozen (so the pre-correction CLI heuristic would
+    have failed, as proven in INCREMENT_019_CHECKPOINT_3_MICRO_REVIEW.md,
+    Section 6), the CLI's own "Result: existing declaration reused" line
+    must still appear on the second call, matching the Service's real,
+    factual outcome exactly - never a clock-derived guess."""
+
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+
+    frozen = datetime.now(timezone.utc)
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return frozen
+
+    monkeypatch.setattr("molecular.conditions_service.datetime", _FrozenDateTime)
+
+    first = runner.invoke(
+        app, ["conditions", "add", "exp001", "ph-frozen-001", "--ph", "7.4", "--declared-by", "Dr. X"]
+    )
+    second = runner.invoke(
+        app, ["conditions", "add", "exp001", "ph-frozen-001", "--ph", "7.4", "--declared-by", "Dr. X"]
+    )
+
+    assert first.exit_code == 0
+    assert "Result: existing declaration reused" not in first.output
+    assert second.exit_code == 0
+    assert "Result: existing declaration reused" in second.output
+
+    log_text = (project / "logs" / "activity.log").read_text(encoding="utf-8")
+    lines = log_text.splitlines()
+    assert "reused=False" in lines[1]
+    assert "reused=True" in lines[3]
+
+
+def test_conditions_add_output_reused_matches_service_outcome_for_future_dated_record(
+    tmp_path, monkeypatch
+):
+    """Adversarial scenario, now via the real CLI: a pre-existing, valid
+    record with declared_at ten years in the future (nothing in the
+    schema forbids this) must still be announced by the CLI as a
+    recognized reuse when retried with identical content - this is the
+    exact scenario that proved CP3-M1 wrong before this correction."""
+
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+    cond_dir = project / "scientific" / "experimental_conditions"
+    cond_dir.mkdir(parents=True)
+    future_iso = (datetime.now(timezone.utc) + timedelta(days=3650)).isoformat()
+    record = {
+        "schema_version": "1.0",
+        "id": "ph-future-001",
+        "ph": {"point": {"value": "7.4"}, "range": None},
+        "purpose": "simulation_input",
+        "declared_by": "Dr. Jane Doe",
+        "label": None,
+        "rationale": None,
+        "supersedes_id": None,
+        "declared_at": future_iso,
+    }
+    (cond_dir / "ph-future-001.yaml").write_text(yaml.safe_dump(record, sort_keys=False), encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "conditions", "add", "exp001", "ph-future-001",
+            "--ph", "7.4", "--declared-by", "Dr. Jane Doe",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Result: existing declaration reused" in result.output
+
+
+def test_conditions_add_output_never_shows_reused_for_a_genuine_fresh_creation(tmp_path, monkeypatch):
+    _init_valid_experiment(tmp_path, monkeypatch)
+
+    result = runner.invoke(
+        app, ["conditions", "add", "exp001", "ph-001", "--ph", "7.4", "--declared-by", "Dr. Jane Doe"]
+    )
+
+    assert result.exit_code == 0
+    assert "Result: existing declaration reused" not in result.output
+
+
+def test_conditions_add_decimal_constraint_violation_logs_started_then_error(tmp_path, monkeypatch):
+    """T-075 reconciled against the Checkpoint 3 correction: the three
+    decimal_* constraint violations now flow through
+    declare_conditions_from_values (the Application Service), so the
+    activity log carries the started+error pair Section 19.1/23 require
+    - never silently zero entries, as it did before this correction
+    (CP3-M2)."""
+
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+
+    result = runner.invoke(
+        app, ["conditions", "add", "exp001", "ph-bad-001", "--ph", "1234567", "--declared-by", "Dr. X"]
+    )
+
+    assert result.exit_code == 1
+    assert "INPUT ERROR" in result.output
+
+    log_file = project / "logs" / "activity.log"
+    assert log_file.exists()
+    lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    assert "outcome=started" in lines[0]
+    assert "outcome=error" in lines[1]
+    assert all("outcome=success" not in line for line in lines)
+
+
+@pytest.mark.parametrize(
+    "ph_value",
+    [
+        "1000000",  # decimal_whole_digits
+        "1.1234567",  # decimal_max_places
+        "1234567.123456",  # decimal_max_digits
+    ],
+)
+def test_conditions_add_each_decimal_constraint_logs_started_then_error(
+    tmp_path, monkeypatch, ph_value
+):
+    """T-075, all three constraints individually, each confirmed to
+    reach the Application Service's own logging boundary."""
+
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+
+    result = runner.invoke(
+        app, ["conditions", "add", "exp001", "ph-bad", "--ph", ph_value, "--declared-by", "Dr. X"]
+    )
+
+    assert result.exit_code == 1
+    assert "INPUT ERROR" in result.output
+
+    log_text = (project / "logs" / "activity.log").read_text(encoding="utf-8")
+    assert "outcome=started" in log_text
+    assert "outcome=error" in log_text
+    assert "outcome=success" not in log_text

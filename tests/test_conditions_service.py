@@ -26,22 +26,35 @@ Application Service's own intrinsic best-effort logging calls (Section
 19.1/23 of the frozen spec assigns T-067-T-069 to this exact layer) - the
 CLI itself, and confirmation that the CLI never double-logs, remain
 Checkpoint 3's responsibility.
+
+Checkpoint 3 correction (CP3-M1/CP3-M2, following
+INCREMENT_019_CHECKPOINT_3_MICRO_REVIEW.md): a new section below tests
+declare_conditions_from_values and ConditionsDeclarationOutcome - the
+Application Service's own factual created/reused outcome, and its own
+construction of PhPoint/PhRange/PhDeclaration from raw Decimal values
+(previously done one layer up, in the CLI, which could neither report
+the outcome factually nor log pH validation failures). declare_conditions
+itself is untouched in observable behavior - see the unmodified tests
+above and below - since both entry points now share one private core.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from molecular.conditions import PhDeclaration, PhPoint
 from molecular.conditions_registry import ConditionsRecordInvalidError, _conditions_dir
 from molecular.conditions_service import (
     ConditionsDeclarationConflictError,
+    ConditionsDeclarationOutcome,
     ConditionsPersistenceError,
     ConditionsPredecessorNotFoundError,
     ConditionsValidationError,
     declare_conditions,
+    declare_conditions_from_values,
     list_conditions,
     load_conditions,
 )
@@ -599,3 +612,412 @@ def test_list_conditions_does_not_write_to_the_activity_log(tmp_path):  # additi
 
     lines_after = _activity_lines(tmp_path)
     assert lines_after == lines_before
+
+
+# --- Checkpoint 3 correction: declare_conditions_from_values /
+# ConditionsDeclarationOutcome (CP3-M1: factual created/reused outcome;
+# CP3-M2: ph construction/validation moved into the Application Service) ---
+
+
+def _freeze_service_clock(monkeypatch, frozen_instant: datetime) -> None:
+    """Replace this module's own `datetime` with a subclass whose `now()`
+    always returns `frozen_instant` - the only way to prove that
+    classification no longer depends on the clock advancing at all
+    between two calls."""
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return frozen_instant
+
+    monkeypatch.setattr("molecular.conditions_service.datetime", _FrozenDateTime)
+
+
+def test_declare_from_values_fresh_creation_returns_outcome_with_reused_false(tmp_path):
+    outcome = declare_conditions_from_values(
+        tmp_path,
+        conditions_id="ph-values-001",
+        ph_point=Decimal("7.4"),
+        purpose="simulation_input",
+        declared_by="Dr. Jane Doe",
+    )
+
+    assert isinstance(outcome, ConditionsDeclarationOutcome)
+    assert outcome.reused is False
+    assert outcome.declaration.id == "ph-values-001"
+    assert load_conditions(tmp_path, "ph-values-001") == outcome.declaration
+
+
+def test_declare_from_values_equivalent_retry_returns_outcome_with_reused_true(tmp_path):
+    first = declare_conditions_from_values(
+        tmp_path,
+        conditions_id="ph-values-001",
+        ph_point=Decimal("7.4"),
+        purpose="simulation_input",
+        declared_by="Dr. Jane Doe",
+    )
+
+    retried = declare_conditions_from_values(
+        tmp_path,
+        conditions_id="ph-values-001",
+        ph_point=Decimal("7.4"),
+        purpose="simulation_input",
+        declared_by="Dr. Jane Doe",
+    )
+
+    assert retried.reused is True
+    assert retried.declaration == first.declaration
+
+
+def test_frozen_clock_creation_and_retry_classify_correctly(tmp_path, monkeypatch):
+    """Adversarial scenarios (3)/(4)/(7) from the Checkpoint 3 correction
+    task: a completely frozen (or arbitrarily low-resolution) clock means
+    the original creation's declared_at and any later retry's own
+    declared_at-if-it-were-fresh would be byte-identical - and this must
+    not affect classification at all, since `reused` is never inferred
+    from any timestamp comparison any more. This is the exact scenario
+    that proved CP3-M1 wrong at the CLI layer before this correction."""
+
+    frozen = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    _freeze_service_clock(monkeypatch, frozen)
+
+    first = declare_conditions_from_values(
+        tmp_path,
+        conditions_id="ph-frozen-001",
+        ph_point=Decimal("7.4"),
+        purpose="simulation_input",
+        declared_by="Dr. X",
+    )
+    second = declare_conditions_from_values(
+        tmp_path,
+        conditions_id="ph-frozen-001",
+        ph_point=Decimal("7.4"),
+        purpose="simulation_input",
+        declared_by="Dr. X",
+    )
+
+    assert first.reused is False
+    assert second.reused is True
+    assert first.declaration.declared_at == second.declaration.declared_at == frozen
+
+
+def test_retry_against_a_future_dated_existing_record_is_still_recognized_as_reused(tmp_path):
+    """Adversarial scenario (5): a persisted record with declared_at set
+    in the future - nothing in the schema forbids this; only
+    tz-awareness is validated (Section 15 of conditions.py) - must still
+    be recognized as a safe retry. The comparison never involves
+    declared_at at all (Section 16.1); only ph/purpose/declared_by/
+    label/rationale/supersedes_id participate. This is the exact scenario
+    that proved CP3-M1 wrong at the CLI layer before this correction."""
+
+    conditions_dir = _conditions_dir(tmp_path)
+    conditions_dir.mkdir(parents=True)
+    future_iso = (datetime.now(timezone.utc) + timedelta(days=3650)).isoformat()
+    record = {
+        "schema_version": "1.0",
+        "id": "ph-future-001",
+        "ph": {"point": {"value": "7.4"}, "range": None},
+        "purpose": "simulation_input",
+        "declared_by": "Dr. Jane Doe",
+        "label": None,
+        "rationale": None,
+        "supersedes_id": None,
+        "declared_at": future_iso,
+    }
+    (conditions_dir / "ph-future-001.yaml").write_text(
+        yaml.safe_dump(record, sort_keys=False), encoding="utf-8"
+    )
+
+    outcome = declare_conditions_from_values(
+        tmp_path,
+        conditions_id="ph-future-001",
+        ph_point=Decimal("7.4"),
+        purpose="simulation_input",
+        declared_by="Dr. Jane Doe",
+    )
+
+    assert outcome.reused is True
+
+
+def test_retry_recognized_regardless_of_persisted_record_utc_offset_representation(tmp_path):
+    """Adversarial scenario (6): a persisted record whose declared_at was
+    authored with a non-UTC offset must not affect retry classification
+    - declared_at of any kind, any offset, never participates in the
+    comparison at all."""
+
+    conditions_dir = _conditions_dir(tmp_path)
+    conditions_dir.mkdir(parents=True)
+    record = {
+        "schema_version": "1.0",
+        "id": "ph-offset-001",
+        "ph": {"point": {"value": "7.4"}, "range": None},
+        "purpose": "simulation_input",
+        "declared_by": "Dr. Jane Doe",
+        "label": None,
+        "rationale": None,
+        "supersedes_id": None,
+        "declared_at": "2025-01-01T12:00:00+05:00",
+    }
+    (conditions_dir / "ph-offset-001.yaml").write_text(
+        yaml.safe_dump(record, sort_keys=False), encoding="utf-8"
+    )
+
+    outcome = declare_conditions_from_values(
+        tmp_path,
+        conditions_id="ph-offset-001",
+        ph_point=Decimal("7.4"),
+        purpose="simulation_input",
+        declared_by="Dr. Jane Doe",
+    )
+
+    assert outcome.reused is True
+
+
+def test_retry_recognized_after_a_real_elapsed_delay(tmp_path):
+    """Adversarial scenario (8): a retry separated by a real elapsed
+    delay (standing in for "a later process") must classify identically
+    to an immediate retry - proving correctness never depended on timing
+    in either direction."""
+
+    import time
+
+    first = declare_conditions_from_values(
+        tmp_path,
+        conditions_id="ph-delay-001",
+        ph_point=Decimal("7.4"),
+        purpose="simulation_input",
+        declared_by="Dr. X",
+    )
+    time.sleep(0.05)
+    second = declare_conditions_from_values(
+        tmp_path,
+        conditions_id="ph-delay-001",
+        ph_point=Decimal("7.4"),
+        purpose="simulation_input",
+        declared_by="Dr. X",
+    )
+
+    assert second.reused is True
+    assert second.declaration == first.declaration
+
+
+def test_conflict_from_values_raises_instead_of_returning_an_outcome(tmp_path):
+    """Adversarial scenario (9): a genuine conflict never returns a
+    ConditionsDeclarationOutcome at all - it raises, exactly like
+    declare_conditions already did."""
+
+    declare_conditions_from_values(
+        tmp_path,
+        conditions_id="ph-conflict-001",
+        ph_point=Decimal("7.4"),
+        purpose="simulation_input",
+        declared_by="Dr. X",
+    )
+
+    with pytest.raises(ConditionsDeclarationConflictError):
+        declare_conditions_from_values(
+            tmp_path,
+            conditions_id="ph-conflict-001",
+            ph_point=Decimal("5.0"),
+            purpose="simulation_input",
+            declared_by="Dr. X",
+        )
+
+
+def test_corrupted_existing_record_from_values_raises_instead_of_returning_an_outcome(tmp_path):
+    """Adversarial scenario (10): a corrupted colliding record never
+    returns a ConditionsDeclarationOutcome - it raises
+    ConditionsRecordInvalidError, exactly like declare_conditions
+    already did."""
+
+    conditions_dir = _conditions_dir(tmp_path)
+    conditions_dir.mkdir(parents=True)
+    (conditions_dir / "ph-corrupt-001.yaml").write_text(
+        "schema_version: '1.0'\nid: [unterminated\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ConditionsRecordInvalidError):
+        declare_conditions_from_values(
+            tmp_path,
+            conditions_id="ph-corrupt-001",
+            ph_point=Decimal("7.4"),
+            purpose="simulation_input",
+            declared_by="Dr. X",
+        )
+
+
+@pytest.mark.parametrize(
+    "ph_kwargs,expected_native_error",
+    [
+        (dict(ph_point=Decimal("1234567")), "decimal_whole_digits"),
+        (dict(ph_point=Decimal("1.1234567")), "decimal_max_places"),
+        (dict(ph_point=Decimal("1234567.123456")), "decimal_max_digits"),
+    ],
+)
+def test_declare_from_values_decimal_constraint_violation_raises_conditions_validation_error(
+    tmp_path, ph_kwargs, expected_native_error
+):
+    """CP3-M2: the three decimal_* constraint violations, exercised via
+    declare_conditions_from_values (the Application Service builds
+    PhPoint itself), raise ConditionsValidationError with the original
+    pydantic.ValidationError preserved as __cause__ - resolving T-075's
+    own literal requirement ("via ConditionsValidationError")."""
+
+    with pytest.raises(ConditionsValidationError) as excinfo:
+        declare_conditions_from_values(
+            tmp_path,
+            conditions_id="ph-bad-001",
+            purpose="simulation_input",
+            declared_by="Dr. Jane Doe",
+            **ph_kwargs,
+        )
+
+    assert isinstance(excinfo.value.__cause__, ValidationError)
+    assert expected_native_error in str(excinfo.value)
+
+
+def test_declare_from_values_inverted_range_raises_validation_error_with_cause(tmp_path):
+    with pytest.raises(ConditionsValidationError) as excinfo:
+        declare_conditions_from_values(
+            tmp_path,
+            conditions_id="ph-bad-002",
+            ph_min=Decimal("8.0"),
+            ph_max=Decimal("6.0"),
+            purpose="simulation_input",
+            declared_by="Dr. X",
+        )
+
+    assert isinstance(excinfo.value.__cause__, ValidationError)
+
+
+def test_declare_from_values_point_and_range_both_given_raises_validation_error(tmp_path):
+    with pytest.raises(ConditionsValidationError):
+        declare_conditions_from_values(
+            tmp_path,
+            conditions_id="ph-bad-003",
+            ph_point=Decimal("7.4"),
+            ph_min=Decimal("6.0"),
+            ph_max=Decimal("8.0"),
+            purpose="simulation_input",
+            declared_by="Dr. X",
+        )
+
+
+def test_declare_from_values_neither_point_nor_range_given_raises_validation_error(tmp_path):
+    with pytest.raises(ConditionsValidationError):
+        declare_conditions_from_values(
+            tmp_path,
+            conditions_id="ph-bad-004",
+            purpose="simulation_input",
+            declared_by="Dr. X",
+        )
+
+
+def test_declare_from_values_decimal_violation_logs_started_then_error_never_success(tmp_path):
+    """CP3-M2's core proof: unlike the pre-correction CLI (which built
+    PhPoint one layer up and never called the Service at all for this
+    failure), this failure now produces exactly the started+error pair
+    Section 19.1/23 require - never silently zero log entries."""
+
+    with pytest.raises(ConditionsValidationError):
+        declare_conditions_from_values(
+            tmp_path,
+            conditions_id="ph-bad-005",
+            ph_point=Decimal("1234567"),
+            purpose="simulation_input",
+            declared_by="Dr. Jane Doe",
+        )
+
+    lines = _activity_lines(tmp_path)
+    assert len(lines) == 2
+    assert "outcome=started" in lines[0]
+    assert "outcome=error" in lines[1]
+    assert all("outcome=success" not in line for line in lines)
+
+
+def test_declare_from_values_validation_failure_leaves_no_partial_file(tmp_path):
+    with pytest.raises(ConditionsValidationError):
+        declare_conditions_from_values(
+            tmp_path,
+            conditions_id="ph-bad-006",
+            ph_point=Decimal("1234567"),
+            purpose="simulation_input",
+            declared_by="Dr. X",
+        )
+
+    assert not (_conditions_dir(tmp_path) / "ph-bad-006.yaml").exists()
+
+
+def test_declare_from_values_keyboard_interrupt_is_never_swallowed(tmp_path, monkeypatch):
+    def _interrupt(*args, **kwargs):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr("molecular.conditions_service.record_activity", _interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        declare_conditions_from_values(
+            tmp_path,
+            conditions_id="ph-values-001",
+            ph_point=Decimal("7.4"),
+            purpose="simulation_input",
+            declared_by="Dr. X",
+        )
+
+
+def test_declare_from_values_system_exit_is_never_swallowed(tmp_path, monkeypatch):
+    def _exit(*args, **kwargs):
+        raise SystemExit(1)
+
+    monkeypatch.setattr("molecular.conditions_service.record_activity", _exit)
+
+    with pytest.raises(SystemExit):
+        declare_conditions_from_values(
+            tmp_path,
+            conditions_id="ph-values-001",
+            ph_point=Decimal("7.4"),
+            purpose="simulation_input",
+            declared_by="Dr. X",
+        )
+
+
+def test_declare_conditions_and_declare_conditions_from_values_share_one_core(tmp_path):
+    """Proves there are not two declaration algorithms: a declaration
+    created via the pre-built-ph entry point (declare_conditions) is
+    recognized as an equivalent retry by the raw-values entry point
+    (declare_conditions_from_values), and vice versa."""
+
+    declare_conditions(
+        tmp_path,
+        conditions_id="ph-shared-001",
+        ph=_point(Decimal("7.4")),
+        purpose="simulation_input",
+        declared_by="Dr. X",
+    )
+
+    outcome = declare_conditions_from_values(
+        tmp_path,
+        conditions_id="ph-shared-001",
+        ph_point=Decimal("7.4"),
+        purpose="simulation_input",
+        declared_by="Dr. X",
+    )
+
+    assert outcome.reused is True
+
+    declare_conditions_from_values(
+        tmp_path,
+        conditions_id="ph-shared-002",
+        ph_point=Decimal("7.4"),
+        purpose="simulation_input",
+        declared_by="Dr. X",
+    )
+
+    retried = declare_conditions(
+        tmp_path,
+        conditions_id="ph-shared-002",
+        ph=_point(Decimal("7.4")),
+        purpose="simulation_input",
+        declared_by="Dr. X",
+    )
+
+    assert retried.id == "ph-shared-002"

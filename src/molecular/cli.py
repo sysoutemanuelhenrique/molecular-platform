@@ -27,14 +27,14 @@ from molecular.atomic import (
     UnsafeRawArtifactPathError,
     atomic_write_text,
 )
-from molecular.conditions import PhDeclaration, PhPoint, PhRange
+from molecular.conditions import PhDeclaration
 from molecular.conditions_registry import ConditionsRecordInvalidError
 from molecular.conditions_service import (
     ConditionsDeclarationConflictError,
     ConditionsPersistenceError,
     ConditionsPredecessorNotFoundError,
     ConditionsValidationError,
-    declare_conditions,
+    declare_conditions_from_values,
     list_conditions,
     load_conditions,
 )
@@ -1821,27 +1821,43 @@ def provenance_show(
 
 # --- conditions add/revise/show/list ---
 #
-# declare_conditions already performs its own best-effort started/success/
-# error activity logging (Section 22.6 of the frozen spec) - no command
-# below calls record_activity, directly or via _record_activity_safely, at
-# any point, including on a pre-flight failure that never reaches
-# declare_conditions. This is deliberately stricter than some earlier
+# declare_conditions_from_values already performs its own best-effort
+# started/success/error activity logging, AND already decides the
+# factual created/reused outcome itself (Section 22.6 of the frozen
+# spec, extended by the Checkpoint 3 correction) - no command below
+# calls record_activity, directly or via _record_activity_safely, at any
+# point, including on a pre-flight failure that never reaches the
+# Application Service. This is deliberately stricter than some earlier
 # commands in this module (e.g. ligand_show, state_derive's own
 # pre-flight checks): for this feature, the CLI layer never owns any
 # activity-log entry of its own, full stop.
+#
+# Checkpoint 3 correction (CP3-M1/CP3-M2): this block no longer
+# constructs PhPoint/PhRange/PhDeclaration itself, and no longer infers
+# created-vs-reused from a clock reading. Both decisions now belong
+# entirely to the Application Service (conditions_service.py) - see
+# _parse_ph_values_or_exit and _declare_conditions_or_exit below.
 
 
-def _parse_ph_or_exit(
+def _parse_ph_values_or_exit(
     ph: Optional[str], ph_min: Optional[str], ph_max: Optional[str]
-) -> PhDeclaration:
-    """Parse --ph / --ph-min + --ph-max into a PhDeclaration, entirely at
-    the CLI boundary, before declare_conditions is ever called (Section
-    22.1 steps 1-3 of the frozen spec).
+) -> Tuple[Optional[Decimal], Optional[Decimal], Optional[Decimal]]:
+    """Parse --ph / --ph-min + --ph-max into raw Decimal value(s) only -
+    never into PhPoint/PhRange/PhDeclaration. Returns
+    (ph_point, ph_min, ph_max), exactly one of which (point) xor (both
+    range bounds) is non-None, ready to pass straight into
+    declare_conditions_from_values.
 
-    Every raw string goes straight to Decimal(...) - never float(...). The
-    64-character length pre-check runs, for every supplied string
-    independently, strictly before any Decimal(...) conversion is
-    attempted for that string.
+    This function's own responsibility ends at Section 22.1 steps 1-3 of
+    the frozen spec: which CLI flags were given (an exclusivity/syntax
+    concern about the options themselves, never a scientific one), the
+    64-character length pre-check, and Decimal(...) conversion - never
+    float(...) - rejecting only a syntactically invalid string
+    (decimal.InvalidOperation). Everything about whether the resulting
+    Decimal(s) are scientifically/structurally valid - the three
+    decimal_* field constraints, an inverted range, or the point/range
+    exclusivity rule itself - is Application Service territory
+    (declare_conditions_from_values), never re-implemented here.
     """
 
     has_ph = ph is not None
@@ -1873,15 +1889,9 @@ def _parse_ph_or_exit(
         typer.echo("pH value is not a valid decimal number.")
         raise typer.Exit(code=1)
 
-    try:
-        if has_ph:
-            return PhDeclaration(point=PhPoint(value=decimals[0]))
-        return PhDeclaration(range=PhRange(minimum=decimals[0], maximum=decimals[1]))
-    except ValidationError as error:
-        typer.echo("INPUT ERROR")
-        typer.echo("pH value is invalid.")
-        _echo_validation_errors(error)
-        raise typer.Exit(code=1)
+    if has_ph:
+        return decimals[0], None, None
+    return None, decimals[0], decimals[1]
 
 
 def _format_ph(ph: PhDeclaration) -> str:
@@ -1890,10 +1900,14 @@ def _format_ph(ph: PhDeclaration) -> str:
     return f"{ph.range.minimum} - {ph.range.maximum}"
 
 
-def _echo_conditions_declaration(declaration, *, reused: bool = False) -> None:
+def _echo_conditions_declaration(declaration, *, reused: bool) -> None:
     """Print a ScientificConditionsDeclaration's real fields - never
     inventing a field the model does not have, never hiding label/
-    rationale/supersedes_id when present."""
+    rationale/supersedes_id when present. `reused` is always the
+    Application Service's own factual determination (never a clock-based
+    inference) - callers that have no such fact (show) pass False
+    explicitly, since reuse recognition does not apply to reading an
+    already-persisted record."""
 
     typer.echo("SCIENTIFIC CONDITIONS DECLARED")
     typer.echo()
@@ -1917,32 +1931,34 @@ def _declare_conditions_or_exit(
     project_dir: Path,
     *,
     conditions_id: str,
-    ph: PhDeclaration,
+    ph_point: Optional[Decimal],
+    ph_min: Optional[Decimal],
+    ph_max: Optional[Decimal],
     purpose: str,
     declared_by: str,
     label: Optional[str],
     rationale: Optional[str],
     supersedes_id: Optional[str],
 ) -> None:
-    """Shared declare/revise flow: exactly one call into declare_conditions,
-    no second persistence path of any kind, and no CLI-level activity
-    logging - declare_conditions already owns its own started/success/
-    error logging (Section 22.6 of the frozen spec).
+    """Shared declare/revise flow: exactly one call into
+    declare_conditions_from_values, no second persistence path of any
+    kind, and no CLI-level activity logging - the Application Service
+    already owns its own started/success/error logging (Section 22.6)
+    and already decides the factual created/reused outcome itself.
 
-    `before` is captured immediately before the call so a recognized,
-    safe retry can be presented distinctly from a fresh creation: a fresh
-    record's declared_at is always generated after `before`; a recognized
-    retry's returned declared_at is always the original record's, from
-    strictly before `before`.
+    No clock reading, no activity-log inspection, no pre-existing-file
+    check, and no pre-load of any kind happens here or anywhere else in
+    this function: `outcome.reused` is used exactly as returned, with no
+    further inference.
     """
 
-    before = datetime.now(timezone.utc)
-
     try:
-        declaration = declare_conditions(
+        outcome = declare_conditions_from_values(
             project_dir,
             conditions_id=conditions_id,
-            ph=ph,
+            ph_point=ph_point,
+            ph_min=ph_min,
+            ph_max=ph_max,
             purpose=purpose,
             declared_by=declared_by,
             label=label,
@@ -1978,7 +1994,7 @@ def _declare_conditions_or_exit(
         typer.echo(str(error))
         raise typer.Exit(code=1)
 
-    _echo_conditions_declaration(declaration, reused=declaration.declared_at < before)
+    _echo_conditions_declaration(outcome.declaration, reused=outcome.reused)
 
 
 @conditions_app.command("add")
@@ -1997,18 +2013,21 @@ def conditions_add(
 
     Never infers, defaults, recommends, or computes a pH - the scientist
     must supply either --ph or both --ph-min/--ph-max explicitly. This
-    command performs no persistence of its own: every write and every
-    idempotency/conflict decision is delegated entirely to
-    declare_conditions.
+    command performs no persistence of its own: every write, every
+    idempotency/conflict decision, and the pH value's own scientific
+    validity are delegated entirely to the Application Service
+    (declare_conditions_from_values).
     """
 
     context = _resolve_experiment_or_exit(experiment)
-    ph_declaration = _parse_ph_or_exit(ph, ph_min, ph_max)
+    ph_point, ph_min_value, ph_max_value = _parse_ph_values_or_exit(ph, ph_min, ph_max)
 
     _declare_conditions_or_exit(
         context.project_dir,
         conditions_id=conditions_id,
-        ph=ph_declaration,
+        ph_point=ph_point,
+        ph_min=ph_min_value,
+        ph_max=ph_max_value,
         purpose=purpose,
         declared_by=declared_by,
         label=label,
@@ -2035,16 +2054,18 @@ def conditions_revise(
     A revision is a brand-new record under its own new conditions_id -
     never an in-place edit of the predecessor, which is never modified by
     this command. No "latest"/"active" declaration is ever selected
-    automatically anywhere in this command or in declare_conditions.
+    automatically anywhere in this command or in the Application Service.
     """
 
     context = _resolve_experiment_or_exit(experiment)
-    ph_declaration = _parse_ph_or_exit(ph, ph_min, ph_max)
+    ph_point, ph_min_value, ph_max_value = _parse_ph_values_or_exit(ph, ph_min, ph_max)
 
     _declare_conditions_or_exit(
         context.project_dir,
         conditions_id=conditions_id,
-        ph=ph_declaration,
+        ph_point=ph_point,
+        ph_min=ph_min_value,
+        ph_max=ph_max_value,
         purpose=purpose,
         declared_by=declared_by,
         label=label,
@@ -2071,7 +2092,7 @@ def conditions_show(experiment: str, conditions_id: str):
         typer.echo(str(error))
         raise typer.Exit(code=1)
 
-    _echo_conditions_declaration(declaration)
+    _echo_conditions_declaration(declaration, reused=False)
 
 
 @conditions_app.command("list")
