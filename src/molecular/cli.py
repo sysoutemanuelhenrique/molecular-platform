@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 import re
 from typing import List, Optional, Tuple
@@ -25,6 +26,17 @@ from molecular.atomic import (
     RawArtifactTypeError,
     UnsafeRawArtifactPathError,
     atomic_write_text,
+)
+from molecular.conditions import PhDeclaration, PhPoint, PhRange
+from molecular.conditions_registry import ConditionsRecordInvalidError
+from molecular.conditions_service import (
+    ConditionsDeclarationConflictError,
+    ConditionsPersistenceError,
+    ConditionsPredecessorNotFoundError,
+    ConditionsValidationError,
+    declare_conditions,
+    list_conditions,
+    load_conditions,
 )
 from molecular.config import load_experiment
 from molecular.context import (
@@ -93,6 +105,7 @@ entity_app = typer.Typer(help="Manage scientific entities.")
 state_app = typer.Typer(help="Manage molecular states.")
 conformer_app = typer.Typer(help="Manage conformers.")
 provenance_app = typer.Typer(help="Query state-transformation provenance.")
+conditions_app = typer.Typer(help="Manage experimental conditions declarations.")
 app.add_typer(ligand_app, name="ligand")
 app.add_typer(protein_app, name="protein")
 app.add_typer(experiment_app, name="experiment")
@@ -100,6 +113,7 @@ app.add_typer(entity_app, name="entity")
 app.add_typer(state_app, name="state")
 app.add_typer(conformer_app, name="conformer")
 app.add_typer(provenance_app, name="provenance")
+app.add_typer(conditions_app, name="conditions")
 
 @app.callback()
 def main():
@@ -1803,3 +1817,298 @@ def provenance_show(
         typer.echo()
 
     _record_activity_safely(context.project_dir, command="provenance-show", outcome="success")
+
+
+# --- conditions add/revise/show/list ---
+#
+# declare_conditions already performs its own best-effort started/success/
+# error activity logging (Section 22.6 of the frozen spec) - no command
+# below calls record_activity, directly or via _record_activity_safely, at
+# any point, including on a pre-flight failure that never reaches
+# declare_conditions. This is deliberately stricter than some earlier
+# commands in this module (e.g. ligand_show, state_derive's own
+# pre-flight checks): for this feature, the CLI layer never owns any
+# activity-log entry of its own, full stop.
+
+
+def _parse_ph_or_exit(
+    ph: Optional[str], ph_min: Optional[str], ph_max: Optional[str]
+) -> PhDeclaration:
+    """Parse --ph / --ph-min + --ph-max into a PhDeclaration, entirely at
+    the CLI boundary, before declare_conditions is ever called (Section
+    22.1 steps 1-3 of the frozen spec).
+
+    Every raw string goes straight to Decimal(...) - never float(...). The
+    64-character length pre-check runs, for every supplied string
+    independently, strictly before any Decimal(...) conversion is
+    attempted for that string.
+    """
+
+    has_ph = ph is not None
+    has_min = ph_min is not None
+    has_max = ph_max is not None
+
+    if has_ph and (has_min or has_max):
+        typer.echo("INPUT ERROR")
+        typer.echo("Provide either --ph or both --ph-min/--ph-max, never both forms.")
+        raise typer.Exit(code=1)
+
+    if not has_ph and not (has_min and has_max):
+        typer.echo("INPUT ERROR")
+        typer.echo("Provide either --ph or both --ph-min and --ph-max.")
+        raise typer.Exit(code=1)
+
+    raw_fields = [("--ph", ph)] if has_ph else [("--ph-min", ph_min), ("--ph-max", ph_max)]
+
+    for option_name, raw_value in raw_fields:
+        if len(raw_value) > 64:
+            typer.echo("INPUT ERROR")
+            typer.echo(f"{option_name} must not exceed 64 characters.")
+            raise typer.Exit(code=1)
+
+    try:
+        decimals = [Decimal(raw_value) for _, raw_value in raw_fields]
+    except InvalidOperation:
+        typer.echo("INPUT ERROR")
+        typer.echo("pH value is not a valid decimal number.")
+        raise typer.Exit(code=1)
+
+    try:
+        if has_ph:
+            return PhDeclaration(point=PhPoint(value=decimals[0]))
+        return PhDeclaration(range=PhRange(minimum=decimals[0], maximum=decimals[1]))
+    except ValidationError as error:
+        typer.echo("INPUT ERROR")
+        typer.echo("pH value is invalid.")
+        _echo_validation_errors(error)
+        raise typer.Exit(code=1)
+
+
+def _format_ph(ph: PhDeclaration) -> str:
+    if ph.point is not None:
+        return str(ph.point.value)
+    return f"{ph.range.minimum} - {ph.range.maximum}"
+
+
+def _echo_conditions_declaration(declaration, *, reused: bool = False) -> None:
+    """Print a ScientificConditionsDeclaration's real fields - never
+    inventing a field the model does not have, never hiding label/
+    rationale/supersedes_id when present."""
+
+    typer.echo("SCIENTIFIC CONDITIONS DECLARED")
+    typer.echo()
+    typer.echo(f"Conditions ID: {declaration.id}")
+    typer.echo(f"pH: {_format_ph(declaration.ph)}")
+    typer.echo(f"Purpose: {declaration.purpose}")
+    typer.echo(f"Declared by: {declaration.declared_by}")
+    typer.echo(f"Declared at: {declaration.declared_at.isoformat()}")
+
+    if declaration.label is not None:
+        typer.echo(f"Label: {declaration.label}")
+    if declaration.rationale is not None:
+        typer.echo(f"Rationale: {declaration.rationale}")
+    if declaration.supersedes_id is not None:
+        typer.echo(f"Supersedes: {declaration.supersedes_id}")
+    if reused:
+        typer.echo("Result: existing declaration reused")
+
+
+def _declare_conditions_or_exit(
+    project_dir: Path,
+    *,
+    conditions_id: str,
+    ph: PhDeclaration,
+    purpose: str,
+    declared_by: str,
+    label: Optional[str],
+    rationale: Optional[str],
+    supersedes_id: Optional[str],
+) -> None:
+    """Shared declare/revise flow: exactly one call into declare_conditions,
+    no second persistence path of any kind, and no CLI-level activity
+    logging - declare_conditions already owns its own started/success/
+    error logging (Section 22.6 of the frozen spec).
+
+    `before` is captured immediately before the call so a recognized,
+    safe retry can be presented distinctly from a fresh creation: a fresh
+    record's declared_at is always generated after `before`; a recognized
+    retry's returned declared_at is always the original record's, from
+    strictly before `before`.
+    """
+
+    before = datetime.now(timezone.utc)
+
+    try:
+        declaration = declare_conditions(
+            project_dir,
+            conditions_id=conditions_id,
+            ph=ph,
+            purpose=purpose,
+            declared_by=declared_by,
+            label=label,
+            rationale=rationale,
+            supersedes_id=supersedes_id,
+        )
+    except ConditionsValidationError as error:
+        typer.echo("INPUT ERROR")
+        typer.echo(str(error))
+        raise typer.Exit(code=1)
+    except ConditionsPredecessorNotFoundError as error:
+        typer.echo("PREDECESSOR NOT FOUND")
+        typer.echo(str(error))
+        raise typer.Exit(code=1)
+    except ConditionsRecordInvalidError as error:
+        # Reachable via two distinct paths when supersedes_id is given
+        # (Section 22.0/22.2's correction): the named predecessor itself
+        # unreadable, or the colliding existing record at conditions_id
+        # unreadable (the same single path `add` always takes). The
+        # command does not need to, and does not, distinguish which -
+        # str(error) already names whichever id actually is unreadable
+        # (never any field read from the unreadable file itself, since by
+        # definition it could not be parsed).
+        typer.echo("RECORD INVALID")
+        typer.echo(str(error))
+        raise typer.Exit(code=1)
+    except ConditionsDeclarationConflictError as error:
+        typer.echo("CONFLICT")
+        typer.echo(str(error))
+        raise typer.Exit(code=1)
+    except ConditionsPersistenceError as error:
+        typer.echo("STORAGE ERROR")
+        typer.echo(str(error))
+        raise typer.Exit(code=1)
+
+    _echo_conditions_declaration(declaration, reused=declaration.declared_at < before)
+
+
+@conditions_app.command("add")
+def conditions_add(
+    experiment: str,
+    conditions_id: str,
+    ph: Optional[str] = typer.Option(None, "--ph"),
+    ph_min: Optional[str] = typer.Option(None, "--ph-min"),
+    ph_max: Optional[str] = typer.Option(None, "--ph-max"),
+    declared_by: str = typer.Option(..., "--declared-by"),
+    purpose: str = typer.Option("simulation_input", "--purpose"),
+    label: Optional[str] = typer.Option(None, "--label"),
+    rationale: Optional[str] = typer.Option(None, "--rationale"),
+):
+    """Declare a new scientist-authored experimental conditions record.
+
+    Never infers, defaults, recommends, or computes a pH - the scientist
+    must supply either --ph or both --ph-min/--ph-max explicitly. This
+    command performs no persistence of its own: every write and every
+    idempotency/conflict decision is delegated entirely to
+    declare_conditions.
+    """
+
+    context = _resolve_experiment_or_exit(experiment)
+    ph_declaration = _parse_ph_or_exit(ph, ph_min, ph_max)
+
+    _declare_conditions_or_exit(
+        context.project_dir,
+        conditions_id=conditions_id,
+        ph=ph_declaration,
+        purpose=purpose,
+        declared_by=declared_by,
+        label=label,
+        rationale=rationale,
+        supersedes_id=None,
+    )
+
+
+@conditions_app.command("revise")
+def conditions_revise(
+    experiment: str,
+    conditions_id: str,
+    supersedes: str = typer.Option(..., "--supersedes"),
+    ph: Optional[str] = typer.Option(None, "--ph"),
+    ph_min: Optional[str] = typer.Option(None, "--ph-min"),
+    ph_max: Optional[str] = typer.Option(None, "--ph-max"),
+    declared_by: str = typer.Option(..., "--declared-by"),
+    purpose: str = typer.Option("simulation_input", "--purpose"),
+    label: Optional[str] = typer.Option(None, "--label"),
+    rationale: Optional[str] = typer.Option(None, "--rationale"),
+):
+    """Declare a new conditions record that explicitly revises --supersedes.
+
+    A revision is a brand-new record under its own new conditions_id -
+    never an in-place edit of the predecessor, which is never modified by
+    this command. No "latest"/"active" declaration is ever selected
+    automatically anywhere in this command or in declare_conditions.
+    """
+
+    context = _resolve_experiment_or_exit(experiment)
+    ph_declaration = _parse_ph_or_exit(ph, ph_min, ph_max)
+
+    _declare_conditions_or_exit(
+        context.project_dir,
+        conditions_id=conditions_id,
+        ph=ph_declaration,
+        purpose=purpose,
+        declared_by=declared_by,
+        label=label,
+        rationale=rationale,
+        supersedes_id=supersedes,
+    )
+
+
+@conditions_app.command("show")
+def conditions_show(experiment: str, conditions_id: str):
+    """Show a declared experimental conditions record."""
+
+    context = _resolve_experiment_or_exit(experiment)
+    validated_id = _validate_id_or_exit(conditions_id)
+
+    try:
+        declaration = load_conditions(context.project_dir, validated_id)
+    except FileNotFoundError as error:
+        typer.echo("NOT FOUND")
+        typer.echo(str(error))
+        raise typer.Exit(code=1)
+    except ConditionsRecordInvalidError as error:
+        typer.echo("RECORD INVALID")
+        typer.echo(str(error))
+        raise typer.Exit(code=1)
+
+    _echo_conditions_declaration(declaration)
+
+
+@conditions_app.command("list")
+def conditions_list(experiment: str):
+    """List every declared experimental conditions record for an experiment.
+
+    The order is exactly the (declared_at, id) order list_conditions
+    itself returns, unmodified - no re-sorting, no filter, no "current"/
+    "active"/"latest" ranking of any kind.
+    """
+
+    context = _resolve_experiment_or_exit(experiment)
+
+    try:
+        declarations = list_conditions(context.project_dir)
+    except ConditionsRecordInvalidError as error:
+        typer.echo("RECORD INVALID")
+        typer.echo(str(error))
+        raise typer.Exit(code=1)
+
+    typer.echo("CONDITIONS")
+    typer.echo()
+
+    if not declarations:
+        typer.echo(
+            "No experimental conditions declared for experiment "
+            f"'{context.config.experiment_id}'."
+        )
+        return
+
+    for declaration in declarations:
+        fields = [
+            f"ph={_format_ph(declaration.ph)}",
+            f"purpose={declaration.purpose}",
+            f"declared_by={declaration.declared_by}",
+            f"declared_at={declaration.declared_at.isoformat()}",
+        ]
+        if declaration.supersedes_id is not None:
+            fields.append(f"supersedes={declaration.supersedes_id}")
+        typer.echo(f"{declaration.id}  ({', '.join(fields)})")

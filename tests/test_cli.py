@@ -1,3 +1,4 @@
+import decimal
 import importlib.util
 import inspect
 import os
@@ -6732,3 +6733,704 @@ def test_ligand_promote_end_to_end_real_rdkit_flow(tmp_path, monkeypatch):
     second = runner.invoke(app, _promote_cli_args())
     assert second.exit_code == 0, second.output
     assert "Result: existing promotion reused" in second.output
+
+
+# --- conditions add/revise/show/list (Increment 019, Checkpoint 3) ---
+#
+# Covers the CLI-layer scenarios from the normative matrix
+# (INCREMENT_019_FINAL_SPECIFICATION.md, Section 25.2): T-070-T-090. Every
+# `# T-NNN` tag below names the scenario the tagged test actually
+# exercises; a test proving real, useful behavior with no scenario of its
+# own in this range is marked "additional coverage" instead, never given
+# a T-NNN it does not actually prove.
+#
+# declare_conditions already owns its own best-effort started/success/
+# error activity logging (Section 22.6) - several tests below exist
+# specifically to prove the CLI never adds a second, duplicate logging
+# path of its own (Section 11 of the governing Checkpoint 3 task).
+
+
+def _corrupt_conditions_record(project: Path, conditions_id: str) -> Path:
+    """Write a structurally-corrupt YAML file directly at the path a real
+    conditions declaration would occupy, simulating an already-persisted
+    record that fails to parse."""
+
+    conditions_dir = project / "scientific" / "experimental_conditions"
+    conditions_dir.mkdir(parents=True, exist_ok=True)
+    corrupted_file = conditions_dir / f"{conditions_id}.yaml"
+    corrupted_file.write_text("schema_version: '1.0'\nid: [unterminated\n", encoding="utf-8")
+    return corrupted_file
+
+
+def test_conditions_add_with_point_ph_succeeds(tmp_path, monkeypatch):  # T-070
+    _init_valid_experiment(tmp_path, monkeypatch)
+
+    result = runner.invoke(
+        app,
+        ["conditions", "add", "exp001", "ph-001", "--ph", "7.4", "--declared-by", "Dr. Jane Doe"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "SCIENTIFIC CONDITIONS DECLARED" in result.output
+    assert "Conditions ID: ph-001" in result.output
+    assert "pH: 7.4" in result.output
+    assert "Purpose: simulation_input" in result.output
+    assert "Declared by: Dr. Jane Doe" in result.output
+
+
+def test_conditions_add_with_range_ph_succeeds(tmp_path, monkeypatch):  # T-071
+    _init_valid_experiment(tmp_path, monkeypatch)
+
+    result = runner.invoke(
+        app,
+        [
+            "conditions", "add", "exp001", "ph-range-001",
+            "--ph-min", "6.0", "--ph-max", "8.0",
+            "--declared-by", "Dr. Jane Doe",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "SCIENTIFIC CONDITIONS DECLARED" in result.output
+    assert "pH: 6.0 - 8.0" in result.output
+
+
+def test_conditions_add_rejects_both_ph_forms(tmp_path, monkeypatch):  # T-072
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+
+    result = runner.invoke(
+        app,
+        [
+            "conditions", "add", "exp001", "ph-001",
+            "--ph", "7.0", "--ph-min", "6.0", "--ph-max", "8.0",
+            "--declared-by", "Dr. Jane Doe",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "INPUT ERROR" in result.output
+    assert not (project / "scientific").exists()
+
+
+def test_conditions_add_rejects_no_ph_form(tmp_path, monkeypatch):  # T-073
+    _init_valid_experiment(tmp_path, monkeypatch)
+
+    result = runner.invoke(
+        app, ["conditions", "add", "exp001", "ph-001", "--declared-by", "Dr. Jane Doe"]
+    )
+
+    assert result.exit_code == 1
+    assert "INPUT ERROR" in result.output
+
+
+def test_conditions_add_rejects_incomplete_range(tmp_path, monkeypatch):  # additional coverage
+    _init_valid_experiment(tmp_path, monkeypatch)
+
+    result = runner.invoke(
+        app,
+        ["conditions", "add", "exp001", "ph-001", "--ph-min", "6.0", "--declared-by", "Dr. Jane Doe"],
+    )
+
+    assert result.exit_code == 1
+    assert "INPUT ERROR" in result.output
+
+
+def test_conditions_add_rejects_ph_over_64_chars_without_attempting_decimal_conversion(
+    tmp_path, monkeypatch
+):  # T-074
+    _init_valid_experiment(tmp_path, monkeypatch)
+
+    decimal_calls = []
+
+    def _tracking_decimal(value):
+        decimal_calls.append(value)
+        return decimal.Decimal(value)
+
+    monkeypatch.setattr(cli_module, "Decimal", _tracking_decimal)
+
+    long_value = "1" * 65  # a syntactically valid Decimal literal, deliberately too long
+
+    result = runner.invoke(
+        app,
+        ["conditions", "add", "exp001", "ph-001", "--ph", long_value, "--declared-by", "Dr. Jane Doe"],
+    )
+
+    assert result.exit_code == 1
+    assert "INPUT ERROR" in result.output
+    assert "64 characters" in result.output
+    assert decimal_calls == []
+
+
+@pytest.mark.parametrize(
+    "ph_value",
+    [
+        "1000000",  # decimal_whole_digits
+        "1.1234567",  # decimal_max_places
+        "1234567.123456",  # decimal_max_digits
+    ],
+)
+def test_conditions_add_rejects_ph_violating_decimal_constraints(
+    tmp_path, monkeypatch, ph_value
+):  # T-075
+    _init_valid_experiment(tmp_path, monkeypatch)
+
+    result = runner.invoke(
+        app,
+        ["conditions", "add", "exp001", "ph-001", "--ph", ph_value, "--declared-by", "Dr. Jane Doe"],
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "INPUT ERROR" in result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+
+
+def test_conditions_add_rejects_non_decimal_ph_string(tmp_path, monkeypatch):  # additional coverage
+    _init_valid_experiment(tmp_path, monkeypatch)
+
+    result = runner.invoke(
+        app,
+        ["conditions", "add", "exp001", "ph-001", "--ph", "not-a-number", "--declared-by", "Dr. Jane Doe"],
+    )
+
+    assert result.exit_code == 1
+    assert "INPUT ERROR" in result.output
+
+
+@pytest.mark.parametrize("ph_value", ["NaN", "Infinity", "-Infinity"])
+def test_conditions_add_rejects_non_finite_ph(tmp_path, monkeypatch, ph_value):  # additional coverage
+    _init_valid_experiment(tmp_path, monkeypatch)
+
+    result = runner.invoke(
+        app,
+        ["conditions", "add", "exp001", "ph-001", "--ph", ph_value, "--declared-by", "Dr. Jane Doe"],
+    )
+
+    assert result.exit_code == 1
+    assert "INPUT ERROR" in result.output
+
+
+def test_conditions_add_rejects_inverted_ph_range(tmp_path, monkeypatch):  # additional coverage
+    _init_valid_experiment(tmp_path, monkeypatch)
+
+    result = runner.invoke(
+        app,
+        [
+            "conditions", "add", "exp001", "ph-001",
+            "--ph-min", "8.0", "--ph-max", "6.0",
+            "--declared-by", "Dr. Jane Doe",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "INPUT ERROR" in result.output
+
+
+def test_conditions_add_rejects_label_over_200_chars(tmp_path, monkeypatch):  # T-076
+    _init_valid_experiment(tmp_path, monkeypatch)
+
+    result = runner.invoke(
+        app,
+        [
+            "conditions", "add", "exp001", "ph-001",
+            "--ph", "7.4", "--declared-by", "Dr. Jane Doe",
+            "--label", "x" * 201,
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "INPUT ERROR" in result.output
+
+
+def test_conditions_add_rejects_empty_purpose(tmp_path, monkeypatch):  # T-077
+    _init_valid_experiment(tmp_path, monkeypatch)
+
+    result = runner.invoke(
+        app,
+        [
+            "conditions", "add", "exp001", "ph-001",
+            "--ph", "7.4", "--declared-by", "Dr. Jane Doe",
+            "--purpose", "",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "INPUT ERROR" in result.output
+
+
+def test_conditions_add_colliding_with_corrupted_record_reports_record_invalid(
+    tmp_path, monkeypatch
+):  # T-078
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+    corrupted_file = _corrupt_conditions_record(project, "corrupt-001")
+    original_bytes = corrupted_file.read_bytes()
+
+    result = runner.invoke(
+        app,
+        ["conditions", "add", "exp001", "corrupt-001", "--ph", "7.4", "--declared-by", "Dr. Jane Doe"],
+    )
+
+    assert result.exit_code == 1
+    assert "RECORD INVALID" in result.output
+    assert "SCIENTIFIC CONDITIONS DECLARED" not in result.output
+    assert "CONFLICT" not in result.output
+    assert "reused" not in result.output.lower()
+    assert corrupted_file.read_bytes() == original_bytes
+
+    log_file = project / "logs" / "activity.log"
+    assert log_file.exists()
+    assert "outcome=success" not in log_file.read_text(encoding="utf-8")
+
+
+def test_conditions_add_reports_storage_error_on_forced_oserror(tmp_path, monkeypatch):  # T-079
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+
+    def _raise_storage_error(*args, **kwargs):
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr("molecular.conditions_registry.atomic_write_text", _raise_storage_error)
+
+    result = runner.invoke(
+        app,
+        ["conditions", "add", "exp001", "ph-001", "--ph", "7.4", "--declared-by", "Dr. Jane Doe"],
+    )
+
+    assert result.exit_code == 1
+    assert "STORAGE ERROR" in result.output
+    assert "SCIENTIFIC CONDITIONS DECLARED" not in result.output
+    assert not (project / "scientific" / "experimental_conditions" / "ph-001.yaml").exists()
+    assert "outcome=success" not in (project / "logs" / "activity.log").read_text(encoding="utf-8")
+
+
+def test_conditions_revise_without_supersedes_is_rejected_by_typer(tmp_path, monkeypatch):  # T-080
+    _init_valid_experiment(tmp_path, monkeypatch)
+
+    result = runner.invoke(
+        app,
+        ["conditions", "revise", "exp001", "ph-002", "--ph", "7.4", "--declared-by", "Dr. Jane Doe"],
+    )
+
+    assert result.exit_code != 0
+    assert "SCIENTIFIC CONDITIONS DECLARED" not in result.output
+
+
+def test_conditions_revise_with_existing_predecessor_succeeds(tmp_path, monkeypatch):  # T-081
+    _init_valid_experiment(tmp_path, monkeypatch)
+    runner.invoke(
+        app, ["conditions", "add", "exp001", "ph-001", "--ph", "7.4", "--declared-by", "Dr. Jane Doe"]
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "conditions", "revise", "exp001", "ph-002", "--supersedes", "ph-001",
+            "--ph", "9.0", "--declared-by", "Dr. Jane Doe",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "SCIENTIFIC CONDITIONS DECLARED" in result.output
+    assert "Supersedes: ph-001" in result.output
+
+
+def test_conditions_revise_with_nonexistent_predecessor_reports_predecessor_not_found(
+    tmp_path, monkeypatch
+):  # T-082
+    _init_valid_experiment(tmp_path, monkeypatch)
+
+    result = runner.invoke(
+        app,
+        [
+            "conditions", "revise", "exp001", "ph-002", "--supersedes", "does-not-exist",
+            "--ph", "9.0", "--declared-by", "Dr. Jane Doe",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "PREDECESSOR NOT FOUND" in result.output
+
+
+def test_conditions_revise_with_corrupted_predecessor_reports_record_invalid(
+    tmp_path, monkeypatch
+):  # T-083
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+    _corrupt_conditions_record(project, "ph-original-001")
+
+    result = runner.invoke(
+        app,
+        [
+            "conditions", "revise", "exp001", "ph-002", "--supersedes", "ph-original-001",
+            "--ph", "9.0", "--declared-by", "Dr. Jane Doe",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "RECORD INVALID" in result.output
+
+
+def test_conditions_revise_colliding_with_corrupted_record_reports_record_invalid(
+    tmp_path, monkeypatch
+):  # T-084
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+    runner.invoke(
+        app,
+        ["conditions", "add", "exp001", "ph-original-001", "--ph", "7.4", "--declared-by", "Dr. Jane Doe"],
+    )
+    corrupted_file = _corrupt_conditions_record(project, "corrupt-001")
+    original_bytes = corrupted_file.read_bytes()
+
+    result = runner.invoke(
+        app,
+        [
+            "conditions", "revise", "exp001", "corrupt-001", "--supersedes", "ph-original-001",
+            "--ph", "9.0", "--declared-by", "Dr. Jane Doe",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "RECORD INVALID" in result.output
+    assert corrupted_file.read_bytes() == original_bytes
+
+
+def test_conditions_revise_reports_storage_error_on_forced_oserror(tmp_path, monkeypatch):  # additional coverage
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+    runner.invoke(
+        app, ["conditions", "add", "exp001", "ph-001", "--ph", "7.4", "--declared-by", "Dr. Jane Doe"]
+    )
+
+    def _raise_storage_error(*args, **kwargs):
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr("molecular.conditions_registry.atomic_write_text", _raise_storage_error)
+
+    result = runner.invoke(
+        app,
+        [
+            "conditions", "revise", "exp001", "ph-002", "--supersedes", "ph-001",
+            "--ph", "9.0", "--declared-by", "Dr. Jane Doe",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "STORAGE ERROR" in result.output
+
+
+def test_conditions_show_nonexistent_reports_not_found(tmp_path, monkeypatch):  # T-085
+    _init_valid_experiment(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["conditions", "show", "exp001", "does-not-exist"])
+
+    assert result.exit_code == 1
+    assert "NOT FOUND" in result.output
+
+
+def test_conditions_show_corrupted_reports_record_invalid(tmp_path, monkeypatch):  # T-086
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+    _corrupt_conditions_record(project, "corrupt-001")
+
+    result = runner.invoke(app, ["conditions", "show", "exp001", "corrupt-001"])
+
+    assert result.exit_code == 1
+    assert "RECORD INVALID" in result.output
+
+
+def test_conditions_show_succeeds_and_shows_full_record(tmp_path, monkeypatch):  # additional coverage
+    _init_valid_experiment(tmp_path, monkeypatch)
+    runner.invoke(
+        app,
+        [
+            "conditions", "add", "exp001", "ph-001",
+            "--ph", "7.4", "--declared-by", "Dr. Jane Doe",
+            "--label", "baseline", "--rationale", "standard assay condition",
+        ],
+    )
+
+    result = runner.invoke(app, ["conditions", "show", "exp001", "ph-001"])
+
+    assert result.exit_code == 0
+    assert "Conditions ID: ph-001" in result.output
+    assert "Label: baseline" in result.output
+    assert "Rationale: standard assay condition" in result.output
+
+
+def test_conditions_list_output_order_is_stable_across_repeated_invocations(
+    tmp_path, monkeypatch
+):  # T-087
+    _init_valid_experiment(tmp_path, monkeypatch)
+    runner.invoke(
+        app, ["conditions", "add", "exp001", "ph-first-001", "--ph", "7.0", "--declared-by", "Dr. A"]
+    )
+    runner.invoke(
+        app, ["conditions", "add", "exp001", "ph-second-001", "--ph", "7.5", "--declared-by", "Dr. B"]
+    )
+
+    first = runner.invoke(app, ["conditions", "list", "exp001"])
+    second = runner.invoke(app, ["conditions", "list", "exp001"])
+
+    assert first.exit_code == 0
+    assert second.exit_code == 0
+    assert first.output == second.output
+    assert "ph-first-001" in first.output
+    assert "ph-second-001" in first.output
+
+
+def test_conditions_list_on_fresh_experiment_is_empty_and_exits_zero(
+    tmp_path, monkeypatch
+):  # additional coverage
+    _init_valid_experiment(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["conditions", "list", "exp001"])
+
+    assert result.exit_code == 0
+    assert "CONDITIONS" in result.output
+    assert "No experimental conditions declared" in result.output
+
+
+def test_conditions_list_with_corrupted_record_reports_record_invalid(
+    tmp_path, monkeypatch
+):  # additional coverage
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+    _corrupt_conditions_record(project, "corrupt-001")
+
+    result = runner.invoke(app, ["conditions", "list", "exp001"])
+
+    assert result.exit_code == 1
+    assert "RECORD INVALID" in result.output
+
+
+def test_conditions_commands_never_prompt_interactively(tmp_path, monkeypatch):  # T-088
+    _init_valid_experiment(tmp_path, monkeypatch)
+
+    invocations = [
+        ["conditions", "add", "exp001", "ph-001"],
+        ["conditions", "revise", "exp001", "ph-002", "--supersedes", "ph-001"],
+        ["conditions", "show", "exp001", "does-not-exist"],
+        ["conditions", "list", "exp001"],
+    ]
+
+    for args in invocations:
+        result = runner.invoke(app, args, input="")
+        assert not isinstance(result.exception, EOFError)
+
+
+def test_conditions_app_has_no_forbidden_subcommands(tmp_path, monkeypatch):  # T-089
+    _init_valid_experiment(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["conditions", "--help"])
+
+    assert result.exit_code == 0
+    for forbidden in ("set-default", "infer", "recommend", "apply-all"):
+        assert forbidden not in result.output
+
+
+def test_conditions_no_unhandled_exception_escapes_any_command(tmp_path, monkeypatch):  # T-090
+    """Cross-command symmetry check against Section 22.0's coverage table:
+    every (command, error-type) cell that can realistically occur produces
+    a clean banner and a normal exit, never a raw Python traceback."""
+
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+    runner.invoke(
+        app, ["conditions", "add", "exp001", "ph-001", "--ph", "7.4", "--declared-by", "Dr. Jane Doe"]
+    )
+    runner.invoke(
+        app,
+        [
+            "conditions", "revise", "exp001", "ph-rev-001", "--supersedes", "ph-001",
+            "--ph", "8.0", "--declared-by", "Dr. Jane Doe",
+        ],
+    )
+    _corrupt_conditions_record(project, "corrupt-001")
+
+    invocations = [
+        # add: ConditionsValidationError (malformed id)
+        ["conditions", "add", "exp001", "not valid id!", "--ph", "7.4", "--declared-by", "Dr. X"],
+        # add: ConditionsDeclarationConflictError (divergent retry)
+        ["conditions", "add", "exp001", "ph-001", "--ph", "5.0", "--declared-by", "Dr. Jane Doe"],
+        # add: ConditionsRecordInvalidError (colliding record corrupted)
+        ["conditions", "add", "exp001", "corrupt-001", "--ph", "7.4", "--declared-by", "Dr. X"],
+        # revise: ConditionsValidationError (self-supersession)
+        [
+            "conditions", "revise", "exp001", "ph-001", "--supersedes", "ph-001",
+            "--ph", "7.4", "--declared-by", "Dr. X",
+        ],
+        # revise: ConditionsDeclarationConflictError (divergent retry of a revision)
+        [
+            "conditions", "revise", "exp001", "ph-rev-001", "--supersedes", "ph-001",
+            "--ph", "1.0", "--declared-by", "Dr. Jane Doe",
+        ],
+        # revise: ConditionsPredecessorNotFoundError
+        [
+            "conditions", "revise", "exp001", "ph-rev-002", "--supersedes", "does-not-exist",
+            "--ph", "7.4", "--declared-by", "Dr. X",
+        ],
+        # revise: ConditionsRecordInvalidError (predecessor corrupted)
+        [
+            "conditions", "revise", "exp001", "ph-rev-003", "--supersedes", "corrupt-001",
+            "--ph", "7.4", "--declared-by", "Dr. X",
+        ],
+        # show: FileNotFoundError
+        ["conditions", "show", "exp001", "does-not-exist"],
+        # show: ConditionsRecordInvalidError
+        ["conditions", "show", "exp001", "corrupt-001"],
+        # list: ConditionsRecordInvalidError
+        ["conditions", "list", "exp001"],
+    ]
+
+    for args in invocations:
+        result = runner.invoke(app, args)
+        assert result.exception is None or isinstance(result.exception, SystemExit), (
+            f"unhandled exception for {args!r}: {result.exception!r}"
+        )
+        assert result.exit_code in (0, 1), f"unexpected exit code for {args!r}"
+
+
+# --- conditions: CLI -> Service -> activity log boundary ---
+#
+# declare_conditions is the sole owner of activity logging for this
+# feature (Section 22.6). The CLI never calls record_activity itself -
+# these tests prove the boundary holds under real filesystem integration,
+# not mocks.
+
+
+def test_conditions_add_produces_exactly_started_then_success_log_entries(tmp_path, monkeypatch):
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+
+    runner.invoke(
+        app, ["conditions", "add", "exp001", "ph-001", "--ph", "7.4", "--declared-by", "Dr. Jane Doe"]
+    )
+
+    lines = (project / "logs" / "activity.log").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    assert "command=conditions-declare" in lines[0]
+    assert "outcome=started" in lines[0]
+    assert "command=conditions-declare" in lines[1]
+    assert "outcome=success" in lines[1]
+    assert "reused=False" in lines[1]
+
+
+def test_conditions_add_retry_via_cli_logs_reused_true(tmp_path, monkeypatch):
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+
+    runner.invoke(
+        app, ["conditions", "add", "exp001", "ph-001", "--ph", "7.4", "--declared-by", "Dr. Jane Doe"]
+    )
+    result = runner.invoke(
+        app, ["conditions", "add", "exp001", "ph-001", "--ph", "7.4", "--declared-by", "Dr. Jane Doe"]
+    )
+
+    assert result.exit_code == 0
+    assert "Result: existing declaration reused" in result.output
+
+    lines = (project / "logs" / "activity.log").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 4
+    assert "reused=False" in lines[1]
+    assert "reused=True" in lines[3]
+
+
+def test_conditions_add_fresh_and_retry_log_lines_are_distinguishable(tmp_path, monkeypatch):
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+
+    runner.invoke(
+        app, ["conditions", "add", "exp001", "ph-001", "--ph", "7.4", "--declared-by", "Dr. Jane Doe"]
+    )
+    runner.invoke(
+        app, ["conditions", "add", "exp001", "ph-001", "--ph", "7.4", "--declared-by", "Dr. Jane Doe"]
+    )
+
+    lines = (project / "logs" / "activity.log").read_text(encoding="utf-8").splitlines()
+
+    def _strip_timestamp(line: str) -> str:
+        return line.split(" ", 1)[1]
+
+    assert _strip_timestamp(lines[1]) != _strip_timestamp(lines[3])
+
+
+def test_conditions_cli_never_logs_under_its_own_command_name(tmp_path, monkeypatch):
+    """Only command=conditions-declare entries (declare_conditions's own)
+    may ever appear - never command=conditions-add/-revise/-show/-list,
+    proving the CLI never calls record_activity itself."""
+
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+
+    runner.invoke(
+        app, ["conditions", "add", "exp001", "ph-001", "--ph", "7.4", "--declared-by", "Dr. Jane Doe"]
+    )
+    runner.invoke(
+        app,
+        [
+            "conditions", "revise", "exp001", "ph-002", "--supersedes", "ph-001",
+            "--ph", "9.0", "--declared-by", "Dr. Jane Doe",
+        ],
+    )
+    runner.invoke(app, ["conditions", "show", "exp001", "ph-001"])
+    runner.invoke(app, ["conditions", "list", "exp001"])
+    runner.invoke(
+        app, ["conditions", "add", "exp001", "bad id!", "--ph", "7.4", "--declared-by", "Dr. Jane Doe"]
+    )
+
+    log_text = (project / "logs" / "activity.log").read_text(encoding="utf-8")
+    assert "command=conditions-add" not in log_text
+    assert "command=conditions-revise" not in log_text
+    assert "command=conditions-show" not in log_text
+    assert "command=conditions-list" not in log_text
+    for line in log_text.splitlines():
+        assert "command=conditions-declare" in line
+
+
+def test_conditions_add_conflict_does_not_log_false_success(tmp_path, monkeypatch):
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+
+    runner.invoke(
+        app, ["conditions", "add", "exp001", "ph-001", "--ph", "7.4", "--declared-by", "Dr. Jane Doe"]
+    )
+    lines_before = (project / "logs" / "activity.log").read_text(encoding="utf-8").splitlines()
+
+    result = runner.invoke(
+        app, ["conditions", "add", "exp001", "ph-001", "--ph", "5.0", "--declared-by", "Dr. Jane Doe"]
+    )
+
+    assert result.exit_code == 1
+    assert "CONFLICT" in result.output
+
+    lines_after = (project / "logs" / "activity.log").read_text(encoding="utf-8").splitlines()
+    new_lines = lines_after[len(lines_before):]
+    assert len(new_lines) == 2
+    assert "outcome=started" in new_lines[0]
+    assert "outcome=error" in new_lines[1]
+    assert all("outcome=success" not in line for line in new_lines)
+
+
+def test_conditions_add_invalid_input_does_not_log_false_success(tmp_path, monkeypatch):
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+
+    result = runner.invoke(
+        app,
+        [
+            "conditions", "add", "exp001", "ph-001",
+            "--ph", "7.4", "--declared-by", "Dr. Jane Doe", "--purpose", "",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "INPUT ERROR" in result.output
+    assert "outcome=success" not in (project / "logs" / "activity.log").read_text(encoding="utf-8")
+
+
+def test_conditions_cli_error_banner_matches_service_level_error(tmp_path, monkeypatch):
+    """The banner the CLI prints is exactly the message the typed
+    exception declare_conditions itself raised - not a generic/guessed
+    banner invented at the CLI layer."""
+
+    _init_valid_experiment(tmp_path, monkeypatch)
+
+    def _raise_persistence_error(*args, **kwargs):
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr("molecular.conditions_registry.atomic_write_text", _raise_persistence_error)
+
+    result = runner.invoke(
+        app, ["conditions", "add", "exp001", "ph-001", "--ph", "7.4", "--declared-by", "Dr. Jane Doe"]
+    )
+
+    assert result.exit_code == 1
+    assert "STORAGE ERROR" in result.output
+    assert "failed to persist conditions declaration 'ph-001'" in result.output

@@ -208,7 +208,7 @@ def test_same_id_in_two_different_project_dirs_are_fully_independent(tmp_path): 
     assert {d.id for d in list_conditions(project_b)} == {"ph-standard-001"}
 
 
-def test_retry_equivalence_uses_decimal_numeric_equality_not_text(tmp_path):  # T-055
+def test_retry_equivalence_uses_decimal_numeric_equality_not_text(tmp_path):  # additional coverage
     _declare(tmp_path, ph=_point(Decimal("7.40")))
 
     retried = _declare(tmp_path, ph=_point(Decimal("7.4")))
@@ -216,7 +216,7 @@ def test_retry_equivalence_uses_decimal_numeric_equality_not_text(tmp_path):  # 
     assert retried.id == "ph-standard-001"
 
 
-def test_retry_against_a_corrupted_existing_record_raises_record_invalid(tmp_path):  # T-056
+def test_retry_against_a_corrupted_existing_record_raises_record_invalid(tmp_path):  # additional coverage
     conditions_dir = _conditions_dir(tmp_path)
     conditions_dir.mkdir(parents=True)
     (conditions_dir / "ph-standard-001.yaml").write_text(
