@@ -9,6 +9,7 @@ not structurally expose for legacy PDB (Section 12.4) - a directly
 constructed `ParsedReceptorDocument`.
 """
 
+import unicodedata
 from decimal import Decimal
 from pathlib import Path
 
@@ -855,3 +856,105 @@ def test_inspection_id_golden_vector():  # T-122
 
     assert inspection_id == "73090f1a141de86e358c79f051b0245df0ca32287425935632e624d15078adf4"
     assert len(inspection_id) == 64
+
+
+# --- CP1 Checkpoint 1 micro-review regression tests (non-normative) -------
+# Added to close the two MAJOR findings of the Checkpoint 1 micro-review
+# (CP1-MAJOR-01: water classification priority, Section 17.1; CP1-MAJOR-02:
+# NFC normalization at the parser boundary, Section 33.2). These
+# intentionally are not T-numbered - they do not renumber or reuse any of
+# T-013-042 or T-106-122 above.
+
+
+def test_cp1_major01_hoh_mmcif_without_label_entity_id_classified_water(tmp_path):  # CP1-MAJOR-01
+    atom_rows = "HETATM 1 O O . HOH ? ? . ? 1.0 1.0 1.0 1.00 10.0 201 B 1"
+    report = _build_report(tmp_path, "hoh_no_entity.cif", _minimal_cif(atom_rows=atom_rows))
+
+    component = next(c for c in report.non_polymer_components if c.ccd_code == "HOH")
+    assert component.classification == "water"
+    assert component.classification_basis == "format-declared"
+
+
+def test_cp1_major01_dod_mmcif_without_label_entity_id_classified_water(tmp_path):  # CP1-MAJOR-01
+    atom_rows = "HETATM 1 O O . DOD ? ? . ? 1.0 1.0 1.0 1.00 10.0 201 B 1"
+    report = _build_report(tmp_path, "dod_no_entity.cif", _minimal_cif(atom_rows=atom_rows))
+
+    component = next(c for c in report.non_polymer_components if c.ccd_code == "DOD")
+    assert component.classification == "water"
+
+
+def test_cp1_major01_water_takes_priority_over_polymer_entity_association(tmp_path):  # CP1-MAJOR-01
+    # HOH explicitly associated with a label_entity_id typed "polymer" by
+    # _entity - water classification must still win (Section 17.1 is
+    # unconditional on ccd_code, never gated by entity type association).
+    atom_rows = "HETATM 1 O O . HOH A 1 1 ? 1.0 1.0 1.0 1.00 10.0 201 A 1"
+    entity_block = _entity_block((("1", "polymer", "Test protein"),))
+    report = _build_report(
+        tmp_path, "hoh_polymer_entity.cif", _minimal_cif(atom_rows=atom_rows, entity_block=entity_block)
+    )
+
+    component = next(c for c in report.non_polymer_components if c.ccd_code == "HOH")
+    assert component.classification == "water"
+
+
+def test_cp1_major01_non_aqueous_component_without_label_entity_id_not_misclassified_water(tmp_path):  # CP1-MAJOR-01
+    atom_rows = "ATOM 1 N N . MSE ? ? . ? 1.0 1.0 1.0 1.00 10.0 1 A 1"
+    report = _build_report(tmp_path, "mse_no_entity.cif", _minimal_cif(atom_rows=atom_rows))
+
+    component = next(c for c in report.non_polymer_components if c.ccd_code == "MSE")
+    assert component.classification == "modified-polymer-residue"
+    assert component.classification != "water"
+
+
+def test_cp1_major01_legacy_pdb_water_classification_unaffected(tmp_path):  # CP1-MAJOR-01
+    content = _pdb_atom("HETATM", 1, "O", "HOH", "A", 201) + "\nEND\n"
+    report = _build_report_pdb(tmp_path, "hoh.pdb", content)
+
+    component = next(c for c in report.non_polymer_components if c.ccd_code == "HOH")
+    assert component.classification == "water"
+
+
+def test_cp1_major01_metal_coordination_classification_unaffected(tmp_path):  # CP1-MAJOR-01
+    content = (
+        _pdb_link("ZN", "ZN", "A", 101, "NE2", "HIS", "A", 10, length=2.1) + "\n"
+        + _pdb_atom("ATOM", 1, "NE2", "HIS", "A", 10, elem="N") + "\n"
+        + _pdb_atom("HETATM", 2, "ZN", "ZN", "A", 101, elem="ZN") + "\n"
+        + "END\n"
+    )
+    report = _build_report_pdb(tmp_path, "link_metal_regression.pdb", content)
+
+    connection = report.metal_coordinations[0]
+    assert connection.source_category == "legacy-pdb-link"
+    assert connection.category == "legacy-pdb-link-metal"
+
+
+def test_cp1_major02_entity_description_propagates_nfc_into_report(tmp_path):  # CP1-MAJOR-02
+    nfd_description = unicodedata.normalize("NFD", "café protein")
+    nfc_description = unicodedata.normalize("NFC", "café protein")
+    atom_rows = "ATOM 1 N N . ALA A 1 1 ? 1.0 1.0 1.0 1.00 10.0 1 A 1"
+    entity_block = _entity_block((("1", "polymer", nfd_description),))
+    report = _build_report(
+        tmp_path, "nfd_entity.cif", _minimal_cif(atom_rows=atom_rows, entity_block=entity_block)
+    )
+
+    assert report.entities[0].description == nfc_description
+    assert report.entities[0].description != nfd_description
+
+
+def test_cp1_major02_warning_detail_embedding_structural_value_remains_nfc(tmp_path):  # CP1-MAJOR-02
+    nfd_ccd_code = unicodedata.normalize("NFD", "É")
+    nfc_ccd_code = unicodedata.normalize("NFC", "É")
+    atom_rows = f"HETATM 1 XX XX . '{nfd_ccd_code}' B 2 . ? 1.0 1.0 1.0 1.00 10.0 101 A 1"
+    entity_block = _entity_block((("2", "non-polymer", "mystery"),))
+    report = _build_report(
+        tmp_path, "nfd_ccd.cif", _minimal_cif(atom_rows=atom_rows, entity_block=entity_block)
+    )
+
+    component = report.non_polymer_components[0]
+    assert component.classification == "unknown"
+    assert component.ccd_code == nfc_ccd_code
+    assert len(component.ccd_code) == 1  # precomposed - confirms normalization actually ran
+
+    warning = next(w for w in report.warnings if w.code == "unknown-chemical-component")
+    assert nfc_ccd_code in warning.detail
+    assert warning.detail == unicodedata.normalize("NFC", warning.detail)

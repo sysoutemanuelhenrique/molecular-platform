@@ -23,6 +23,8 @@ below; every translated exception preserves the original via
 `raise ... from error` (Section 10.3).
 """
 
+import dataclasses
+import unicodedata
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -825,6 +827,39 @@ def _parse_legacy_pdb_structure(structure: "gemmi.Structure") -> Tuple[
     return tuple(residues), tuple(connections), unavailable_categories
 
 
+def _normalize_structural_strings(value):
+    """Recursively normalize every `str` to NFC, anywhere it appears inside
+    `value` (Section 33.2: "every string is normalized to NFC at the
+    parser's boundary", unconditional and inherited unchanged).
+
+    This is the single, central, auditable boundary for the requirement:
+    called once, on the fully-assembled `ParsedReceptorDocument`, right
+    before `parse_receptor_raw` returns it - before any of its content
+    reaches `receptor_inspection.py`'s models or report (CP1-MAJOR-02). It
+    walks every dataclass field and every tuple element generically, so it
+    never needs to be updated by hand when a new string field is added to
+    any `Parsed*` dataclass.
+
+    - `None` is always preserved - absence is never turned into `""`.
+    - Only `str` values are touched; `Decimal`/`int`/`bool`/`None` and
+      other non-string, non-container values pass through unchanged (so
+      `occupancy`/`distance` stay `Decimal`, per Section 33.2).
+    - ASCII content is a no-op under NFC by definition.
+    """
+
+    if isinstance(value, str):
+        return unicodedata.normalize("NFC", value)
+    if isinstance(value, tuple):
+        return tuple(_normalize_structural_strings(item) for item in value)
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        changes = {
+            field.name: _normalize_structural_strings(getattr(value, field.name))
+            for field in dataclasses.fields(value)
+        }
+        return dataclasses.replace(value, **changes)
+    return value
+
+
 def parse_receptor_raw(raw_path: Path, *, expected_checksum: str) -> ParsedReceptorDocument:
     """Execute Section 11.3's ten-step safe read flow and return a plain
     `ParsedReceptorDocument`. `raw_path` must already be the path derived
@@ -900,7 +935,7 @@ def parse_receptor_raw(raw_path: Path, *, expected_checksum: str) -> ParsedRecep
         for model_number in sorted({residue.model_number for residue in residues})
     ) or (ParsedModel(model_number=1),)
 
-    return ParsedReceptorDocument(
+    document = ParsedReceptorDocument(
         structure_format=structure_format,
         raw_checksum=raw_checksum,
         parser_name="gemmi",
@@ -914,3 +949,4 @@ def parse_receptor_raw(raw_path: Path, *, expected_checksum: str) -> ParsedRecep
         missing_atoms=missing_atoms,
         unavailable_categories=unavailable_categories,
     )
+    return _normalize_structural_strings(document)

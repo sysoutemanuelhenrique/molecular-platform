@@ -7,6 +7,7 @@ fixture is a minimal literal written under `tmp_path`.
 """
 
 import gzip
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -359,3 +360,177 @@ def test_altered_raw_artifact_checksum_mismatch_rejected(tmp_path):  # T-105
 
     with pytest.raises(RawChecksumMismatchError):
         parse_receptor_raw(path, expected_checksum=stale_checksum)
+
+
+# --- CP1 Checkpoint 1 micro-review regression tests (non-normative) -------
+# Added to close CP1-MAJOR-02 (NFC normalization at the parser boundary,
+# Section 33.2) found by the Checkpoint 1 micro-review. These intentionally
+# are not T-numbered - they do not renumber or reuse any of T-001-042 or
+# T-095-105 above.
+
+_NFD_DESCRIPTION = unicodedata.normalize("NFD", "café protein")
+_NFC_DESCRIPTION = unicodedata.normalize("NFC", "café protein")
+
+
+def test_cp1_major02_entity_description_simple_field_normalized_to_nfc(tmp_path):  # CP1-MAJOR-02
+    content = f"""\
+data_TEST
+#
+loop_
+_entity.id
+_entity.type
+_entity.pdbx_description
+1 polymer '{_NFD_DESCRIPTION}'
+#
+{_ATOM_SITE_HEADER}\
+ATOM 1 N N . ALA A 1 1 ? 1.0 1.0 1.0 1.00 10.0 1 A 1
+#
+"""
+    path = _write(tmp_path, "nfd_description.cif", content)
+
+    document = _parse(path)
+
+    assert document.entities[0].description == _NFC_DESCRIPTION
+    assert document.entities[0].description != _NFD_DESCRIPTION
+    assert unicodedata.is_normalized("NFC", document.entities[0].description)
+
+
+def test_cp1_major02_assembly_details_optional_field_normalized_to_nfc(tmp_path):  # CP1-MAJOR-02
+    extra = f"""\
+loop_
+_pdbx_struct_assembly.id
+_pdbx_struct_assembly.details
+1 '{_NFD_DESCRIPTION}'
+#
+"""
+    path = _write(tmp_path, "nfd_assembly.cif", _minimal_cif(extra_blocks=extra))
+
+    document = _parse(path)
+
+    assert document.assemblies[0].details == _NFC_DESCRIPTION
+    assert document.assemblies[0].details != _NFD_DESCRIPTION
+
+
+def test_cp1_major02_struct_conn_details_nested_field_normalized_to_nfc(tmp_path):  # CP1-MAJOR-02
+    content = f"""\
+data_TEST
+#
+{_ATOM_SITE_HEADER}\
+ATOM 1 N N . CYS A 1 7 ? 1.0 1.0 1.0 1.00 10.0 7 A 1
+ATOM 2 SG SG . CYS A 1 7 ? 1.5 1.0 1.0 1.00 10.0 7 A 1
+ATOM 3 N N . CYS A 1 20 ? 2.0 2.0 1.0 1.00 10.0 20 A 1
+ATOM 4 SG SG . CYS A 1 20 ? 2.5 2.0 1.0 1.00 10.0 20 A 1
+#
+loop_
+_struct_conn.id
+_struct_conn.conn_type_id
+_struct_conn.ptnr1_label_asym_id
+_struct_conn.ptnr1_auth_asym_id
+_struct_conn.ptnr1_auth_seq_id
+_struct_conn.ptnr1_label_atom_id
+_struct_conn.ptnr2_label_asym_id
+_struct_conn.ptnr2_auth_asym_id
+_struct_conn.ptnr2_auth_seq_id
+_struct_conn.ptnr2_label_atom_id
+_struct_conn.details
+c1 disulf A A 7 SG A A 20 SG '{_NFD_DESCRIPTION}'
+#
+"""
+    path = _write(tmp_path, "nfd_struct_conn.cif", content)
+
+    document = _parse(path)
+
+    assert document.connections[0].details == _NFC_DESCRIPTION
+    assert document.connections[0].details != _NFD_DESCRIPTION
+
+
+def test_cp1_major02_atom_name_in_nested_atoms_tuple_normalized_to_nfc(tmp_path):  # CP1-MAJOR-02
+    nfd_atom_name = unicodedata.normalize("NFD", "Nấ")
+    nfc_atom_name = unicodedata.normalize("NFC", "Nấ")
+    content = f"""\
+data_TEST
+#
+{_ATOM_SITE_HEADER}\
+ATOM 1 N '{nfd_atom_name}' . ALA A 1 1 ? 1.0 1.0 1.0 1.00 10.0 1 A 1
+#
+"""
+    path = _write(tmp_path, "nfd_atom_name.cif", content)
+
+    document = _parse(path)
+
+    assert document.residues[0].atoms[0].atom_name == nfc_atom_name
+    assert document.residues[0].atoms[0].atom_name != nfd_atom_name
+
+
+def test_cp1_major02_ascii_only_content_unaffected(tmp_path):  # CP1-MAJOR-02
+    path = _write(tmp_path, "ascii.cif", _minimal_cif())
+
+    document = _parse(path)
+
+    assert document.entities[0].description == "Test protein"
+
+
+def test_cp1_major02_none_preserved_not_converted_to_empty_string(tmp_path):  # CP1-MAJOR-02
+    extra = """\
+loop_
+_pdbx_struct_assembly.id
+_pdbx_struct_assembly.details
+1 .
+#
+"""
+    path = _write(tmp_path, "nfd_none.cif", _minimal_cif(extra_blocks=extra))
+
+    document = _parse(path)
+
+    assert document.assemblies[0].details is None
+
+
+def test_cp1_major02_raw_checksum_and_file_bytes_unaffected_by_normalization(tmp_path):  # CP1-MAJOR-02
+    content = f"""\
+data_TEST
+#
+loop_
+_entity.id
+_entity.type
+_entity.pdbx_description
+1 polymer '{_NFD_DESCRIPTION}'
+#
+{_ATOM_SITE_HEADER}\
+ATOM 1 N N . ALA A 1 1 ? 1.0 1.0 1.0 1.00 10.0 1 A 1
+#
+"""
+    path = _write(tmp_path, "nfd_checksum.cif", content)
+    raw_bytes_before = path.read_bytes()
+    expected_checksum = compute_sha256(path)
+
+    document = parse_receptor_raw(path, expected_checksum=expected_checksum)
+
+    assert document.raw_checksum == expected_checksum
+    assert path.read_bytes() == raw_bytes_before
+    assert document.entities[0].description == _NFC_DESCRIPTION
+
+
+def test_cp1_major02_nfc_and_nfd_equivalent_inputs_produce_identical_parsed_domain_value(tmp_path):  # CP1-MAJOR-02
+    def cif_with(description: str) -> str:
+        return f"""\
+data_TEST
+#
+loop_
+_entity.id
+_entity.type
+_entity.pdbx_description
+1 polymer '{description}'
+#
+{_ATOM_SITE_HEADER}\
+ATOM 1 N N . ALA A 1 1 ? 1.0 1.0 1.0 1.00 10.0 1 A 1
+#
+"""
+
+    nfc_path = _write(tmp_path, "nfc_variant.cif", cif_with(_NFC_DESCRIPTION))
+    nfd_path = _write(tmp_path, "nfd_variant.cif", cif_with(_NFD_DESCRIPTION))
+
+    nfc_document = _parse(nfc_path)
+    nfd_document = _parse(nfd_path)
+
+    assert nfc_document.entities[0].description == nfd_document.entities[0].description
+    assert nfc_document.raw_checksum != nfd_document.raw_checksum

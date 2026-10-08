@@ -432,26 +432,35 @@ def _build_non_polymer_components(
         comp_id = residue.comp_id
         atom_count = max(len(residue.atoms), 1)
 
-        if residue.label_entity_id is not None:
-            entity_type_raw = next(
-                (
-                    entity.entity_type_raw
-                    for entity in parsed.entities
-                    if entity.label_entity_id == residue.label_entity_id
-                ),
-                None,
-            )
-            is_polymer_entity = _classify_entity_type_raw(entity_type_raw) == "polymer"
-        else:
-            is_polymer_entity = not residue.is_het
-
-        if is_polymer_entity:
-            if comp_id in STANDARD_POLYMER_RESIDUE_CODES:
-                continue  # an ordinary, unmodified backbone residue is never reported
-            classification: NonPolymerClassification = "modified-polymer-residue"
+        # Water classification (Section 17.1) is unconditional on `ccd_code`
+        # alone and takes priority over the polymer/non-polymer bifurcation
+        # below - it must never depend on `is_het`, on `label_entity_id`
+        # being present, or on an (even correct) polymer entity association
+        # (CP1-MAJOR-01).
+        if comp_id in _WATER_CCD_CODES:
+            classification: NonPolymerClassification = "water"
             basis: ClassificationBasis = "format-declared"
         else:
-            classification, basis = _classify_non_polymer(ccd_code=comp_id, atom_count=atom_count)
+            if residue.label_entity_id is not None:
+                entity_type_raw = next(
+                    (
+                        entity.entity_type_raw
+                        for entity in parsed.entities
+                        if entity.label_entity_id == residue.label_entity_id
+                    ),
+                    None,
+                )
+                is_polymer_entity = _classify_entity_type_raw(entity_type_raw) == "polymer"
+            else:
+                is_polymer_entity = not residue.is_het
+
+            if is_polymer_entity:
+                if comp_id in STANDARD_POLYMER_RESIDUE_CODES:
+                    continue  # an ordinary, unmodified backbone residue is never reported
+                classification = "modified-polymer-residue"
+                basis = "format-declared"
+            else:
+                classification, basis = _classify_non_polymer(ccd_code=comp_id, atom_count=atom_count)
 
         components.append(
             NonPolymerComponent(
