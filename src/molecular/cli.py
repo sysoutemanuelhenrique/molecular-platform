@@ -76,6 +76,45 @@ from molecular.rdkit_tautomer import (
     PromotionRecordCountError,
     RDKitUnavailableError,
 )
+from molecular.receptor_inspection import InspectionFailureError
+from molecular.receptor_parsing import (
+    CompressedExtensionRejectedError,
+    CompressedRawContentError,
+    RawArtifactTooLargeError,
+    RawArtifactUnavailableError,
+    RawChecksumMismatchError,
+    ReceptorParseFailureError,
+    StructConnMalformedError,
+    UnsupportedStructureFormatError,
+)
+from molecular.receptor_registry import (
+    ReceptorInspectionNotFoundError,
+    ReceptorInspectionRecordInvalidError,
+    ReceptorResolutionNotFoundError,
+    ReceptorResolutionRecordInvalidError,
+    ReceptorSelectionNotFoundError,
+    ReceptorSelectionRecordInvalidError,
+)
+from molecular.receptor_selection import ChainSelector, ComponentDisposition
+from molecular.receptor_service import (
+    AmbiguousModelSelectionError,
+    AssemblyNotFoundError,
+    ChainNotFoundError,
+    InspectionSelectionUnsupportedError,
+    ModelNotFoundError,
+    ReceptorInputNotFoundError,
+    ReceptorInputRecordInvalidError,
+    ReceptorPersistenceError,
+    ReceptorSelectionConflictError,
+    ReceptorSelectionValidationError,
+    declare_receptor_selection,
+    inspect_receptor,
+    list_receptor_selections,
+    load_receptor_inspection,
+    load_receptor_selection,
+    load_resolved_receptor_selection,
+    resolve_receptor_selection,
+)
 from molecular.registry import load_ligand, load_protein, register_ligand, register_protein
 from molecular.scientific import ScientificEntity
 from molecular.scientific_registry import (
@@ -106,6 +145,8 @@ state_app = typer.Typer(help="Manage molecular states.")
 conformer_app = typer.Typer(help="Manage conformers.")
 provenance_app = typer.Typer(help="Query state-transformation provenance.")
 conditions_app = typer.Typer(help="Manage experimental conditions declarations.")
+receptor_app = typer.Typer(help="Manage receptor inspection, selection, and resolution.")
+receptor_inspection_app = typer.Typer(help="Inspect persisted receptor inspection reports.")
 app.add_typer(ligand_app, name="ligand")
 app.add_typer(protein_app, name="protein")
 app.add_typer(experiment_app, name="experiment")
@@ -114,6 +155,8 @@ app.add_typer(state_app, name="state")
 app.add_typer(conformer_app, name="conformer")
 app.add_typer(provenance_app, name="provenance")
 app.add_typer(conditions_app, name="conditions")
+app.add_typer(receptor_app, name="receptor")
+receptor_app.add_typer(receptor_inspection_app, name="inspection")
 
 @app.callback()
 def main():
@@ -1817,6 +1860,399 @@ def provenance_show(
         typer.echo()
 
     _record_activity_safely(context.project_dir, command="provenance-show", outcome="success")
+
+
+# ===========================================================================
+# receptor inspection/selection/resolution CLI (Increment 020, Checkpoint 3)
+# ===========================================================================
+
+def _echo_receptor_inspection_summary(report) -> None:
+    """Print the Section 29.4 success fields common to `protein inspect`,
+    `receptor select`, and `receptor resolve` - created/reused is printed
+    by each caller separately, since the factual field name differs
+    (`created` for inspect, `reused` for select/resolve)."""
+
+    typer.echo(f"Inspection ID: {report.inspection_id}")
+    typer.echo(f"Parser: {report.parser.name} {report.parser.version}")
+    typer.echo(f"Raw checksum: {report.raw_checksum}")
+    typer.echo(f"Selection capability: {report.selection_capability}")
+    typer.echo(
+        "Inventory: "
+        f"{len(report.models)} model(s), {len(report.chains)} chain(s), "
+        f"{len(report.entities)} entity(ies), "
+        f"{len(report.non_polymer_components)} non-polymer component(s)"
+    )
+    typer.echo(f"Warnings: {len(report.warnings)}")
+    for warning in report.warnings:
+        typer.echo(f"- {warning.code}: {_sanitize_cli_error_text(warning.detail)}")
+
+
+def _echo_yaml_record(model) -> None:
+    typer.echo(yaml.safe_dump(model.model_dump(mode="json"), sort_keys=False))
+
+
+def _parse_chain_option(text: str) -> ChainSelector:
+    label_asym_id, _, auth_asym_id = text.partition(":")
+    return ChainSelector(label_asym_id=label_asym_id, auth_asym_id=auth_asym_id or None)
+
+
+def _parse_component_option(text: str) -> ComponentDisposition:
+    parts = text.split(":")
+    if len(parts) != 4:
+        raise ValueError(
+            "--component must have exactly 4 ':'-separated fields "
+            f"(ccd:label:role:disposition), got {text!r}"
+        )
+    ccd_code, label_asym_id, role, disposition = parts
+    return ComponentDisposition(
+        label_asym_id=label_asym_id, ccd_code=ccd_code, role=role, disposition=disposition
+    )
+
+
+@protein_app.command("inspect")
+def protein_inspect(experiment: str, protein_input_id: str):
+    """Create-or-reuse a read-only ReceptorInspectionReport for a
+    registered protein input (Section 25.2)."""
+
+    context = _resolve_experiment_or_exit(experiment)
+    validated_id = _validate_id_or_exit(
+        protein_input_id,
+        project_dir=context.project_dir,
+        command="receptor-inspect",
+        error_sanitizer=_sanitize_cli_error_text,
+    )
+
+    try:
+        outcome = inspect_receptor(context.project_dir, protein_input_id=validated_id)
+    except ReceptorInputNotFoundError as error:
+        typer.echo("NOT FOUND")
+        typer.echo(_sanitize_cli_error_text(error))
+        raise typer.Exit(code=1)
+    except ReceptorInputRecordInvalidError as error:
+        typer.echo("RECORD INVALID")
+        typer.echo(_sanitize_cli_error_text(error))
+        raise typer.Exit(code=1)
+    except (CompressedExtensionRejectedError, CompressedRawContentError) as error:
+        typer.echo("COMPRESSED INPUT REJECTED")
+        typer.echo(_sanitize_cli_error_text(error))
+        raise typer.Exit(code=1)
+    except RawArtifactTooLargeError as error:
+        typer.echo("SIZE LIMIT EXCEEDED")
+        typer.echo(_sanitize_cli_error_text(error))
+        raise typer.Exit(code=1)
+    except RawChecksumMismatchError as error:
+        typer.echo("CHECKSUM MISMATCH")
+        typer.echo(_sanitize_cli_error_text(error))
+        raise typer.Exit(code=1)
+    except (
+        ReceptorParseFailureError,
+        UnsupportedStructureFormatError,
+        StructConnMalformedError,
+        InspectionFailureError,
+    ) as error:
+        typer.echo("PARSE ERROR")
+        typer.echo(_sanitize_cli_error_text(error))
+        raise typer.Exit(code=1)
+    except (RawArtifactUnavailableError, ReceptorPersistenceError, OSError) as error:
+        typer.echo("STORAGE ERROR")
+        typer.echo(_sanitize_cli_error_text(error))
+        raise typer.Exit(code=1)
+
+    typer.echo("RECEPTOR INSPECTION")
+    typer.echo()
+    typer.echo(f"Created: {outcome.created}")
+    _echo_receptor_inspection_summary(outcome.report)
+
+
+@receptor_inspection_app.command("show")
+def receptor_inspection_show(experiment: str, inspection_id: str):
+    """Load and display an already-persisted receptor inspection report by
+    its exact inspection_id, without reinvoking the parser (T-136)."""
+
+    context = _resolve_experiment_or_exit(experiment)
+
+    try:
+        report = load_receptor_inspection(context.project_dir, inspection_id)
+    except ReceptorInspectionNotFoundError as error:
+        typer.echo("NOT FOUND")
+        typer.echo(str(error))
+        raise typer.Exit(code=1)
+    except ReceptorInspectionRecordInvalidError as error:
+        typer.echo("RECORD INVALID")
+        typer.echo(str(error))
+        raise typer.Exit(code=1)
+    except ValueError as error:
+        typer.echo("INPUT ERROR")
+        typer.echo(str(error))
+        raise typer.Exit(code=1)
+
+    typer.echo("RECEPTOR INSPECTION REPORT")
+    typer.echo()
+    _echo_yaml_record(report)
+
+
+@receptor_app.command("select")
+def receptor_select(
+    experiment: str,
+    selection_id: str,
+    source: str = typer.Option(..., "--source"),
+    model: Optional[int] = typer.Option(None, "--model"),
+    assembly: Optional[str] = typer.Option(None, "--assembly"),
+    chain: List[str] = typer.Option([], "--chain"),
+    water: Optional[str] = typer.Option(None, "--water"),
+    metal: Optional[str] = typer.Option(None, "--metal"),
+    component: List[str] = typer.Option([], "--component"),
+    declared_by: str = typer.Option(..., "--declared-by"),
+    label: Optional[str] = typer.Option(None, "--label"),
+    rationale: Optional[str] = typer.Option(None, "--rationale"),
+):
+    """Declare a ReceptorSelectionPolicy against a registered protein
+    input's current inspection (Section 25.3). Never selects, infers, or
+    recommends any value on the scientist's behalf."""
+
+    context = _resolve_experiment_or_exit(experiment)
+
+    selected_chains = []
+    for raw_chain in chain:
+        try:
+            selected_chains.append(_parse_chain_option(raw_chain))
+        except (ValueError, ValidationError) as error:
+            typer.echo("INPUT ERROR")
+            typer.echo(_sanitize_cli_error_text(f"invalid --chain {raw_chain!r}: {error}"))
+            _record_activity_safely(
+                context.project_dir, command="receptor-selection-declare", outcome="error"
+            )
+            raise typer.Exit(code=1)
+
+    component_dispositions = []
+    for raw_component in component:
+        try:
+            component_dispositions.append(_parse_component_option(raw_component))
+        except (ValueError, ValidationError) as error:
+            typer.echo("INPUT ERROR")
+            typer.echo(_sanitize_cli_error_text(f"invalid --component {raw_component!r}: {error}"))
+            _record_activity_safely(
+                context.project_dir, command="receptor-selection-declare", outcome="error"
+            )
+            raise typer.Exit(code=1)
+
+    try:
+        outcome = declare_receptor_selection(
+            context.project_dir,
+            selection_id=selection_id,
+            protein_input_id=source,
+            selected_model=model,
+            selected_assembly=assembly,
+            selected_chains=tuple(selected_chains),
+            water_disposition=water,
+            metal_disposition=metal,
+            component_dispositions=tuple(component_dispositions),
+            declared_by=declared_by,
+            label=label,
+            rationale=rationale,
+        )
+    except ReceptorSelectionValidationError as error:
+        typer.echo("INPUT ERROR")
+        typer.echo(_sanitize_cli_error_text(error))
+        raise typer.Exit(code=1)
+    except InspectionSelectionUnsupportedError as error:
+        typer.echo("SELECTION UNSUPPORTED")
+        typer.echo(_sanitize_cli_error_text(error))
+        raise typer.Exit(code=1)
+    except (ReceptorInputNotFoundError, ReceptorInspectionNotFoundError) as error:
+        typer.echo("NOT FOUND")
+        typer.echo(_sanitize_cli_error_text(error))
+        raise typer.Exit(code=1)
+    except (ReceptorInputRecordInvalidError, ReceptorInspectionRecordInvalidError) as error:
+        typer.echo("RECORD INVALID")
+        typer.echo(_sanitize_cli_error_text(error))
+        raise typer.Exit(code=1)
+    except (CompressedExtensionRejectedError, CompressedRawContentError) as error:
+        typer.echo("COMPRESSED INPUT REJECTED")
+        typer.echo(_sanitize_cli_error_text(error))
+        raise typer.Exit(code=1)
+    except RawArtifactTooLargeError as error:
+        typer.echo("SIZE LIMIT EXCEEDED")
+        typer.echo(_sanitize_cli_error_text(error))
+        raise typer.Exit(code=1)
+    except RawChecksumMismatchError as error:
+        typer.echo("CHECKSUM MISMATCH")
+        typer.echo(_sanitize_cli_error_text(error))
+        raise typer.Exit(code=1)
+    except (
+        ReceptorParseFailureError,
+        UnsupportedStructureFormatError,
+        StructConnMalformedError,
+        InspectionFailureError,
+    ) as error:
+        typer.echo("PARSE ERROR")
+        typer.echo(_sanitize_cli_error_text(error))
+        raise typer.Exit(code=1)
+    except ReceptorSelectionConflictError as error:
+        typer.echo("CONFLICT")
+        typer.echo(_sanitize_cli_error_text(error))
+        raise typer.Exit(code=1)
+    except (RawArtifactUnavailableError, ReceptorPersistenceError, OSError) as error:
+        typer.echo("STORAGE ERROR")
+        typer.echo(_sanitize_cli_error_text(error))
+        raise typer.Exit(code=1)
+
+    report = load_receptor_inspection(context.project_dir, outcome.policy.inspection_id)
+    typer.echo("RECEPTOR SELECTION DECLARED")
+    typer.echo()
+    typer.echo(f"Selection ID: {outcome.policy.selection_id}")
+    typer.echo(f"Reused: {outcome.reused}")
+    _echo_receptor_inspection_summary(report)
+
+
+@receptor_app.command("resolve")
+def receptor_resolve(experiment: str, selection_id: str):
+    """Resolve a declared ReceptorSelectionPolicy against the RAW and the
+    inspection report it references (Section 25.4). Tudo-ou-nada: no
+    partial resolution is ever persisted."""
+
+    context = _resolve_experiment_or_exit(experiment)
+
+    try:
+        outcome = resolve_receptor_selection(context.project_dir, selection_id=selection_id)
+    except (
+        ReceptorInputNotFoundError,
+        ReceptorSelectionNotFoundError,
+        ReceptorInspectionNotFoundError,
+    ) as error:
+        typer.echo("NOT FOUND")
+        typer.echo(_sanitize_cli_error_text(error))
+        raise typer.Exit(code=1)
+    except (
+        ReceptorInputRecordInvalidError,
+        ReceptorSelectionRecordInvalidError,
+        ReceptorInspectionRecordInvalidError,
+    ) as error:
+        typer.echo("RECORD INVALID")
+        typer.echo(_sanitize_cli_error_text(error))
+        raise typer.Exit(code=1)
+    except RawChecksumMismatchError as error:
+        typer.echo("CHECKSUM MISMATCH")
+        typer.echo(_sanitize_cli_error_text(error))
+        raise typer.Exit(code=1)
+    except (
+        ModelNotFoundError,
+        AmbiguousModelSelectionError,
+        AssemblyNotFoundError,
+        ChainNotFoundError,
+    ) as error:
+        typer.echo("RESOLUTION FAILED")
+        typer.echo(_sanitize_cli_error_text(error))
+        raise typer.Exit(code=1)
+    except (RawArtifactUnavailableError, ReceptorPersistenceError, OSError) as error:
+        typer.echo("STORAGE ERROR")
+        typer.echo(_sanitize_cli_error_text(error))
+        raise typer.Exit(code=1)
+    except ValueError as error:
+        # A malformed selection_id reaches validate_input_id's own bare
+        # ValueError (resolve_receptor_selection's first statement, before
+        # any other step) - never a resolution/checksum failure, both of
+        # which are already caught by their own dedicated, more specific
+        # clauses above. Mirrors the same except ValueError already used by
+        # receptor_inspection_show/receptor_show_selection/
+        # receptor_show_resolution for the same underlying id-format check.
+        typer.echo("INPUT ERROR")
+        typer.echo(_sanitize_cli_error_text(error))
+        raise typer.Exit(code=1)
+
+    report = load_receptor_inspection(context.project_dir, outcome.resolution.inspection_id)
+    typer.echo("RECEPTOR SELECTION RESOLVED")
+    typer.echo()
+    typer.echo(f"Selection ID: {outcome.resolution.resolved_selection_id}")
+    typer.echo(f"Reused: {outcome.reused}")
+    _echo_receptor_inspection_summary(report)
+
+
+@receptor_app.command("show-selection")
+def receptor_show_selection(experiment: str, selection_id: str):
+    """Show a declared ReceptorSelectionPolicy record."""
+
+    context = _resolve_experiment_or_exit(experiment)
+
+    try:
+        policy = load_receptor_selection(context.project_dir, selection_id)
+    except ReceptorSelectionNotFoundError as error:
+        typer.echo("NOT FOUND")
+        typer.echo(str(error))
+        raise typer.Exit(code=1)
+    except ReceptorSelectionRecordInvalidError as error:
+        typer.echo("RECORD INVALID")
+        typer.echo(str(error))
+        raise typer.Exit(code=1)
+    except ValueError as error:
+        typer.echo("INPUT ERROR")
+        typer.echo(str(error))
+        raise typer.Exit(code=1)
+
+    typer.echo("RECEPTOR SELECTION POLICY")
+    typer.echo()
+    _echo_yaml_record(policy)
+
+
+@receptor_app.command("show-resolution")
+def receptor_show_resolution(experiment: str, selection_id: str):
+    """Show a resolved ResolvedReceptorSelection record."""
+
+    context = _resolve_experiment_or_exit(experiment)
+
+    try:
+        resolution = load_resolved_receptor_selection(context.project_dir, selection_id)
+    except ReceptorResolutionNotFoundError as error:
+        typer.echo("NOT FOUND")
+        typer.echo(str(error))
+        raise typer.Exit(code=1)
+    except ReceptorResolutionRecordInvalidError as error:
+        typer.echo("RECORD INVALID")
+        typer.echo(str(error))
+        raise typer.Exit(code=1)
+    except ValueError as error:
+        typer.echo("INPUT ERROR")
+        typer.echo(str(error))
+        raise typer.Exit(code=1)
+
+    typer.echo("RESOLVED RECEPTOR SELECTION")
+    typer.echo()
+    _echo_yaml_record(resolution)
+
+
+@receptor_app.command("list-selections")
+def receptor_list_selections(
+    experiment: str, source: Optional[str] = typer.Option(None, "--source")
+):
+    """List every declared ReceptorSelectionPolicy, in exactly the
+    (declared_at, selection_id) order list_receptor_selections returns -
+    optionally filtered by --source (protein_input_id), never re-sorted
+    (T-094)."""
+
+    context = _resolve_experiment_or_exit(experiment)
+
+    try:
+        policies = list_receptor_selections(context.project_dir)
+    except ReceptorSelectionRecordInvalidError as error:
+        typer.echo("RECORD INVALID")
+        typer.echo(str(error))
+        raise typer.Exit(code=1)
+
+    if source is not None:
+        policies = tuple(policy for policy in policies if policy.protein_input_id == source)
+
+    typer.echo("RECEPTOR SELECTIONS")
+    typer.echo()
+
+    if not policies:
+        typer.echo("No receptor selections declared.")
+        return
+
+    for policy in policies:
+        typer.echo(
+            f"selection_id={policy.selection_id} protein_input_id={policy.protein_input_id} "
+            f"declared_by={policy.declared_by} declared_at={policy.declared_at.isoformat()}"
+        )
 
 
 # --- conditions add/revise/show/list ---

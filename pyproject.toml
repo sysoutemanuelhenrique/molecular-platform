@@ -19,6 +19,9 @@ dev = [
 rdkit = [
     "rdkit==2026.3.6",
 ]
+structure = [
+    "gemmi==0.7.5",
+]
 
 [project.scripts]
 molecular = "molecular.cli:app"
