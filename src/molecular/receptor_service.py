@@ -68,6 +68,7 @@ from molecular.receptor_registry import (
     ReceptorInspectionNotFoundError,
     ReceptorInspectionRecordInvalidError,
     ReceptorResolutionIdentityConflictError,
+    ReceptorResolutionRecordInvalidError,
     ReceptorSelectionIdentityConflictError,
     ReceptorSelectionNotFoundError,
     ReceptorSelectionRecordInvalidError,
@@ -352,8 +353,17 @@ def inspect_receptor(project_dir: Path, *, protein_input_id: str) -> ReceptorIns
         # inspection_id is a deterministic hash of report content (Section
         # 15); a collision here can only mean the identical payload was
         # already persisted by a concurrent caller - a create-once hit,
-        # never an error (Section 24.2).
-        report = _registry_load_receptor_inspection(project_dir, inspection_id)
+        # never an error (Section 24.2). The reload itself is protected the
+        # same way declare_receptor_selection already protects its own
+        # recovery reload: a RecordInvalidError hit in the narrow TOCTOU
+        # window (a concurrent writer leaving the colliding file corrupted/
+        # partially written) logs one error entry and re-raises with
+        # __cause__ intact, never a silent success.
+        try:
+            report = _registry_load_receptor_inspection(project_dir, inspection_id)
+        except ReceptorInspectionRecordInvalidError:
+            _record_activity_safely(project_dir, command=_INSPECT_OPERATION, outcome="error", details=details)
+            raise
         _record_activity_safely(
             project_dir, command=_INSPECT_OPERATION, outcome="success",
             details=replace(details, created=False),
@@ -705,7 +715,16 @@ def resolve_receptor_selection(project_dir: Path, *, selection_id: str) -> Recep
         # same selection_id is structurally impossible here, unlike
         # declare_receptor_selection's own (scientist-authored) retry
         # comparison - so any collision is always treated as a reused hit.
-        existing = _registry_load_resolved_receptor_selection(project_dir, selection_id)
+        # The reload itself is protected the same way
+        # declare_receptor_selection already protects its own recovery
+        # reload: a RecordInvalidError hit in the narrow TOCTOU window logs
+        # one error entry and re-raises with __cause__ intact, never a
+        # silent success.
+        try:
+            existing = _registry_load_resolved_receptor_selection(project_dir, selection_id)
+        except ReceptorResolutionRecordInvalidError:
+            _record_activity_safely(project_dir, command=_RESOLVE_OPERATION, outcome="error", details=details)
+            raise
         _record_activity_safely(
             project_dir, command=_RESOLVE_OPERATION, outcome="success",
             details=replace(details, reused=True),

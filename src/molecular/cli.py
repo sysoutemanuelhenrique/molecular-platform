@@ -2148,6 +2148,17 @@ def receptor_resolve(experiment: str, selection_id: str):
         typer.echo("STORAGE ERROR")
         typer.echo(_sanitize_cli_error_text(error))
         raise typer.Exit(code=1)
+    except ValueError as error:
+        # A malformed selection_id reaches validate_input_id's own bare
+        # ValueError (resolve_receptor_selection's first statement, before
+        # any other step) - never a resolution/checksum failure, both of
+        # which are already caught by their own dedicated, more specific
+        # clauses above. Mirrors the same except ValueError already used by
+        # receptor_inspection_show/receptor_show_selection/
+        # receptor_show_resolution for the same underlying id-format check.
+        typer.echo("INPUT ERROR")
+        typer.echo(_sanitize_cli_error_text(error))
+        raise typer.Exit(code=1)
 
     report = load_receptor_inspection(context.project_dir, outcome.resolution.inspection_id)
     typer.echo("RECEPTOR SELECTION RESOLVED")

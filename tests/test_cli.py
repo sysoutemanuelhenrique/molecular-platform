@@ -16,6 +16,7 @@ from typer.testing import CliRunner
 
 import molecular.application as application_module
 import molecular.cli as cli_module
+import molecular.receptor_service as receptor_service_module
 from molecular.atomic import (
     RawArtifactIdentityUnstableError,
     RawArtifactSharingViolationError,
@@ -7791,6 +7792,89 @@ def test_receptor_resolve_failure_shows_resolution_failed_banner_sanitized(
     assert str(project.resolve()) not in result.output
 
 
+@pytest.mark.parametrize("malformed_selection_id", ["has space", "bad.char!"])
+def test_receptor_resolve_malformed_selection_id_returns_input_error_without_traceback(
+    tmp_path, monkeypatch, malformed_selection_id
+):  # CP3-MAJOR-01 correction
+    """Exercises the real `receptor resolve` command against the exact
+    defect the Checkpoint 3 micro-review found: a malformed selection_id
+    (here, one containing a space and one containing an invalid character)
+    reached validate_input_id's bare ValueError with no clause in
+    receptor_resolve's except chain to catch it - producing a raw Python
+    traceback instead of the INPUT ERROR banner every other command in
+    this family already produces for the same kind of id-format failure.
+    This test fails against the pre-correction HEAD
+    (31a0485c27cba020e941d11077356fa2d1bd093b)."""
+
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+    _register_receptor_protein_via_cli(project)
+
+    result = runner.invoke(app, ["receptor", "resolve", "exp001", malformed_selection_id])
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "INPUT ERROR" in result.output
+
+
+def test_receptor_resolve_valid_selection_id_still_follows_normal_flow(
+    tmp_path, monkeypatch
+):  # CP3-MAJOR-01 correction - no regression on the happy path
+    """Confirms the CP3-MAJOR-01 correction above does not disturb a
+    well-formed selection_id: resolution still succeeds exactly as before,
+    and a genuine resolution failure (not an id-format problem) still
+    produces RESOLUTION FAILED, never INPUT ERROR."""
+
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+    _register_receptor_protein_via_cli(project)
+
+    runner.invoke(
+        app,
+        [
+            "receptor",
+            "select",
+            "exp001",
+            "sel-valid",
+            "--source",
+            "demo-protein",
+            "--model",
+            "1",
+            "--chain",
+            "A",
+            "--declared-by",
+            "Dr. Jane Doe",
+        ],
+    )
+
+    result = runner.invoke(app, ["receptor", "resolve", "exp001", "sel-valid"])
+
+    assert result.exit_code == 0
+    assert "RECEPTOR SELECTION RESOLVED" in result.output
+
+    runner.invoke(
+        app,
+        [
+            "receptor",
+            "select",
+            "exp001",
+            "sel-bad-chain",
+            "--source",
+            "demo-protein",
+            "--model",
+            "1",
+            "--chain",
+            "ZZZ",
+            "--declared-by",
+            "Dr. Jane Doe",
+        ],
+    )
+
+    result = runner.invoke(app, ["receptor", "resolve", "exp001", "sel-bad-chain"])
+
+    assert result.exit_code == 1
+    assert "RESOLUTION FAILED" in result.output
+    assert "INPUT ERROR" not in result.output
+
+
 def test_receptor_list_selections_filters_by_source_without_reordering(
     tmp_path, monkeypatch
 ):  # T-094
@@ -7849,12 +7933,33 @@ def test_receptor_inspection_show_loads_persisted_report_without_reparsing(
     raw_file = project.parent / "demo-protein.cif"
     original_mtime = raw_file.stat().st_mtime_ns
 
+    # Strengthened proof (CP3-MINOR-02): mtime preservation alone cannot
+    # distinguish "never reopened" from "reopened but never written to" -
+    # a read does not touch mtime either way. Instrument the actual
+    # production entry point for RAW parsing, in the exact namespace
+    # `receptor_service.py` calls it from (`parse_receptor_raw`, imported
+    # there via `from molecular.receptor_parsing import parse_receptor_raw`
+    # - patching `receptor_parsing.parse_receptor_raw` itself would not
+    # affect that already-bound reference), so that any call at all makes
+    # this test fail, regardless of what CliRunner does with the resulting
+    # exception.
+    parse_call_count = {"n": 0}
+
+    def _fail_if_parse_is_invoked(*args, **kwargs):
+        parse_call_count["n"] += 1
+        raise AssertionError(
+            "receptor inspection show must never call parse_receptor_raw"
+        )
+
+    monkeypatch.setattr(receptor_service_module, "parse_receptor_raw", _fail_if_parse_is_invoked)
+
     result = runner.invoke(app, ["receptor", "inspection", "show", "exp001", inspection_id])
 
-    assert result.exit_code == 0
+    assert parse_call_count["n"] == 0, "receptor inspection show re-parsed the RAW artifact"
+    assert result.exit_code == 0, result.output
     assert "RECEPTOR INSPECTION REPORT" in result.output
     assert f"inspection_id: {inspection_id}" in result.output
-    # the RAW artifact itself was never reopened/reparsed by this read
+    # complementary, weaker signal kept alongside the instrumented proof above
     assert raw_file.stat().st_mtime_ns == original_mtime
 
 

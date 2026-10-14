@@ -17,11 +17,15 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
+import molecular.receptor_service as receptor_service_module
 from molecular.atomic import compute_sha256
 from molecular.receptor_inspection import ReceptorInspectionReport
 from molecular.receptor_registry import (
+    ReceptorInspectionIdentityConflictError,
     ReceptorInspectionNotFoundError,
     ReceptorInspectionRecordInvalidError,
+    ReceptorResolutionIdentityConflictError,
+    ReceptorResolutionRecordInvalidError,
     _receptor_inspections_dir,
     _resolved_receptor_selections_dir,
 )
@@ -323,6 +327,94 @@ def test_each_service_call_logs_exactly_one_started_and_one_terminal_entry(tmp_p
     resolve_lines = [line for line in log_lines if "command=receptor-selection-resolve" in line]
     assert sum(1 for line in resolve_lines if "outcome=started" in line) == 1
     assert sum(1 for line in resolve_lines if "outcome=success" in line or "outcome=error" in line) == 1
+
+
+# --- CP3-MINOR-01 correction: collision-then-invalid-reload, both paths ---
+#
+# Both focused tests below monkeypatch the names actually bound in
+# receptor_service.py's own module namespace (`register_receptor_inspection`/
+# `_registry_load_receptor_inspection`, and `register_resolved_receptor_
+# selection`/`_registry_load_resolved_receptor_selection`) - the exact
+# references the Service calls, not the originating receptor_registry.py
+# module - so the simulated TOCTOU collision is observed exactly where
+# production code would observe it.
+
+
+def test_inspect_receptor_collision_then_invalid_reload_logs_one_error_preserves_cause(
+    tmp_path, monkeypatch
+):  # CP3-MINOR-01 correction
+    _register_demo_protein(tmp_path, raw_text=_minimal_cif())
+
+    call_count = {"n": 0}
+    original_cause = ValueError("simulated corruption during the TOCTOU window")
+
+    def _load_side_effect(project_dir, inspection_id):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # the upfront "does it already exist" check: not yet
+            raise ReceptorInspectionNotFoundError("not found yet")
+        # the recovery reload after the simulated collision below
+        raise ReceptorInspectionRecordInvalidError(
+            "corrupted during TOCTOU window"
+        ) from original_cause
+
+    def _register_side_effect(project_dir, report):
+        raise ReceptorInspectionIdentityConflictError("concurrent writer collision")
+
+    monkeypatch.setattr(
+        receptor_service_module, "_registry_load_receptor_inspection", _load_side_effect
+    )
+    monkeypatch.setattr(
+        receptor_service_module, "register_receptor_inspection", _register_side_effect
+    )
+
+    with pytest.raises(ReceptorInspectionRecordInvalidError) as excinfo:
+        inspect_receptor(tmp_path, protein_input_id="demo-protein")
+
+    assert excinfo.value.__cause__ is original_cause
+
+    log_lines = (tmp_path / "logs" / "activity.log").read_text(encoding="utf-8").splitlines()
+    inspect_lines = [line for line in log_lines if "command=receptor-inspect" in line]
+    assert sum(1 for line in inspect_lines if "outcome=started" in line) == 1
+    assert sum(1 for line in inspect_lines if "outcome=error" in line) == 1
+    assert sum(1 for line in inspect_lines if "outcome=success" in line) == 0
+
+
+def test_resolve_receptor_selection_collision_then_invalid_reload_logs_one_error_preserves_cause(
+    tmp_path, monkeypatch
+):  # CP3-MINOR-01 correction
+    _register_demo_protein(tmp_path, raw_text=_minimal_cif())
+    _declare_minimal_selection(tmp_path)
+
+    original_cause = ValueError("simulated corruption during the TOCTOU window")
+
+    def _register_side_effect(project_dir, resolution):
+        raise ReceptorResolutionIdentityConflictError("concurrent writer collision")
+
+    def _load_side_effect(project_dir, selection_id):
+        raise ReceptorResolutionRecordInvalidError(
+            "corrupted during TOCTOU window"
+        ) from original_cause
+
+    monkeypatch.setattr(
+        receptor_service_module, "register_resolved_receptor_selection", _register_side_effect
+    )
+    monkeypatch.setattr(
+        receptor_service_module,
+        "_registry_load_resolved_receptor_selection",
+        _load_side_effect,
+    )
+
+    with pytest.raises(ReceptorResolutionRecordInvalidError) as excinfo:
+        resolve_receptor_selection(tmp_path, selection_id="sel-001")
+
+    assert excinfo.value.__cause__ is original_cause
+
+    log_lines = (tmp_path / "logs" / "activity.log").read_text(encoding="utf-8").splitlines()
+    resolve_lines = [line for line in log_lines if "command=receptor-selection-resolve" in line]
+    assert sum(1 for line in resolve_lines if "outcome=started" in line) == 1
+    assert sum(1 for line in resolve_lines if "outcome=error" in line) == 1
+    assert sum(1 for line in resolve_lines if "outcome=success" in line) == 0
 
 
 # --- T-131-135 (new) --------------------------------------------------------
