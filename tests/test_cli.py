@@ -7638,3 +7638,248 @@ def test_conditions_add_each_decimal_constraint_logs_started_then_error(
     assert "outcome=started" in log_text
     assert "outcome=error" in log_text
     assert "outcome=success" not in log_text
+
+
+# ===========================================================================
+# receptor inspection/selection/resolution CLI (Increment 020, Checkpoint 3)
+# Covers T-091-094 (preserved/rewritten) and T-136-137 (new), Section 35.7.
+# ===========================================================================
+
+_RECEPTOR_ATOM_SITE_HEADER = """\
+loop_
+_atom_site.group_PDB
+_atom_site.id
+_atom_site.type_symbol
+_atom_site.label_atom_id
+_atom_site.label_alt_id
+_atom_site.label_comp_id
+_atom_site.label_asym_id
+_atom_site.label_entity_id
+_atom_site.label_seq_id
+_atom_site.pdbx_PDB_ins_code
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+_atom_site.occupancy
+_atom_site.B_iso_or_equiv
+_atom_site.auth_seq_id
+_atom_site.auth_asym_id
+_atom_site.pdbx_PDB_model_num
+"""
+
+
+def _receptor_minimal_cif() -> str:
+    return f"""\
+data_TEST
+#
+loop_
+_entity.id
+_entity.type
+_entity.pdbx_description
+1 polymer 'Test protein'
+#
+{_RECEPTOR_ATOM_SITE_HEADER}\
+ATOM 1 N N . ALA A 1 1 ? 1.0 1.0 1.0 1.00 10.0 1 A 1
+ATOM 2 C CA . ALA A 1 1 ? 2.0 1.0 1.0 1.00 10.0 1 A 1
+#
+"""
+
+
+def _register_receptor_protein_via_cli(project, input_id="demo-protein"):
+    raw_file = project.parent / f"{input_id}.cif"
+    raw_file.write_text(_receptor_minimal_cif(), encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "protein",
+            "add",
+            "exp001",
+            input_id,
+            "--name",
+            "Demo protein",
+            "--acquisition-method",
+            "uploaded",
+            "--raw-file",
+            str(raw_file),
+        ],
+    )
+    assert result.exit_code == 0
+    return result
+
+
+def test_protein_inspect_success_banner_includes_required_fields(tmp_path, monkeypatch):  # T-091, T-137
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+    _register_receptor_protein_via_cli(project)
+
+    result = runner.invoke(app, ["protein", "inspect", "exp001", "demo-protein"])
+
+    assert result.exit_code == 0
+    assert "Created: True" in result.output
+    assert "Inspection ID:" in result.output
+    assert "Raw checksum:" in result.output
+    assert "Selection capability: full" in result.output
+    assert "Warnings:" in result.output
+
+
+def test_receptor_select_then_resolve_produces_loadable_resolved_selection(
+    tmp_path, monkeypatch
+):  # T-092
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+    _register_receptor_protein_via_cli(project)
+
+    result = runner.invoke(
+        app,
+        [
+            "receptor",
+            "select",
+            "exp001",
+            "sel-001",
+            "--source",
+            "demo-protein",
+            "--model",
+            "1",
+            "--chain",
+            "A",
+            "--declared-by",
+            "Dr. Jane Doe",
+        ],
+    )
+    assert result.exit_code == 0
+    assert "RECEPTOR SELECTION DECLARED" in result.output
+
+    result = runner.invoke(app, ["receptor", "resolve", "exp001", "sel-001"])
+    assert result.exit_code == 0
+    assert "RECEPTOR SELECTION RESOLVED" in result.output
+
+    result = runner.invoke(app, ["receptor", "show-resolution", "exp001", "sel-001"])
+    assert result.exit_code == 0
+    assert "resolved_selection_id: sel-001" in result.output
+    assert "resolved_model: 1" in result.output
+
+
+def test_receptor_resolve_failure_shows_resolution_failed_banner_sanitized(
+    tmp_path, monkeypatch
+):  # T-093
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+    _register_receptor_protein_via_cli(project)
+
+    runner.invoke(
+        app,
+        [
+            "receptor",
+            "select",
+            "exp001",
+            "sel-001",
+            "--source",
+            "demo-protein",
+            "--model",
+            "1",
+            "--chain",
+            "ZZZ",
+            "--declared-by",
+            "Dr. Jane Doe",
+        ],
+    )
+
+    result = runner.invoke(app, ["receptor", "resolve", "exp001", "sel-001"])
+
+    assert result.exit_code == 1
+    assert "RESOLUTION FAILED" in result.output
+    # the sanitizer's own absolute-path redaction must never be bypassed:
+    # the project's own absolute filesystem path never appears verbatim.
+    assert str(project.resolve()) not in result.output
+
+
+def test_receptor_list_selections_filters_by_source_without_reordering(
+    tmp_path, monkeypatch
+):  # T-094
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+    _register_receptor_protein_via_cli(project, input_id="protein-a")
+    _register_receptor_protein_via_cli(project, input_id="protein-b")
+
+    for selection_id, source in (
+        ("sel-a1", "protein-a"),
+        ("sel-b1", "protein-b"),
+        ("sel-a2", "protein-a"),
+    ):
+        result = runner.invoke(
+            app,
+            [
+                "receptor",
+                "select",
+                "exp001",
+                selection_id,
+                "--source",
+                source,
+                "--model",
+                "1",
+                "--declared-by",
+                "Dr. Jane Doe",
+            ],
+        )
+        assert result.exit_code == 0
+
+    result = runner.invoke(
+        app, ["receptor", "list-selections", "exp001", "--source", "protein-a"]
+    )
+
+    assert result.exit_code == 0
+    assert "sel-a1" in result.output
+    assert "sel-a2" in result.output
+    assert "sel-b1" not in result.output
+    assert result.output.index("sel-a1") < result.output.index("sel-a2")
+
+
+def test_receptor_inspection_show_loads_persisted_report_without_reparsing(
+    tmp_path, monkeypatch
+):  # T-136
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+    _register_receptor_protein_via_cli(project)
+
+    inspect_result = runner.invoke(app, ["protein", "inspect", "exp001", "demo-protein"])
+    assert inspect_result.exit_code == 0
+
+    inspection_id = None
+    for line in inspect_result.output.splitlines():
+        if line.startswith("Inspection ID:"):
+            inspection_id = line.split(":", 1)[1].strip()
+    assert inspection_id is not None
+
+    raw_file = project.parent / "demo-protein.cif"
+    original_mtime = raw_file.stat().st_mtime_ns
+
+    result = runner.invoke(app, ["receptor", "inspection", "show", "exp001", inspection_id])
+
+    assert result.exit_code == 0
+    assert "RECEPTOR INSPECTION REPORT" in result.output
+    assert f"inspection_id: {inspection_id}" in result.output
+    # the RAW artifact itself was never reopened/reparsed by this read
+    assert raw_file.stat().st_mtime_ns == original_mtime
+
+
+def test_receptor_select_success_includes_inspection_id_and_selection_capability(
+    tmp_path, monkeypatch
+):  # T-137
+    project = _init_valid_experiment(tmp_path, monkeypatch)
+    _register_receptor_protein_via_cli(project)
+
+    result = runner.invoke(
+        app,
+        [
+            "receptor",
+            "select",
+            "exp001",
+            "sel-001",
+            "--source",
+            "demo-protein",
+            "--model",
+            "1",
+            "--declared-by",
+            "Dr. Jane Doe",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Inspection ID:" in result.output
+    assert "Selection capability: full" in result.output
