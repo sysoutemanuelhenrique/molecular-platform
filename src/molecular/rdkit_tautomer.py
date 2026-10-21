@@ -23,26 +23,68 @@ installation with no rdkit extra installed - and defers the actual
 call to resolve_rdkit_engine() (Section 7.1).
 """
 
+import math
+import re
 from collections import Counter
+from io import BytesIO
 from pathlib import Path
 from typing import Literal, Mapping, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from molecular.characterization import (
+    CharacterizationConfigurationError,
+    CharacterizationEffectiveParameters,
+    CharacterizationError,
+    CharacterizationExecutionError,
+    CharacterizationInputError,
+    CharacterizationStorageError,
+    CharacterizationValues,
+    Compute2DParameters,
+    DepictionEffectiveParameters,
+    DrawingResult,
+    MAX_BOND_COUNT,
+    MAX_TOTAL_ATOM_COUNT,
+    RDKitCharacterizationOutcome,
+    REQUIRED_ENGINE_VERSION,
+    SdfParserParameters,
+    SmilesParserParameters,
+    validate_and_bind_depiction_svg,
+)
+from molecular.inputs import validate_input_id
 from molecular.promotion import LigandPromotionPolicy
 
 try:
     from rdkit import Chem, rdBase
-    from rdkit.Chem import rdMolDescriptors
+    from rdkit.Chem import Descriptors, rdMolDescriptors
     from rdkit.Chem.MolStandardize import rdMolStandardize
 except ImportError as _rdkit_import_error:  # pragma: no cover - exercised by packaging tests
     Chem = None
     rdBase = None
+    Descriptors = None
     rdMolDescriptors = None
     rdMolStandardize = None
     _RDKIT_IMPORT_ERROR: Optional[ImportError] = _rdkit_import_error
 else:
     _RDKIT_IMPORT_ERROR = None
+
+# Section 15 of the Increment 020-A frozen spec: drawing availability is
+# deliberately separate from calculation availability - a missing Draw/
+# RDConfig import (or, later, a missing font asset) must never shadow the
+# legacy `_RDKIT_IMPORT_ERROR` sentinel above, and must never make
+# calculation-only characterization (include_svg=False) or the existing
+# tautomer enumeration unavailable.
+try:
+    from rdkit import RDConfig
+    from rdkit.Chem import rdDepictor
+    from rdkit.Chem.Draw import rdMolDraw2D
+except ImportError as _rdkit_drawing_import_error:  # pragma: no cover - exercised by packaging tests
+    RDConfig = None
+    rdDepictor = None
+    rdMolDraw2D = None
+    _RDKIT_DRAWING_IMPORT_ERROR: Optional[ImportError] = _rdkit_drawing_import_error
+else:
+    _RDKIT_DRAWING_IMPORT_ERROR = None
 
 
 EngineName = Literal["rdkit"]
@@ -624,3 +666,639 @@ def enumerate_tautomers_rdkit(
             for smiles in sorted_new_unique
         ),
     )
+
+
+# =========================================================================
+# Increment 020-A, Checkpoint 1: molecular characterization RDKit adapter
+# (Sections 4/6/7/8/9/10/12 of the frozen spec). Bytes in, neutral DTO
+# out - no filesystem I/O, no TautomerEnumerator reuse, and every DTO/
+# error name used below comes from molecular.characterization, never a
+# new ad hoc shape defined in this module.
+# =========================================================================
+
+_SD_DELIMITER_RE = re.compile(r"\r\n|\n")
+_SMILES_ASCII_MAX_ORDINAL = 0x7E
+
+
+def _resolve_characterization_engine() -> tuple[str, str]:
+    """Section 8: resolve+pin the RDKit engine for characterization,
+    independent of enumerate_tautomers_rdkit's own resolve_rdkit_engine
+    (a different profile with its own parameter set). Requires the exact
+    observed version string 2026.03.6 - no other engine or version is
+    substituted."""
+
+    if _RDKIT_IMPORT_ERROR is not None:
+        raise CharacterizationConfigurationError(
+            "the rdkit engine is not installed or failed to import",
+            reason="engine-unavailable",
+        )
+    engine_version = getattr(rdBase, "rdkitVersion", None)
+    if not engine_version or engine_version != REQUIRED_ENGINE_VERSION:
+        raise CharacterizationConfigurationError(
+            f"rdkit engine version must be {REQUIRED_ENGINE_VERSION!r} "
+            f"(observed {engine_version!r})",
+            reason="engine-unavailable",
+        )
+    return _ENGINE_NAME, engine_version
+
+
+def _validate_sdf_grammar(data: bytes) -> None:
+    """Section 7.1: the exact SDF physical grammar, checked on the raw
+    bytes before RDKit ever sees them. Never sniffs, never strips, never
+    tolerates a lone CR or anything after the single terminal `$$$$`
+    line."""
+
+    if b"\x00" in data:
+        raise CharacterizationExecutionError(
+            "SDF source must not contain a NUL byte", reason="invalid-chemical-input"
+        )
+    if data.startswith(b"\xef\xbb\xbf"):
+        raise CharacterizationExecutionError(
+            "SDF source must not have a UTF-8 BOM", reason="invalid-chemical-input"
+        )
+    try:
+        text = data.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise CharacterizationExecutionError(
+            "SDF source is not strict UTF-8", reason="invalid-chemical-input"
+        ) from error
+
+    index = 0
+    while True:
+        index = text.find("\r", index)
+        if index == -1:
+            break
+        if index + 1 >= len(text) or text[index + 1] != "\n":
+            raise CharacterizationExecutionError(
+                "SDF source must not contain a lone CR", reason="invalid-chemical-input"
+            )
+        index += 1
+
+    lines = _SD_DELIMITER_RE.split(text)
+    delimiter_count = lines.count("$$$$")
+    if delimiter_count != 1:
+        raise CharacterizationExecutionError(
+            "SDF source must contain exactly one physical record, terminated "
+            f"by exactly one '$$$$' line (found {delimiter_count})",
+            reason="invalid-chemical-input",
+        )
+    delimiter_index = lines.index("$$$$")
+    remainder = lines[delimiter_index + 1 :]
+    if remainder not in ([], [""]):
+        raise CharacterizationExecutionError(
+            "nothing may follow the terminal '$$$$' line except a single "
+            "trailing line terminator",
+            reason="invalid-chemical-input",
+        )
+
+
+def _validate_smiles_grammar(data: bytes) -> str:
+    """Section 7.2: the exact SMILES physical grammar. Returns the bare
+    token (never including the trailing terminator) for RDKit to parse."""
+
+    try:
+        text = data.decode("ascii", errors="strict")
+    except UnicodeDecodeError as error:
+        raise CharacterizationExecutionError(
+            "SMILES source must be strict ASCII", reason="invalid-chemical-input"
+        ) from error
+
+    if "\x00" in text or "\x7f" in text:
+        raise CharacterizationExecutionError(
+            "SMILES source must not contain NUL or DEL", reason="invalid-chemical-input"
+        )
+
+    carriage_return_count = text.count("\r")
+    if carriage_return_count:
+        if carriage_return_count != 1 or not text.endswith("\r\n"):
+            raise CharacterizationExecutionError(
+                "SMILES source must not contain a lone CR", reason="invalid-chemical-input"
+            )
+
+    newline_count = text.count("\n")
+    if newline_count:
+        if newline_count != 1 or not text.endswith("\n"):
+            raise CharacterizationExecutionError(
+                "SMILES source must have at most one trailing LF/CRLF, nothing else",
+                reason="invalid-chemical-input",
+            )
+
+    if text.endswith("\r\n"):
+        token = text[:-2]
+    elif text.endswith("\n"):
+        token = text[:-1]
+    else:
+        token = text
+
+    if not token:
+        raise CharacterizationExecutionError(
+            "SMILES source must contain a non-empty token", reason="invalid-chemical-input"
+        )
+    for character in token:
+        if ord(character) < 0x20 or ord(character) == 0x7F:
+            raise CharacterizationExecutionError(
+                "SMILES token must not contain control characters",
+                reason="invalid-chemical-input",
+            )
+        if character.isspace():
+            raise CharacterizationExecutionError(
+                "SMILES token must not contain whitespace",
+                reason="invalid-chemical-input",
+            )
+    return token
+
+
+def _parse_molecule_rdkit(representation_bytes: bytes, *, input_format: str):
+    """Sections 7.1/7.2/12 step 5: grammar validation, then exactly one
+    RDKit parse call, with native logs suppressed for the call's own
+    minimal scope (Section 13's logging rule)."""
+
+    if input_format == "sdf":
+        _validate_sdf_grammar(representation_bytes)
+        try:
+            with rdBase.BlockLogs():
+                supplier = Chem.ForwardSDMolSupplier(
+                    BytesIO(representation_bytes),
+                    sanitize=True,
+                    removeHs=False,
+                    strictParsing=True,
+                )
+                items = list(supplier)
+        except Exception as error:
+            raise CharacterizationExecutionError(
+                f"the SDF source could not be parsed: {error.__class__.__name__}",
+                reason="invalid-chemical-input",
+            ) from error
+        if len(items) != 1 or items[0] is None:
+            raise CharacterizationExecutionError(
+                "the SDF source must contain exactly one valid molecule",
+                reason="invalid-chemical-input",
+            )
+        return items[0]
+
+    if input_format == "smiles":
+        token = _validate_smiles_grammar(representation_bytes)
+        params = Chem.SmilesParserParams()
+        params.sanitize = True
+        params.removeHs = False
+        params.parseName = False
+        params.allowCXSMILES = False
+        try:
+            with rdBase.BlockLogs():
+                mol = Chem.MolFromSmiles(token, params)
+        except Exception as error:
+            raise CharacterizationExecutionError(
+                f"the SMILES source could not be parsed: {error.__class__.__name__}",
+                reason="invalid-chemical-input",
+            ) from error
+        if mol is None:
+            raise CharacterizationExecutionError(
+                "the SMILES token did not parse into a valid molecule",
+                reason="invalid-chemical-input",
+            )
+        return mol
+
+    raise CharacterizationConfigurationError(
+        f"unsupported representation format: {input_format!r}",
+        reason="unsupported-format",
+    )
+
+
+def _validate_graph_eligibility(mol) -> None:
+    """Section 7.3: graph eligibility, checked before size limits and
+    before any value is computed. Never fragments, neutralizes, or
+    otherwise edits the molecule to make it eligible."""
+
+    if mol.GetNumAtoms() == 0:
+        raise CharacterizationExecutionError(
+            "the molecule is empty", reason="unsupported-structure"
+        )
+
+    if any(atom.GetAtomicNum() == 0 for atom in mol.GetAtoms()):
+        raise CharacterizationExecutionError(
+            "dummy atoms (atomic number 0) are not permitted",
+            reason="unsupported-structure",
+        )
+    if any(atom.HasQuery() for atom in mol.GetAtoms()) or any(
+        bond.HasQuery() for bond in mol.GetBonds()
+    ):
+        raise CharacterizationExecutionError(
+            "query atoms/bonds are not permitted", reason="unsupported-structure"
+        )
+    if len(Chem.GetMolSubstanceGroups(mol)) > 0:
+        raise CharacterizationExecutionError(
+            "SGroup/polymeric structures are not permitted",
+            reason="unsupported-structure",
+        )
+    for group in mol.GetStereoGroups():
+        if group.GetGroupType() in (
+            Chem.StereoGroupType.STEREO_AND,
+            Chem.StereoGroupType.STEREO_OR,
+        ):
+            raise CharacterizationExecutionError(
+                "enhanced stereo AND/OR groups are not permitted",
+                reason="unsupported-structure",
+            )
+
+    fragments = Chem.GetMolFrags(mol, sanitizeFrags=False)
+    if len(fragments) != 1:
+        raise CharacterizationExecutionError(
+            "exactly one connected component is required "
+            f"(found {len(fragments)}; no component was selected or removed)",
+            reason="unsupported-structure",
+        )
+
+
+def _validate_size_limits(mol) -> None:
+    """Section 6: the inclusive atom/bond ceilings, checked after parsing
+    and after eligibility, before any descriptor is computed."""
+
+    atom_count = mol.GetNumAtoms()
+    if atom_count > MAX_TOTAL_ATOM_COUNT:
+        raise CharacterizationExecutionError(
+            f"atom count {atom_count} exceeds the limit of {MAX_TOTAL_ATOM_COUNT}",
+            reason="molecular-size-limit",
+        )
+    bond_count = mol.GetNumBonds()
+    if bond_count > MAX_BOND_COUNT:
+        raise CharacterizationExecutionError(
+            f"bond count {bond_count} exceeds the limit of {MAX_BOND_COUNT}",
+            reason="molecular-size-limit",
+        )
+
+
+def _compute_characterization_values(mol) -> CharacterizationValues:
+    """Section 8: the ten values, each via the explicit method/kwargs the
+    frozen spec pins - never a different overload, and never a value
+    substituted by zero/null on failure (Section 11's invariant)."""
+
+    try:
+        with rdBase.BlockLogs():
+            formula = rdMolDescriptors.CalcMolFormula(
+                mol, separateIsotopes=True, abbreviateHIsotopes=False
+            )
+            molar_mass = Descriptors.MolWt(mol)
+            exact_mass = rdMolDescriptors.CalcExactMolWt(mol, onlyHeavy=False)
+            formal_charge = Chem.GetFormalCharge(mol)
+            heavy_atom_count = mol.GetNumHeavyAtoms()
+            hbd_count = rdMolDescriptors.CalcNumHBD(mol)
+            hba_count = rdMolDescriptors.CalcNumHBA(mol)
+            rotatable_bond_count = rdMolDescriptors.CalcNumRotatableBonds(
+                mol, strict=rdMolDescriptors.NumRotatableBondsOptions.Strict
+            )
+            tpsa = rdMolDescriptors.CalcTPSA(mol, force=True, includeSandP=False)
+            clogp = rdMolDescriptors.CalcCrippenDescriptors(
+                mol, includeHs=True, force=True
+            )[0]
+    except Exception as error:
+        raise CharacterizationExecutionError(
+            f"a descriptor method failed: {error.__class__.__name__}",
+            reason="descriptor-failure",
+        ) from error
+
+    if not formula:
+        raise CharacterizationExecutionError(
+            "formula must not be empty", reason="descriptor-failure"
+        )
+    for value in (molar_mass, exact_mass, tpsa, clogp):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(
+            value
+        ):
+            raise CharacterizationExecutionError(
+                "a descriptor returned a non-finite or mistyped value",
+                reason="descriptor-failure",
+            )
+    for value in (formal_charge, heavy_atom_count, hbd_count, hba_count, rotatable_bond_count):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise CharacterizationExecutionError(
+                "a descriptor returned a non-integer or mistyped value",
+                reason="descriptor-failure",
+            )
+
+    try:
+        return CharacterizationValues(
+            formula=formula,
+            molar_mass_g_mol=molar_mass,
+            exact_mass_da=exact_mass,
+            formal_charge_e=formal_charge,
+            heavy_atom_count=heavy_atom_count,
+            hbd_count=hbd_count,
+            hba_count=hba_count,
+            rotatable_bond_count=rotatable_bond_count,
+            tpsa_a2=tpsa,
+            clogp_wildman_crippen=clogp,
+        )
+    except Exception as error:
+        raise CharacterizationExecutionError(
+            f"the computed values failed the closed DTO contract: {error}",
+            reason="descriptor-failure",
+        ) from error
+
+
+# Section 9: the exact annotation properties omitted from the drawing
+# copy before any coordinate/preparation step - never a chemical field.
+_DRAWING_ANNOTATION_PROPERTIES_TO_CLEAR = (
+    "atomLabel",
+    "_displayLabel",
+    "_displayLabelW",
+    "molFileAlias",
+    "atomNote",
+    "bondNote",
+    "_MolFileRLabel",
+)
+
+
+def _clear_drawing_annotation_properties(mol) -> None:
+    for atom in mol.GetAtoms():
+        for key in _DRAWING_ANNOTATION_PROPERTIES_TO_CLEAR:
+            if atom.HasProp(key):
+                atom.ClearProp(key)
+    for bond in mol.GetBonds():
+        for key in _DRAWING_ANNOTATION_PROPERTIES_TO_CLEAR:
+            if bond.HasProp(key):
+                bond.ClearProp(key)
+
+
+def _graph_signature(mol) -> tuple:
+    """Section 9's before/after comparison: per-index atomic numbers,
+    isotopes, formal charges, explicit/implicit H counts, and bond
+    orders/aromaticity - never conformer/wedge direction, which are
+    presentation, not chemistry."""
+
+    atoms = tuple(
+        (
+            atom.GetAtomicNum(),
+            atom.GetIsotope(),
+            atom.GetFormalCharge(),
+            atom.GetNumExplicitHs(),
+            atom.GetNumImplicitHs(),
+        )
+        for atom in mol.GetAtoms()
+    )
+    # PrepareMolForDrawing may flip a bond's begin/end atom order to orient
+    # a wedge outward from its stereocenter (a presentation convention,
+    # never a connectivity change) - the endpoints are therefore compared
+    # as an unordered pair, never a directional (begin, end) tuple.
+    bonds = frozenset(
+        (
+            frozenset((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())),
+            bond.GetBondType(),
+            bond.GetIsAromatic(),
+        )
+        for bond in mol.GetBonds()
+    )
+    return atoms, bonds
+
+
+def _resolve_font_path_and_hash() -> tuple[Path, str]:
+    import hashlib
+
+    font_path = Path(RDConfig.RDDataDir) / "Fonts" / "Telex-Regular.ttf"
+    if not font_path.is_file():
+        raise CharacterizationConfigurationError(
+            "the RDKit Telex-Regular.ttf font asset is unavailable",
+            reason="drawing-unavailable",
+        )
+    font_bytes = font_path.read_bytes()
+    return font_path, hashlib.sha256(font_bytes).hexdigest()
+
+
+def _build_drawing_result(
+    mol,
+    *,
+    input_state_id: str,
+    representation_sha256: str,
+    engine_version: str,
+) -> tuple[DrawingResult, str]:
+    """Sections 9/10/10.2: produce, validate, and bind a 2D depiction SVG
+    for `mol`. Raises CharacterizationConfigurationError(reason=
+    "drawing-unavailable") if the drawing modules/font are unavailable,
+    or CharacterizationExecutionError(reason="depiction-failure") for any
+    graph-invariant or SVG-profile violation. `mol` itself is never
+    mutated - only a fresh copy is prepared for drawing."""
+
+    if _RDKIT_DRAWING_IMPORT_ERROR is not None:
+        raise CharacterizationConfigurationError(
+            "the rdkit drawing modules (Draw/RDConfig) are unavailable",
+            reason="drawing-unavailable",
+        )
+
+    font_path, font_sha256 = _resolve_font_path_and_hash()
+
+    draw_mol = Chem.Mol(mol)
+    _clear_drawing_annotation_properties(draw_mol)
+    before_signature = _graph_signature(draw_mol)
+    before_isomeric_smiles = Chem.MolToSmiles(draw_mol, isomericSmiles=True)
+
+    try:
+        with rdBase.BlockLogs():
+            rdDepictor.Compute2DCoords(
+                draw_mol,
+                canonOrient=True,
+                clearConfs=True,
+                coordMap={},
+                nFlipsPerSample=0,
+                nSample=0,
+                sampleSeed=0,
+                permuteDeg4Nodes=False,
+                bondLength=-1.0,
+                forceRDKit=True,
+                useRingTemplates=False,
+            )
+            prepared = rdMolDraw2D.PrepareMolForDrawing(
+                draw_mol,
+                kekulize=False,
+                addChiralHs=False,
+                wedgeBonds=True,
+                forceCoords=False,
+                wavyBonds=False,
+            )
+    except Exception as error:
+        raise CharacterizationExecutionError(
+            f"2D coordinate generation/preparation failed: {error.__class__.__name__}",
+            reason="depiction-failure",
+        ) from error
+
+    after_signature = _graph_signature(prepared)
+    if before_signature != after_signature:
+        raise CharacterizationExecutionError(
+            "the drawing preparation altered the molecule's chemical invariants",
+            reason="depiction-failure",
+        )
+    try:
+        with rdBase.BlockLogs():
+            after_isomeric_smiles = Chem.MolToSmiles(prepared, isomericSmiles=True)
+    except Exception as error:
+        raise CharacterizationExecutionError(
+            f"post-preparation stereochemistry check failed: {error.__class__.__name__}",
+            reason="depiction-failure",
+        ) from error
+    if before_isomeric_smiles != after_isomeric_smiles:
+        raise CharacterizationExecutionError(
+            "the drawing preparation altered stereochemistry",
+            reason="depiction-failure",
+        )
+
+    try:
+        with rdBase.BlockLogs():
+            drawer = rdMolDraw2D.MolDraw2DSVG(600, 400, -1, -1, False)
+            options = drawer.drawOptions()
+            options.prepareMolsBeforeDrawing = False
+            options.includeMetadata = False
+            options.includeAtomTags = False
+            options.addAtomIndices = False
+            options.addBondIndices = False
+            options.fontFile = str(font_path)
+            drawer.DrawMolecule(prepared, legend="")
+            drawer.FinishDrawing()
+            raw_svg = drawer.GetDrawingText()
+    except Exception as error:
+        raise CharacterizationExecutionError(
+            f"SVG rendering failed: {error.__class__.__name__}",
+            reason="depiction-failure",
+        ) from error
+
+    final_svg = validate_and_bind_depiction_svg(
+        raw_svg,
+        input_state_id=input_state_id,
+        representation_sha256=representation_sha256,
+        engine_version=engine_version,
+    )
+    final_bytes = final_svg.encode("utf-8")
+
+    import hashlib
+    import xml.parsers.expat as expat
+
+    drawing = DrawingResult(
+        font_name=font_path.name,
+        font_sha256_observed=font_sha256,
+        svg_sha256=hashlib.sha256(final_bytes).hexdigest(),
+        svg_size_bytes=len(final_bytes),
+        xml_parser_version_observed=expat.EXPAT_VERSION,
+        effective_parameters=DepictionEffectiveParameters(
+            compute2d=Compute2DParameters(),
+        ),
+    )
+    return drawing, final_svg
+
+
+def characterize_molecule_rdkit(
+    representation_bytes: bytes,
+    *,
+    input_format: str,
+    input_state_id: str,
+    representation_sha256: str,
+    include_svg: bool = False,
+) -> RDKitCharacterizationOutcome:
+    """Section 4/12: the RDKit adapter's single public entry point.
+    `representation_bytes` must already be a verified buffer (Section 6's
+    reader protocol is the caller's responsibility, never this
+    function's) - this function performs NO filesystem I/O of its own,
+    never reopens anything, and calls into RDKit exactly once per
+    molecule for parsing (Section 12, step 4/5: "uma vez").
+
+    Raises (never anything outside this closed taxonomy):
+    - CharacterizationInputError(reason="invalid-request") for a
+      malformed include_svg or input_state_id.
+    - CharacterizationConfigurationError for an unavailable/mismatched
+      engine, an unsupported format, or unavailable drawing.
+    - CharacterizationStorageError(reason="checksum-mismatch") if
+      representation_sha256 does not match representation_bytes.
+    - CharacterizationExecutionError for any chemistry/drawing failure.
+    """
+
+    if not isinstance(include_svg, bool):
+        raise CharacterizationInputError(
+            "include_svg must be a strict bool", reason="invalid-request"
+        )
+    if not isinstance(input_state_id, str):
+        raise CharacterizationInputError(
+            "input_state_id must be a str", reason="invalid-request"
+        )
+    try:
+        validate_input_id(input_state_id)
+    except ValueError as error:
+        raise CharacterizationInputError(
+            f"input_state_id is not a valid identifier: {error}",
+            reason="invalid-request",
+        ) from error
+
+    engine_name, engine_version = _resolve_characterization_engine()
+
+    if not isinstance(input_format, str):
+        raise CharacterizationInputError(
+            "input_format must be a str", reason="invalid-request"
+        )
+    if input_format not in ("sdf", "smiles"):
+        raise CharacterizationConfigurationError(
+            f"unsupported representation format: {input_format!r}",
+            reason="unsupported-format",
+        )
+
+    if not isinstance(representation_sha256, str):
+        raise CharacterizationInputError(
+            "representation_sha256 must be a str", reason="invalid-request"
+        )
+    import hashlib
+
+    observed_sha256 = hashlib.sha256(representation_bytes).hexdigest()
+    if observed_sha256 != representation_sha256.lower():
+        raise CharacterizationStorageError(
+            "representation_sha256 does not match representation_bytes",
+            reason="checksum-mismatch",
+            input_state_id=input_state_id,
+        )
+
+    try:
+        mol = _parse_molecule_rdkit(
+            representation_bytes, input_format=input_format
+        )
+        _validate_graph_eligibility(mol)
+        _validate_size_limits(mol)
+        values = _compute_characterization_values(mol)
+    except CharacterizationExecutionError as error:
+        if error.input_state_id is None:
+            error.input_state_id = input_state_id
+        raise
+
+    if input_format == "sdf":
+        parser_block = SdfParserParameters()
+    else:
+        parser_block = SmilesParserParameters()
+    effective_parameters = CharacterizationEffectiveParameters(parser=parser_block)
+
+    drawing: Optional[DrawingResult] = None
+    svg: Optional[str] = None
+    warnings: tuple[str, ...] = ("derived-computational-values", "tpsa-no-additional-s-p")
+
+    if include_svg:
+        try:
+            drawing, svg = _build_drawing_result(
+                mol,
+                input_state_id=input_state_id,
+                representation_sha256=representation_sha256,
+                engine_version=engine_version,
+            )
+        except CharacterizationError as error:
+            if error.input_state_id is None:
+                error.input_state_id = input_state_id
+            raise
+        warnings = warnings + ("generated-2d-not-conformer",)
+
+    try:
+        return RDKitCharacterizationOutcome(
+            engine_name=engine_name,
+            engine_version=engine_version,
+            representation_format_resolved=input_format,
+            values=values,
+            effective_parameters=effective_parameters,
+            warnings=warnings,
+            drawing=drawing,
+            svg=svg,
+        )
+    except Exception as error:
+        raise CharacterizationExecutionError(
+            f"the adapter outcome failed the closed DTO contract: {error}",
+            reason="invalid-engine-result",
+            input_state_id=input_state_id,
+        ) from error

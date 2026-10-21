@@ -12,7 +12,21 @@ from rdkit import Chem, rdBase
 from rdkit.Chem import rdMolDescriptors
 from rdkit.Chem.MolStandardize import rdMolStandardize
 
+import hashlib
+import math
+
+import molecular.characterization as characterization_module
 import molecular.rdkit_tautomer as rdkit_tautomer_module
+from molecular.characterization import (
+    CharacterizationConfigurationError,
+    CharacterizationError,
+    CharacterizationExecutionError,
+    CharacterizationInputError,
+    CharacterizationStorageError,
+    MAX_BOND_COUNT,
+    MAX_TOTAL_ATOM_COUNT,
+    REQUIRED_ENGINE_VERSION,
+)
 from molecular.promotion import LigandPromotionPolicy
 from molecular.rdkit_tautomer import (
     DisconnectedStructureError,
@@ -27,6 +41,7 @@ from molecular.rdkit_tautomer import (
     RDKitTautomerEnumerationResult,
     RDKitUnavailableError,
     _classify_record_counts,
+    characterize_molecule_rdkit,
     enumerate_tautomers_rdkit,
     inspect_single_sdf_for_promotion,
     resolve_rdkit_engine,
@@ -954,3 +969,631 @@ def test_blank_title_line_still_emits_name_absent_warning(tmp_path):
     result = inspect_single_sdf_for_promotion(source_path=sdf_path, policy=_default_policy())
 
     assert "sd-name-property-absent" in result.warnings
+
+
+# =========================================================================
+# Increment 020-A, Checkpoint 1: characterize_molecule_rdkit (Sections
+# 4/6/7/8/9/10/12 of the frozen spec). Bytes in, neutral DTO out - every
+# fixture below is either a real molecule constructed through the public
+# RDKit API (never a mocked chemistry result) or a hand-crafted byte
+# string exercising one exact grammar rule.
+# =========================================================================
+
+_CAFFEINE_SMILES = "CN1C=NC2=C1C(=O)N(C)C(=O)N2C"
+_ANTHRACENE_SMILES = "c1ccc2cc3ccccc3cc2c1"
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _characterize(data: bytes, *, fmt="smiles", state_id="s1", include_svg=False):
+    return characterize_molecule_rdkit(
+        data,
+        input_format=fmt,
+        input_state_id=state_id,
+        representation_sha256=_sha256(data),
+        include_svg=include_svg,
+    )
+
+
+def _sdf_bytes_from_smiles(smiles: str) -> bytes:
+    mol = Chem.MolFromSmiles(smiles)
+    return (Chem.MolToMolBlock(mol) + "$$$$\n").encode("ascii")
+
+
+# --- Section 8: engine resolution, pinned to the exact observed version -
+
+
+def test_characterization_engine_requires_exact_pinned_version():
+    data = b"CCO\n"
+    outcome = _characterize(data)
+    assert outcome.engine_name == "rdkit"
+    assert outcome.engine_version == REQUIRED_ENGINE_VERSION == "2026.03.6"
+
+
+def test_characterization_engine_unavailable_on_missing_import(monkeypatch):
+    monkeypatch.setattr(rdkit_tautomer_module, "_RDKIT_IMPORT_ERROR", ImportError("simulated"))
+
+    with pytest.raises(CharacterizationConfigurationError) as excinfo:
+        _characterize(b"CCO\n")
+    assert excinfo.value.reason == "engine-unavailable"
+
+
+def test_characterization_engine_unavailable_on_version_mismatch(monkeypatch):
+    monkeypatch.setattr(rdkit_tautomer_module.rdBase, "rdkitVersion", "2099.01.1")
+
+    with pytest.raises(CharacterizationConfigurationError) as excinfo:
+        _characterize(b"CCO\n")
+    assert excinfo.value.reason == "engine-unavailable"
+
+
+# --- request-shape validation (defensive, before engine resolution) -----
+
+
+def test_include_svg_must_be_strict_bool():
+    data = b"CCO\n"
+    with pytest.raises(CharacterizationInputError) as excinfo:
+        characterize_molecule_rdkit(
+            data,
+            input_format="smiles",
+            input_state_id="s1",
+            representation_sha256=_sha256(data),
+            include_svg=1,
+        )
+    assert excinfo.value.reason == "invalid-request"
+
+
+@pytest.mark.parametrize(
+    "bad_id", ["", ".", "..", "has space", "has/slash", "has\\backslash", "-leading-dash"]
+)
+def test_input_state_id_rejected_before_engine_access(bad_id):
+    data = b"CCO\n"
+    with pytest.raises(CharacterizationInputError) as excinfo:
+        characterize_molecule_rdkit(
+            data,
+            input_format="smiles",
+            input_state_id=bad_id,
+            representation_sha256=_sha256(data),
+        )
+    assert excinfo.value.reason == "invalid-request"
+
+
+def test_input_state_id_is_preserved_verbatim_case_sensitive():
+    data = b"CCO\n"
+    svg_bytes = _characterize(data, state_id="Caffeine-01_a", include_svg=True).svg
+    assert 'data-state-id="Caffeine-01_a"' in svg_bytes
+
+
+def test_unsupported_format_is_configuration_error():
+    data = b"CCO\n"
+    with pytest.raises(CharacterizationConfigurationError) as excinfo:
+        _characterize(data, fmt="mol2")
+    assert excinfo.value.reason == "unsupported-format"
+
+
+def test_checksum_mismatch_is_storage_error():
+    data = b"CCO\n"
+    with pytest.raises(CharacterizationStorageError) as excinfo:
+        characterize_molecule_rdkit(
+            data,
+            input_format="smiles",
+            input_state_id="s1",
+            representation_sha256="a" * 64,
+        )
+    assert excinfo.value.reason == "checksum-mismatch"
+    assert excinfo.value.input_state_id == "s1"
+
+
+# --- Section 7.1: SDF grammar --------------------------------------------
+
+
+def test_sdf_real_v2000_record_is_accepted():
+    data = _sdf_bytes_from_smiles("CCO")
+    outcome = _characterize(data, fmt="sdf")
+    assert outcome.values.formula == "C2H6O"
+    assert outcome.representation_format_resolved == "sdf"
+
+
+def test_sdf_two_records_is_rejected():
+    data = _sdf_bytes_from_smiles("CCO") + _sdf_bytes_from_smiles("CCO")
+    with pytest.raises(CharacterizationExecutionError) as excinfo:
+        _characterize(data, fmt="sdf")
+    assert excinfo.value.reason == "invalid-chemical-input"
+
+
+def test_sdf_valid_plus_invalid_record_is_rejected():
+    valid = _sdf_bytes_from_smiles("CCO")
+    data = valid + b"garbage not a mol block\n$$$$\n"
+    with pytest.raises(CharacterizationExecutionError):
+        _characterize(data, fmt="sdf")
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda data: data.replace(b"$$$$\n", b""),  # no delimiter
+        lambda data: data + b"$$$$\n",  # two delimiters
+        lambda data: data.replace(b"$$$$\n", b"$$$$ \n"),  # delimiter with trailing space
+        lambda data: data + b"\n",  # whitespace after delimiter
+    ],
+)
+def test_sdf_physical_delimiter_grammar_violations_are_rejected(mutate):
+    data = mutate(_sdf_bytes_from_smiles("CCO"))
+    with pytest.raises(CharacterizationExecutionError) as excinfo:
+        _characterize(data, fmt="sdf")
+    assert excinfo.value.reason == "invalid-chemical-input"
+
+
+def test_sdf_lone_cr_is_rejected():
+    data = _sdf_bytes_from_smiles("CCO").replace(b"\n", b"\r", 1)
+    with pytest.raises(CharacterizationExecutionError) as excinfo:
+        _characterize(data, fmt="sdf")
+    assert excinfo.value.reason == "invalid-chemical-input"
+
+
+def test_sdf_crlf_is_accepted():
+    data = _sdf_bytes_from_smiles("CCO").replace(b"\n", b"\r\n")
+    outcome = _characterize(data, fmt="sdf")
+    assert outcome.values.formula == "C2H6O"
+
+
+def test_sdf_dollar_substring_in_property_is_not_a_delimiter():
+    base = _sdf_bytes_from_smiles("CCO")
+    # insert a property block whose value contains the $$$$ substring but
+    # is not an exact physical line on its own.
+    hostile = base.replace(
+        b"M  END\n", b"M  END\n>  <NOTE>\nvalue has $$$$ inside it\n\n"
+    )
+    outcome = _characterize(hostile, fmt="sdf")
+    assert outcome.values.formula == "C2H6O"
+
+
+def test_sdf_nul_byte_is_rejected():
+    data = _sdf_bytes_from_smiles("CCO")[:10] + b"\x00" + _sdf_bytes_from_smiles("CCO")[10:]
+    with pytest.raises(CharacterizationExecutionError):
+        _characterize(data, fmt="sdf")
+
+
+def test_sdf_bom_is_rejected():
+    data = b"\xef\xbb\xbf" + _sdf_bytes_from_smiles("CCO")
+    with pytest.raises(CharacterizationExecutionError):
+        _characterize(data, fmt="sdf")
+
+
+# --- Section 7.2: SMILES grammar -----------------------------------------
+
+
+def test_smiles_enumeration_child_state_is_accepted_with_lf():
+    data = (_ANTHRACENE_SMILES + "\n").encode("ascii")
+    outcome = _characterize(data, fmt="smiles")
+    assert outcome.values.formula == "C14H10"
+
+
+def test_smiles_without_terminator_is_accepted():
+    data = b"CCO"
+    outcome = _characterize(data, fmt="smiles")
+    assert outcome.values.formula == "C2H6O"
+
+
+def test_smiles_with_single_crlf_is_accepted():
+    data = b"CCO\r\n"
+    outcome = _characterize(data, fmt="smiles")
+    assert outcome.values.formula == "C2H6O"
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        b"CCO\r",  # lone CR
+        b"CCO\n\n",  # newline duplicated
+        b"CCO\nCCO\n",  # second line
+        b"CCO ethanol\n",  # name column
+        b"CCO |$a;b;c$|\n",  # CXSMILES
+        b"CC O\n",  # internal whitespace
+        b" CCO\n",  # leading whitespace
+        b"CCO \n",  # trailing whitespace before terminator
+        b"\n",  # empty token
+        b"",  # empty source
+    ],
+)
+def test_smiles_grammar_violations_are_rejected(data):
+    with pytest.raises(CharacterizationExecutionError) as excinfo:
+        _characterize(data, fmt="smiles")
+    assert excinfo.value.reason == "invalid-chemical-input"
+
+
+def test_smiles_non_ascii_is_rejected():
+    data = "CCOé\n".encode("utf-8")
+    with pytest.raises(CharacterizationExecutionError):
+        _characterize(data, fmt="smiles")
+
+
+def test_smiles_nul_and_del_are_rejected():
+    with pytest.raises(CharacterizationExecutionError):
+        _characterize(b"CC\x00O\n", fmt="smiles")
+    with pytest.raises(CharacterizationExecutionError):
+        _characterize(b"CC\x7fO\n", fmt="smiles")
+
+
+# --- Section 7.3: graph eligibility ---------------------------------------
+
+
+def test_disconnected_salt_is_rejected():
+    with pytest.raises(CharacterizationExecutionError) as excinfo:
+        _characterize(b"[Na+].[Cl-]\n", fmt="smiles")
+    assert excinfo.value.reason == "unsupported-structure"
+
+
+def test_dummy_atom_is_rejected():
+    with pytest.raises(CharacterizationExecutionError) as excinfo:
+        _characterize(b"*CC\n", fmt="smiles")
+    assert excinfo.value.reason == "unsupported-structure"
+
+
+def test_sgroup_is_rejected_by_eligibility_check():
+    """SGroup/polymeric markup cannot be produced by plain SMILES/SDF
+    text in this corpus - this exercises the production eligibility
+    function directly against a real RDKit SubstanceGroup object, the
+    same object GetMolSubstanceGroups would return from any real file
+    that declared one (Section 16's own allowance to test an internal
+    decision function directly, mirroring _classify_record_counts
+    above)."""
+
+    mol = Chem.RWMol(Chem.MolFromSmiles("CCO"))
+    sgroup = Chem.CreateMolSubstanceGroup(mol, "SRU")
+    sgroup.SetAtoms([0, 1])
+
+    with pytest.raises(CharacterizationExecutionError) as excinfo:
+        rdkit_tautomer_module._validate_graph_eligibility(mol)
+    assert excinfo.value.reason == "unsupported-structure"
+
+
+@pytest.mark.parametrize("group_type_name", ["STEREO_AND", "STEREO_OR"])
+def test_enhanced_stereo_groups_are_rejected_by_eligibility_check(group_type_name):
+    mol = Chem.RWMol(Chem.MolFromSmiles("C[C@H](N)O"))
+    group_type = getattr(Chem.StereoGroupType, group_type_name)
+    stereo_group = Chem.CreateStereoGroup(group_type, mol, [1])
+    mol.SetStereoGroups([stereo_group])
+
+    with pytest.raises(CharacterizationExecutionError) as excinfo:
+        rdkit_tautomer_module._validate_graph_eligibility(mol)
+    assert excinfo.value.reason == "unsupported-structure"
+
+
+def test_absolute_stereo_group_is_not_rejected_by_eligibility_check():
+    mol = Chem.RWMol(Chem.MolFromSmiles("C[C@H](N)O"))
+    stereo_group = Chem.CreateStereoGroup(Chem.StereoGroupType.STEREO_ABSOLUTE, mol, [1])
+    mol.SetStereoGroups([stereo_group])
+
+    rdkit_tautomer_module._validate_graph_eligibility(mol)  # must not raise
+
+
+def test_empty_molecule_is_rejected():
+    with pytest.raises(CharacterizationExecutionError) as excinfo:
+        _characterize(b"\x20", fmt="smiles")  # single space - no token at all
+    # the grammar check rejects this before eligibility is ever reached
+    assert excinfo.value.reason == "invalid-chemical-input"
+
+
+# --- Section 6: closed, inclusive size limits -----------------------------
+
+
+def test_atom_count_over_limit_is_rejected():
+    data = ("C" * (MAX_TOTAL_ATOM_COUNT + 1) + "\n").encode("ascii")
+    with pytest.raises(CharacterizationExecutionError) as excinfo:
+        _characterize(data, fmt="smiles")
+    assert excinfo.value.reason == "molecular-size-limit"
+
+
+def test_atom_count_at_exact_limit_is_accepted():
+    data = ("C" * MAX_TOTAL_ATOM_COUNT + "\n").encode("ascii")
+    outcome = _characterize(data, fmt="smiles")
+    assert outcome.values.heavy_atom_count == MAX_TOTAL_ATOM_COUNT
+
+
+# --- Section 8: the ten values, against the frozen reference vector ------
+
+
+def test_caffeine_reference_vector():
+    data = (_CAFFEINE_SMILES + "\n").encode("ascii")
+    outcome = _characterize(data, fmt="smiles")
+    values = outcome.values
+
+    assert values.formula == "C8H10N4O2"
+    assert values.formal_charge_e == 0
+    assert values.heavy_atom_count == 14
+    assert values.hbd_count == 0
+    assert values.hba_count == 3
+    assert values.rotatable_bond_count == 0
+    assert math.isclose(values.molar_mass_g_mol, 194.194, abs_tol=1e-8)
+    assert math.isclose(values.exact_mass_da, 194.08037556, abs_tol=1e-8)
+    assert math.isclose(values.tpsa_a2, 61.82, abs_tol=1e-8)
+    assert math.isclose(values.clogp_wildman_crippen, -1.0293, abs_tol=1e-8)
+
+
+@pytest.mark.parametrize(
+    "smiles,expected_formula,expected_charge",
+    [
+        ("CC(=O)O", "C2H4O2", 0),  # acetic acid
+        ("OC(=O)Cc1ccccc1Nc1c(Cl)cccc1Cl", "C14H11Cl2NO2", 0),  # diclofenac
+        ("CCNc1nc(Cl)nc(NC(C)C)n1", "C8H14ClN5", 0),  # atrazine
+        ("CCOP(=S)(OCC)Oc1ccc([N+](=O)[O-])cc1", "C10H14NO5PS", 0),  # parathion-like structure
+    ],
+)
+def test_real_production_fixtures_characterize_without_tautomer_enumeration(
+    smiles, expected_formula, expected_charge
+):
+    data = (smiles + "\n").encode("ascii")
+    outcome = _characterize(data, fmt="smiles")
+    assert outcome.values.formula == expected_formula
+    assert outcome.values.formal_charge_e == expected_charge
+    # characterization never enumerates tautomers - no such field exists
+    # on the outcome at all.
+    assert not hasattr(outcome, "candidates")
+
+
+def test_isotope_and_charge_preservation():
+    outcome_13c = _characterize(b"[13CH4]\n", fmt="smiles")
+    assert outcome_13c.values.formula == "[13C]H4"
+
+    outcome_ammonium = _characterize(b"[NH4+]\n", fmt="smiles")
+    assert outcome_ammonium.values.formal_charge_e == 1
+
+    outcome_acetate = _characterize(b"CC(=O)[O-]\n", fmt="smiles")
+    assert outcome_acetate.values.formal_charge_e == -1
+
+
+def test_hbd_hba_use_the_pinned_api_not_nhoh_nocount():
+    # methylamine=1, ammonia=1, diamine=2 (Section 16, T-020A-045)
+    assert _characterize(b"CN\n", fmt="smiles").values.hbd_count == 1
+    assert _characterize(b"N\n", fmt="smiles").values.hbd_count == 1
+    assert _characterize(b"NCCN\n", fmt="smiles").values.hbd_count == 2
+
+
+def test_rotatable_bonds_strict_discriminant_against_nonstrict():
+    data = b"CC(=O)NC\n"  # N-methylacetamide
+    outcome = _characterize(data, fmt="smiles")
+    mol = Chem.MolFromSmiles("CC(=O)NC")
+    strict = rdMolDescriptors.CalcNumRotatableBonds(
+        mol, strict=rdMolDescriptors.NumRotatableBondsOptions.Strict
+    )
+    nonstrict = rdMolDescriptors.CalcNumRotatableBonds(
+        mol, strict=rdMolDescriptors.NumRotatableBondsOptions.NonStrict
+    )
+    assert strict != nonstrict
+    assert outcome.values.rotatable_bond_count == strict
+
+
+def test_tpsa_sp_discriminant_against_include_s_and_p():
+    data = b"CS(=O)(=O)C\n"  # dimethyl sulfone
+    outcome = _characterize(data, fmt="smiles")
+    mol = Chem.MolFromSmiles("CS(=O)(=O)C")
+    no_sp = rdMolDescriptors.CalcTPSA(mol, force=True, includeSandP=False)
+    with_sp = rdMolDescriptors.CalcTPSA(mol, force=True, includeSandP=True)
+    assert no_sp != with_sp
+    assert math.isclose(outcome.values.tpsa_a2, no_sp, abs_tol=1e-8)
+
+
+def test_descriptor_failure_is_execution_error(monkeypatch):
+    def _raise(*_args, **_kwargs):
+        raise RuntimeError("simulated descriptor failure")
+
+    monkeypatch.setattr(rdkit_tautomer_module.rdMolDescriptors, "CalcTPSA", _raise)
+
+    with pytest.raises(CharacterizationExecutionError) as excinfo:
+        _characterize(b"CCO\n", fmt="smiles")
+    assert excinfo.value.reason == "descriptor-failure"
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
+
+
+def test_descriptor_returning_non_finite_is_rejected(monkeypatch):
+    monkeypatch.setattr(
+        rdkit_tautomer_module.rdMolDescriptors, "CalcTPSA", lambda *a, **k: float("nan")
+    )
+
+    with pytest.raises(CharacterizationExecutionError) as excinfo:
+        _characterize(b"CCO\n", fmt="smiles")
+    assert excinfo.value.reason == "descriptor-failure"
+
+
+def test_stereo_centers_are_preserved_not_enumerated():
+    defined = _characterize(b"C[C@H](N)O\n", fmt="smiles")
+    undefined = _characterize(b"CC(N)O\n", fmt="smiles")
+    assert defined.values.formula == undefined.values.formula == "C2H7NO"
+    # characterization never produces more than one candidate structure -
+    # this is a single-molecule query, not an enumeration.
+
+
+def test_representation_bytes_are_never_mutated():
+    data = bytearray((_CAFFEINE_SMILES + "\n").encode("ascii"))
+    original = bytes(data)
+    _characterize(bytes(data), fmt="smiles")
+    assert bytes(data) == original
+
+
+# --- Sections 9/10/10.2: optional 2D depiction and SVG validator --------
+
+
+@pytest.mark.parametrize(
+    "smiles",
+    [
+        _CAFFEINE_SMILES,
+        _ANTHRACENE_SMILES,  # T-020A-051's required fused-polycyclic canary
+        "CC(=O)Oc1ccccc1C(=O)O",  # aspirin
+        "C[C@H](N)C(=O)O",  # alanine - a defined stereocenter drawn without
+        # a filled wedge triangle in this pinned engine/font/geometry
+        # combination (confirmed empirically - see the dedicated gap test
+        # below for the case that DOES need one)
+        "[13CH3][NH3+]",  # isotope + charge probe
+    ],
+)
+def test_depiction_produces_a_validated_svg_for_each_probe(smiles):
+    data = (smiles + "\n").encode("ascii")
+    outcome = _characterize(data, fmt="smiles", include_svg=True)
+
+    assert outcome.svg is not None
+    assert outcome.drawing is not None
+    assert outcome.drawing.svg_sha256 == hashlib.sha256(
+        outcome.svg.encode("utf-8")
+    ).hexdigest()
+    assert outcome.drawing.svg_size_bytes == len(outcome.svg.encode("utf-8"))
+    assert 'data-profile="molecular-depiction-v1"' in outcome.svg
+    assert "generated-2d-not-conformer" in outcome.warnings
+
+
+def test_depiction_preserves_explicit_hydrogens_and_isotopes():
+    data = b"[2H]C([2H])([2H])CO\n"
+    outcome = _characterize(data, fmt="smiles", include_svg=True)
+    assert outcome.values.formula == "C2H3[2H]3O"
+    assert outcome.svg is not None
+
+
+def test_filled_wedge_triangle_z_command_is_an_unresolved_profile_gap():
+    """CHECKPOINT 1 FINDING (for the report, not silently patched): the
+    frozen spec's closed `d` command grammar (Section 10.1) is M/L/Q
+    only, confronted against five bundled example drawings plus the
+    mandatory antracene canary (Section 16, T-020A-051) - none of which
+    happens to need a FILLED stereo wedge triangle. A real chiral center
+    whose wedge bond IS drawn as a filled triangle (confirmed on this
+    pinned rdkit==2026.3.6 Windows build) produces a `d` attribute
+    ending in an absolute `Z` (closepath) command to close that
+    triangle - a command this checkpoint's grammar does not cover.
+
+    Per Section 10.1's own instruction ("saída que exija comando não
+    coberto falha explicitamente, sem ampliar o perfil silenciosamente
+    ... Qualquer incompatibilidade deve ser relatada"), this is NOT
+    silently patched into the grammar here - the adapter correctly
+    raises depiction-failure, and this gap is reported upward for
+    explicit review rather than resolved unilaterally in this
+    checkpoint."""
+
+    data = b"C[C@@H](C(=O)O)Nc1ccc(Cl)cc1\n"
+    with pytest.raises(CharacterizationExecutionError) as excinfo:
+        _characterize(data, fmt="smiles", include_svg=True)
+    assert excinfo.value.reason == "depiction-failure"
+
+
+def test_force_rdkit_remains_effective_regardless_of_global_coordgen_preference():
+    from rdkit.Chem import rdDepictor as rddepictor_module
+
+    original = rddepictor_module.SetPreferCoordGen
+    rddepictor_module.SetPreferCoordGen(True)
+    try:
+        data = (_CAFFEINE_SMILES + "\n").encode("ascii")
+        outcome = _characterize(data, fmt="smiles", include_svg=True)
+        assert outcome.svg is not None
+    finally:
+        rddepictor_module.SetPreferCoordGen(False)
+
+
+def test_font_evidence_is_real_and_matches_the_documented_hash():
+    data = b"CCO\n"
+    outcome = _characterize(data, fmt="smiles", include_svg=True)
+    assert outcome.drawing.font_name == "Telex-Regular.ttf"
+    # Section 9's Linux-observed hash, now independently confirmed real
+    # and byte-identical on this Windows production environment's wheel.
+    assert (
+        outcome.drawing.font_sha256_observed
+        == "eeaa2d17d105b6b46e5368ecd990f5b19c50131ff922dbf79bfb9bb45c249871"
+    )
+
+
+def test_hostile_annotation_properties_are_stripped_from_the_svg():
+    mol = Chem.MolFromSmiles("CCO")
+    mol.SetProp("_Name", "<script>evil</script>")
+    for atom in mol.GetAtoms():
+        atom.SetProp("atomNote", "<hostile markup>")
+    data = (Chem.MolToMolBlock(mol) + "$$$$\n").encode("ascii")
+
+    outcome = _characterize(data, fmt="sdf", include_svg=True)
+
+    assert "<script>" not in outcome.svg
+    assert "<hostile markup>" not in outcome.svg
+    assert "evil" not in outcome.svg
+
+
+def test_drawer_is_never_invoked_when_svg_not_requested(monkeypatch):
+    def _fail_if_called(*_args, **_kwargs):
+        raise AssertionError("drawing must not be attempted when include_svg=False")
+
+    monkeypatch.setattr(rdkit_tautomer_module, "_build_drawing_result", _fail_if_called)
+
+    data = b"CCO\n"
+    outcome = _characterize(data, fmt="smiles", include_svg=False)
+    assert outcome.svg is None
+    assert outcome.drawing is None
+    assert outcome.values.formula == "C2H6O"
+
+
+def test_drawing_unavailable_does_not_affect_calculation_only_requests(monkeypatch):
+    monkeypatch.setattr(
+        rdkit_tautomer_module, "_RDKIT_DRAWING_IMPORT_ERROR", ImportError("simulated")
+    )
+
+    data = b"CCO\n"
+    outcome = _characterize(data, fmt="smiles", include_svg=False)
+    assert outcome.values.formula == "C2H6O"
+
+    with pytest.raises(CharacterizationConfigurationError) as excinfo:
+        _characterize(data, fmt="smiles", include_svg=True)
+    assert excinfo.value.reason == "drawing-unavailable"
+
+
+def test_depiction_failure_never_returns_a_partial_outcome(monkeypatch):
+    def _raise(*_args, **_kwargs):
+        raise RuntimeError("simulated drawing failure")
+
+    monkeypatch.setattr(rdkit_tautomer_module.rdMolDraw2D, "MolDraw2DSVG", _raise)
+
+    data = b"CCO\n"
+    with pytest.raises(CharacterizationExecutionError) as excinfo:
+        _characterize(data, fmt="smiles", include_svg=True)
+    assert excinfo.value.reason == "depiction-failure"
+
+
+def test_svg_binding_links_state_id_hash_and_engine_to_the_entry():
+    data = (_CAFFEINE_SMILES + "\n").encode("ascii")
+    outcome = characterize_molecule_rdkit(
+        data,
+        input_format="smiles",
+        input_state_id="caffeine-42",
+        representation_sha256=_sha256(data),
+        include_svg=True,
+    )
+    assert 'data-state-id="caffeine-42"' in outcome.svg
+    assert f'data-representation-sha256="{_sha256(data)}"' in outcome.svg
+    assert f'data-engine-version="{outcome.engine_version}"' in outcome.svg
+
+
+# --- Section 13: RDKit native log suppression and restoration -----------
+
+
+def test_native_rdkit_logs_are_suppressed_and_restored(capfd):
+    garbage_sdf = b"garbage not a mol block\n$$$$\n"
+    with pytest.raises(CharacterizationExecutionError):
+        _characterize(garbage_sdf, fmt="sdf")
+
+    captured = capfd.readouterr()
+    assert "ERROR" not in captured.err
+
+    # logs must be restored, not permanently suppressed - a subsequent
+    # real parse failure through the pre-existing tautomer adapter must
+    # still be able to log if it chooses to (no global DisableLog was
+    # left behind by the characterization adapter's own BlockLogs scopes).
+    outcome = _characterize(b"CCO\n", fmt="smiles")
+    assert outcome.values.formula == "C2H6O"
+
+
+# --- Section 15: legacy enumeration/imports are unaffected ---------------
+
+
+def test_characterization_imports_do_not_shadow_legacy_rdkit_import_error():
+    assert rdkit_tautomer_module._RDKIT_IMPORT_ERROR is None
+    assert rdkit_tautomer_module._RDKIT_DRAWING_IMPORT_ERROR is None
+
+
+def test_enumeration_still_works_after_characterization_additions(tmp_path):
+    sdf_path = _write_sdf(tmp_path, "ethanol.sdf", "CCO")
+    result = enumerate_tautomers_rdkit(source_path=sdf_path, source_format="sdf")
+    assert result.enumerated_unique_count >= 1
