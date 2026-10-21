@@ -477,6 +477,172 @@ def test_major1_complement_preserves_contracted_invariants():
     assert restored_values == values
 
 
+# =========================================================================
+# Checkpoint 1 MAJOR-1 string closure: the complement above fixed six of
+# the 17 ordinary `str`/`str | None` fields the new DTOs define (every
+# plain string field across every BaseModel this module defines, Literal/
+# enum fields excluded - the same inventory the architect's probe used,
+# evidence/architect-complete-string-matrix.json). The other 11 -
+# DrawingResult's two hashes, its font/xml_parser version strings,
+# CharacterizationProvenance.representation_path/
+# representation_format_declared/engine_version/application_version, and
+# the two top-level nullable `svg` fields on MolecularCharacterizationResult
+# and RDKitCharacterizationOutcome - still coerced bytes/bytearray on that
+# HEAD, by both the constructor and `model_validate(dict)`. This closes
+# the full 17-field matrix; nothing here is a new finding beyond that one.
+# =========================================================================
+
+
+def _valid_drawing_kwargs(**overrides):
+    base = dict(
+        font_name="Telex-Regular.ttf",
+        font_sha256_observed="a" * 64,
+        svg_sha256=hashlib.sha256(b"<svg/>").hexdigest(),
+        svg_size_bytes=len(b"<svg/>"),
+        xml_parser_version_observed="expat_2.6.0",
+    )
+    base.update(overrides)
+    return base
+
+
+def _valid_result_kwargs(**overrides):
+    base = dict(
+        values=CharacterizationValues(**_valid_values_kwargs()),
+        provenance=CharacterizationProvenance(**_valid_provenance_kwargs()),
+        warnings=_base_warnings() + ("generated-2d-not-conformer",),
+        drawing=DrawingResult(**_valid_drawing_kwargs()),
+        svg="<svg/>",
+    )
+    base.update(overrides)
+    return base
+
+
+def _valid_outcome_kwargs(**overrides):
+    base = dict(
+        engine_version="2026.03.6",
+        representation_format_resolved="smiles",
+        values=CharacterizationValues(**_valid_values_kwargs()),
+        effective_parameters=CharacterizationEffectiveParameters(
+            parser=SmilesParserParameters()
+        ),
+        warnings=(
+            "derived-computational-values",
+            "tpsa-no-additional-s-p",
+            "generated-2d-not-conformer",
+        ),
+        drawing=DrawingResult(**_valid_drawing_kwargs()),
+        svg="<svg/>",
+    )
+    base.update(overrides)
+    return base
+
+
+_SEVENTEEN_FIELD_STRING_MATRIX = [
+    (CharacterizationValues, "formula", _valid_values_kwargs),
+    (DrawingResult, "font_name", _valid_drawing_kwargs),
+    (DrawingResult, "font_sha256_observed", _valid_drawing_kwargs),
+    (DrawingResult, "svg_sha256", _valid_drawing_kwargs),
+    (DrawingResult, "xml_parser_version_observed", _valid_drawing_kwargs),
+    (CharacterizationProvenance, "input_state_id", _valid_provenance_kwargs),
+    (CharacterizationProvenance, "entity_id", _valid_provenance_kwargs),
+    (
+        CharacterizationProvenance,
+        "state_record_sha256_observed",
+        _valid_provenance_kwargs,
+    ),
+    (CharacterizationProvenance, "representation_path", _valid_provenance_kwargs),
+    (
+        CharacterizationProvenance,
+        "representation_format_declared",
+        _valid_provenance_kwargs,
+    ),
+    (
+        CharacterizationProvenance,
+        "representation_checksum_expected",
+        _valid_provenance_kwargs,
+    ),
+    (
+        CharacterizationProvenance,
+        "representation_checksum_observed",
+        _valid_provenance_kwargs,
+    ),
+    (CharacterizationProvenance, "engine_version", _valid_provenance_kwargs),
+    (
+        CharacterizationProvenance,
+        "application_version",
+        lambda: _valid_provenance_kwargs(application_version="0.1.0"),
+    ),
+    (MolecularCharacterizationResult, "svg", _valid_result_kwargs),
+    (RDKitCharacterizationOutcome, "engine_version", _valid_outcome_kwargs),
+    (RDKitCharacterizationOutcome, "svg", _valid_outcome_kwargs),
+]
+
+assert len(_SEVENTEEN_FIELD_STRING_MATRIX) == 17
+
+
+@pytest.mark.parametrize(
+    "model_cls,field,kwargs_factory",
+    _SEVENTEEN_FIELD_STRING_MATRIX,
+    ids=[f"{cls.__name__}.{field}" for cls, field, _ in _SEVENTEEN_FIELD_STRING_MATRIX],
+)
+def test_complete_17_field_string_matrix_rejects_bytes_and_bytearray_everywhere(
+    model_cls, field, kwargs_factory
+):
+    # Mirrors the architect's own probe method exactly: the real production
+    # module, the real constructor AND model_validate(dict), bytes and
+    # bytearray, error localized to the target field - never a copied
+    # validator, never model_construct, never a monkeypatch.
+    base = kwargs_factory()
+    native_value = base[field]
+    assert isinstance(native_value, str)
+
+    native = model_cls(**base)
+    assert type(getattr(native, field)) is str
+    assert getattr(native, field) == native_value
+    assert model_cls.model_validate_json(native.model_dump_json()) == native
+
+    for input_type in (bytes, bytearray):
+        raw = input_type(native_value.encode("utf-8"))
+        for use_model_validate in (False, True):
+            payload = dict(base, **{field: raw})
+            with pytest.raises(ValidationError) as excinfo:
+                if use_model_validate:
+                    model_cls.model_validate(payload)
+                else:
+                    model_cls(**payload)
+            assert any(
+                error["loc"] == (field,) for error in excinfo.value.errors()
+            )
+
+
+def test_string_closure_three_contracted_null_controls_still_accepted():
+    # The architect's probe's own three null controls: application_version,
+    # and both top-level results' svg/drawing pair, all contracted nullable
+    # (Section 11) and unaffected by the bytes/bytearray fix.
+    provenance = CharacterizationProvenance(
+        **_valid_provenance_kwargs(application_version=None)
+    )
+    assert provenance.application_version is None
+
+    result = MolecularCharacterizationResult(
+        values=CharacterizationValues(**_valid_values_kwargs()),
+        provenance=CharacterizationProvenance(**_valid_provenance_kwargs()),
+        warnings=_base_warnings(),
+    )
+    assert result.svg is None and result.drawing is None
+
+    outcome = RDKitCharacterizationOutcome(
+        engine_version="2026.03.6",
+        representation_format_resolved="smiles",
+        values=CharacterizationValues(**_valid_values_kwargs()),
+        effective_parameters=CharacterizationEffectiveParameters(
+            parser=SmilesParserParameters()
+        ),
+        warnings=("derived-computational-values", "tpsa-no-additional-s-p"),
+    )
+    assert outcome.svg is None and outcome.drawing is None
+
+
 def test_all_default_profile_blocks_still_construct_with_no_arguments():
     # the strict-type fix must not break the zero-argument defaults that
     # every effective_parameters block relies on.

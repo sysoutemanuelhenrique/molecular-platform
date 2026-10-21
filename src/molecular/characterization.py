@@ -228,6 +228,13 @@ class CharacterizationExecutionError(CharacterizationError):
 #     `bytes` natively; that statement does not hold on the pydantic
 #     version actually installed for this checkpoint (confirmed here by
 #     direct reproduction, not assumed) and is superseded by this fix.
+#     This finding is not limited to IDs and the provenance hashes: a
+#     mechanical inventory of every plain `str`/`str | None` field across
+#     every BaseModel this module defines (Literal/enum fields excluded)
+#     finds 17 such fields total; the same silent coercion - by
+#     constructor and by `model_validate(dict)` alike - applies equally to
+#     the two DrawingResult hashes, every other plain ordinary-string DTO
+#     field, and the two nullable `svg` fields. All 17 are closed here.
 #
 # The fix actually enforced here is a `mode="before"` validator that
 # inspects `type(value)` directly, for every affected field, before
@@ -307,6 +314,18 @@ def _require_strict_str(value: object) -> object:
             f"expected a strict str, not {type(value).__name__} (got {value!r})"
         )
     return value
+
+
+def _require_strict_str_or_none(value: object) -> object:
+    """The nullable counterpart of `_require_strict_str`, for the three
+    contracted `str | None` fields (Section 11: `application_version`,
+    `svg` on both the public result and the adapter's neutral outcome) -
+    `None` is passed through untouched; any non-`None` value must still be
+    exactly `str`, not `bytes`/`bytearray`."""
+
+    if value is None:
+        return None
+    return _require_strict_str(value)
 
 
 # =========================================================================
@@ -648,6 +667,17 @@ class DrawingResult(BaseModel):
     def _require_strict_int_fields(cls, value: object) -> object:
         return _require_strict_int(value)
 
+    @field_validator(
+        "font_name",
+        "font_sha256_observed",
+        "svg_sha256",
+        "xml_parser_version_observed",
+        mode="before",
+    )
+    @classmethod
+    def _reject_bytes_before_coercion_str(cls, value: object) -> object:
+        return _require_strict_str(value)
+
     @field_validator("font_sha256_observed", "svg_sha256")
     @classmethod
     def _validate_hashes(cls, value: str) -> str:
@@ -691,13 +721,21 @@ class CharacterizationProvenance(BaseModel):
         "input_state_id",
         "entity_id",
         "state_record_sha256_observed",
+        "representation_path",
+        "representation_format_declared",
         "representation_checksum_expected",
         "representation_checksum_observed",
+        "engine_version",
         mode="before",
     )
     @classmethod
     def _reject_bytes_before_coercion_str(cls, value: object) -> object:
         return _require_strict_str(value)
+
+    @field_validator("application_version", mode="before")
+    @classmethod
+    def _reject_bytes_before_coercion_str_or_none(cls, value: object) -> object:
+        return _require_strict_str_or_none(value)
 
     @field_validator("input_state_id", "entity_id")
     @classmethod
@@ -763,6 +801,11 @@ class MolecularCharacterizationResult(BaseModel):
     drawing: DrawingResult | None = None
     svg: str | None = None
 
+    @field_validator("svg", mode="before")
+    @classmethod
+    def _reject_bytes_before_coercion_str_or_none(cls, value: object) -> object:
+        return _require_strict_str_or_none(value)
+
     @model_validator(mode="after")
     def _validate_svg_drawing_consistency(self) -> "MolecularCharacterizationResult":
         if (self.drawing is None) != (self.svg is None):
@@ -827,6 +870,16 @@ class RDKitCharacterizationOutcome(BaseModel):
     warnings: tuple[WarningCode, ...]
     drawing: DrawingResult | None = None
     svg: str | None = None
+
+    @field_validator("engine_version", mode="before")
+    @classmethod
+    def _reject_bytes_before_coercion_str(cls, value: object) -> object:
+        return _require_strict_str(value)
+
+    @field_validator("svg", mode="before")
+    @classmethod
+    def _reject_bytes_before_coercion_str_or_none(cls, value: object) -> object:
+        return _require_strict_str_or_none(value)
 
     @model_validator(mode="after")
     def _validate_svg_drawing_consistency(self) -> "RDKitCharacterizationOutcome":
