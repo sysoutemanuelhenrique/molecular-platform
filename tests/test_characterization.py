@@ -377,6 +377,106 @@ def test_strict_fixes_preserve_valid_json_round_trip():
     assert DrawMoleculeParameters.model_validate_json(drawing.model_dump_json()) == drawing
 
 
+# =========================================================================
+# Checkpoint 1 MAJOR-1 complement: the five numeric/literal exhibits above
+# are now rejected, but plain `str` fields (IDs and hashes) still coerced
+# `bytes`/`bytearray` silently into `str` on the HEAD this complement
+# starts from - reproduced here exactly as the architect's isolated probe
+# found it (evidence/architect-post-correction-dto-probe.json), before
+# this fix. An earlier revision of the corrections report stated plain
+# `str` fields already reject `bytes` natively; that statement is
+# superseded by this reproduction (see the new report's errata) and is
+# not repeated or relied upon here.
+# =========================================================================
+
+
+def test_values_formula_rejects_bytes_and_bytearray():
+    for bad_value in (b"C2H6O", bytearray(b"C2H6O")):
+        kwargs = _valid_values_kwargs()
+        kwargs["formula"] = bad_value
+        with pytest.raises(ValidationError):
+            CharacterizationValues(**kwargs)
+
+
+def test_values_formula_accepts_native_str_control():
+    kwargs = _valid_values_kwargs()
+    kwargs["formula"] = "C2H6O"
+    values = CharacterizationValues(**kwargs)
+    assert values.formula == "C2H6O"
+    assert isinstance(values.formula, str)
+
+
+@pytest.mark.parametrize(
+    "field,valid_str_value",
+    [
+        ("input_state_id", "caffeine-1"),
+        ("entity_id", "caffeine"),
+        ("state_record_sha256_observed", "a" * 64),
+        ("representation_checksum_expected", "A" * 64),
+        ("representation_checksum_observed", "a" * 64),
+    ],
+)
+@pytest.mark.parametrize("as_bytes", [bytes, bytearray])
+def test_provenance_id_and_hash_fields_reject_bytes_and_bytearray(
+    field, valid_str_value, as_bytes
+):
+    bad_value = as_bytes(valid_str_value.encode("ascii"))
+    with pytest.raises(ValidationError):
+        CharacterizationProvenance(**_valid_provenance_kwargs(**{field: bad_value}))
+
+
+@pytest.mark.parametrize(
+    "field,valid_str_value",
+    [
+        ("input_state_id", "caffeine-1"),
+        ("entity_id", "caffeine"),
+        ("state_record_sha256_observed", "a" * 64),
+        ("representation_checksum_expected", "A" * 64),
+        ("representation_checksum_observed", "a" * 64),
+    ],
+)
+def test_provenance_id_and_hash_fields_accept_native_str_control(
+    field, valid_str_value
+):
+    provenance = CharacterizationProvenance(
+        **_valid_provenance_kwargs(**{field: valid_str_value})
+    )
+    assert getattr(provenance, field) == valid_str_value
+    assert isinstance(getattr(provenance, field), str)
+
+
+def test_major1_complement_preserves_contracted_invariants():
+    # Section 11: ID case-sensitivity, the expected checksum's original
+    # spelling (uppercase here), application_version nullable, and the
+    # scientific values are all untouched by the bytes/bytearray fix -
+    # same construction, same JSON round-trip, as before this complement.
+    provenance = CharacterizationProvenance(
+        **_valid_provenance_kwargs(
+            input_state_id="caffeine-1",
+            entity_id="caffeine",
+            representation_checksum_expected="AB" * 32,
+            representation_checksum_observed="ab" * 32,
+            application_version=None,
+        )
+    )
+    assert provenance.input_state_id == "caffeine-1"
+    assert provenance.entity_id == "caffeine"
+    assert provenance.representation_checksum_expected == "AB" * 32
+    assert provenance.application_version is None
+    restored = CharacterizationProvenance.model_validate_json(
+        provenance.model_dump_json()
+    )
+    assert restored == provenance
+
+    values = CharacterizationValues(**_valid_values_kwargs())
+    assert values.formula == "C8H10N4O2"
+    assert values.molar_mass_g_mol == 194.194
+    restored_values = CharacterizationValues.model_validate_json(
+        values.model_dump_json()
+    )
+    assert restored_values == values
+
+
 def test_all_default_profile_blocks_still_construct_with_no_arguments():
     # the strict-type fix must not break the zero-argument defaults that
     # every effective_parameters block relies on.

@@ -219,6 +219,15 @@ class CharacterizationExecutionError(CharacterizationError):
 #   - `Field(strict=True)` cannot even be applied to a `Literal` field:
 #     pydantic raises `RuntimeError("Unable to apply constraint 'strict'
 #     to schema of type 'literal'")` at class-definition time.
+#   - a plain (non-Literal) `str` field's default (lax) validation coerces
+#     `bytes`/`bytearray` whose content would otherwise be a valid string
+#     (e.g. `b"caffeine-1"`) silently into `str` - including for IDs and
+#     hashes, where Section 11 requires strict validation ("Identificadores
+#     /hashs são estritos"). An earlier revision of this module's own
+#     corrections report stated that plain `str` fields already reject
+#     `bytes` natively; that statement does not hold on the pydantic
+#     version actually installed for this checkpoint (confirmed here by
+#     direct reproduction, not assumed) and is superseded by this fix.
 #
 # The fix actually enforced here is a `mode="before"` validator that
 # inspects `type(value)` directly, for every affected field, before
@@ -285,6 +294,21 @@ def _require_strict_float(value: object) -> object:
     return value
 
 
+def _require_strict_str(value: object) -> object:
+    """A plain `str` field (an ID or a hash, never a `Literal`) must
+    reject `bytes`/`bytearray` whose content would otherwise decode to a
+    valid string - pydantic's default `str` validation coerces both
+    silently (confirmed by direct reproduction), which defeats Section
+    11's strict ID/hash requirement just as surely as numeric-string
+    coercion defeats a strict `int`/`float` field."""
+
+    if type(value) is not str:
+        raise ValueError(
+            f"expected a strict str, not {type(value).__name__} (got {value!r})"
+        )
+    return value
+
+
 # =========================================================================
 # Section 8: the ten scientific values
 # =========================================================================
@@ -308,6 +332,11 @@ class CharacterizationValues(BaseModel):
     rotatable_bond_count: int = Field(ge=0)
     tpsa_a2: float = Field(ge=0)
     clogp_wildman_crippen: float
+
+    @field_validator("formula", mode="before")
+    @classmethod
+    def _reject_bytes_before_coercion_str(cls, value: object) -> object:
+        return _require_strict_str(value)
 
     @field_validator(
         "molar_mass_g_mol", "exact_mass_da", "tpsa_a2", "clogp_wildman_crippen",
@@ -657,6 +686,18 @@ class CharacterizationProvenance(BaseModel):
     experimental_conditions_consumption: ExperimentalConditionsConsumption = (
         EXPERIMENTAL_CONDITIONS_CONSUMPTION
     )
+
+    @field_validator(
+        "input_state_id",
+        "entity_id",
+        "state_record_sha256_observed",
+        "representation_checksum_expected",
+        "representation_checksum_observed",
+        mode="before",
+    )
+    @classmethod
+    def _reject_bytes_before_coercion_str(cls, value: object) -> object:
+        return _require_strict_str(value)
 
     @field_validator("input_state_id", "entity_id")
     @classmethod
