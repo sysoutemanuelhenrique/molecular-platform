@@ -197,14 +197,104 @@ class CharacterizationExecutionError(CharacterizationError):
 
 
 # =========================================================================
+# Checkpoint 1 corrections (MAJOR-1): actual strict-type enforcement.
+#
+# Section 11 requires "validação estrita" - but neither
+# `ConfigDict(frozen=True, extra="forbid")` nor `ConfigDict(strict=True)`
+# nor `Field(strict=True)` actually delivers that for the fields affected
+# here, confirmed by direct reproduction against the exact pinned
+# pydantic version installed for this checkpoint (not assumed from the
+# architect's or reviewer's probes, though both independently found the
+# same thing on different pydantic patch versions):
+#   - a plain (non-Literal) `int` field's default (lax) validation coerces
+#     a numeric string ("3"), an integral float (3.0), and a bool (True)
+#     into int - all three accepted silently.
+#   - a plain `float` field's default validation likewise coerces a
+#     numeric string ("4.5") and a bool (True) into float.
+#   - `ConfigDict(strict=True)` does NOT propagate into `Literal` field
+#     validation at all: `Literal[True]` still accepts int `1`,
+#     `Literal[0]` still accepts bool `False`, `Literal[-1.0]` still
+#     accepts int `-1` - because Literal matching compares by `==`
+#     equality, not by exact type, regardless of the model's strict mode.
+#   - `Field(strict=True)` cannot even be applied to a `Literal` field:
+#     pydantic raises `RuntimeError("Unable to apply constraint 'strict'
+#     to schema of type 'literal'")` at class-definition time.
+#
+# The fix actually enforced here is a `mode="before"` validator that
+# inspects `type(value)` directly, for every affected field, before
+# pydantic's own (lax) coercion or Literal `==` matching ever runs - the
+# only mechanism in the installed pydantic that reliably rejects these
+# inputs without widening the public JSON shape or the set of valid
+# native values. Valid native ints/floats/bools/strings, and their valid
+# JSON serialization/round-trip, are unaffected.
+# =========================================================================
+
+
+def _require_strict_bool(value: object) -> object:
+    """A bool-only field (including a `Literal[True]`/`Literal[False]`
+    default) must reject every non-bool, including int `0`/`1` - which
+    pydantic's own Literal matching otherwise accepts via `==` equality
+    even under `ConfigDict(strict=True)` (confirmed by direct
+    reproduction, not assumed)."""
+
+    if type(value) is not bool:
+        raise ValueError(
+            f"expected a strict bool, not {type(value).__name__} (got {value!r})"
+        )
+    return value
+
+
+def _require_strict_int(value: object) -> object:
+    """An int-only field must reject bool, float (including an integral
+    float like `3.0`), and numeric strings (like `"3"`) - pydantic's
+    default int validation coerces all three silently (confirmed by
+    direct reproduction)."""
+
+    if type(value) is not int:
+        raise ValueError(
+            f"expected a strict int, not {type(value).__name__} (got {value!r})"
+        )
+    return value
+
+
+def _require_numeric_not_bool_or_str(value: object) -> object:
+    """A float-typed field that legitimately accepts a native int too
+    (Section 11 does not forbid it, and RDKit itself never hands this
+    adapter an int for these particular fields, but the contract does not
+    rule it out either) - reject only bool and numeric strings, which
+    pydantic's default float validation otherwise coerces silently."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            f"expected a real number (int or float), not {type(value).__name__} "
+            f"(got {value!r})"
+        )
+    return value
+
+
+def _require_strict_float(value: object) -> object:
+    """A float-typed Literal constant (e.g. `bond_length=-1.0`) must
+    reject bool and int equivalents too - `Literal[-1.0]` otherwise
+    accepts int `-1` via `==` equality (confirmed by direct
+    reproduction)."""
+
+    if type(value) is not float:
+        raise ValueError(
+            f"expected a strict float, not {type(value).__name__} (got {value!r})"
+        )
+    return value
+
+
+# =========================================================================
 # Section 8: the ten scientific values
 # =========================================================================
 
 
 class CharacterizationValues(BaseModel):
     """The ten closed scientific fields of Section 8. Strict and frozen:
-    no field may be a bool masquerading as an int, and no float may be
-    NaN/inf (Section 11's invariant, T-020A-003)."""
+    no field may be a bool, a numeric string, or an integral float
+    masquerading as an int or a float, and no float may be NaN/inf
+    (Section 11's invariant, T-020A-003)."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -224,10 +314,8 @@ class CharacterizationValues(BaseModel):
         mode="before",
     )
     @classmethod
-    def _reject_bool_before_coercion_float(cls, value: object) -> object:
-        if isinstance(value, bool):
-            raise ValueError("value must be a real number, not a bool")
-        return value
+    def _reject_bool_and_str_before_coercion_float(cls, value: object) -> object:
+        return _require_numeric_not_bool_or_str(value)
 
     @field_validator(
         "molar_mass_g_mol", "exact_mass_da", "tpsa_a2", "clogp_wildman_crippen"
@@ -247,10 +335,8 @@ class CharacterizationValues(BaseModel):
         mode="before",
     )
     @classmethod
-    def _reject_bool_as_int(cls, value: object) -> object:
-        if isinstance(value, bool):
-            raise ValueError("value must be a strict int, not a bool")
-        return value
+    def _reject_bool_float_and_str_as_int(cls, value: object) -> object:
+        return _require_strict_int(value)
 
     @field_validator("molar_mass_g_mol", "exact_mass_da")
     @classmethod
@@ -273,6 +359,11 @@ class SdfParserParameters(BaseModel):
     remove_hs: Literal[False] = False
     strict_parsing: Literal[True] = True
 
+    @field_validator("sanitize", "remove_hs", "strict_parsing", mode="before")
+    @classmethod
+    def _require_strict_bool_fields(cls, value: object) -> object:
+        return _require_strict_bool(value)
+
 
 class SmilesParserParameters(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -283,6 +374,13 @@ class SmilesParserParameters(BaseModel):
     parse_name: Literal[False] = False
     allow_cxsmiles: Literal[False] = False
 
+    @field_validator(
+        "sanitize", "remove_hs", "parse_name", "allow_cxsmiles", mode="before"
+    )
+    @classmethod
+    def _require_strict_bool_fields(cls, value: object) -> object:
+        return _require_strict_bool(value)
+
 
 class FormulaParameters(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -290,11 +388,21 @@ class FormulaParameters(BaseModel):
     separate_isotopes: Literal[True] = True
     abbreviate_h_isotopes: Literal[False] = False
 
+    @field_validator("separate_isotopes", "abbreviate_h_isotopes", mode="before")
+    @classmethod
+    def _require_strict_bool_fields(cls, value: object) -> object:
+        return _require_strict_bool(value)
+
 
 class ExactMassParameters(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     only_heavy: Literal[False] = False
+
+    @field_validator("only_heavy", mode="before")
+    @classmethod
+    def _require_strict_bool_fields(cls, value: object) -> object:
+        return _require_strict_bool(value)
 
 
 class RotatableBondsParameters(BaseModel):
@@ -309,12 +417,22 @@ class TpsaParameters(BaseModel):
     force: Literal[True] = True
     include_s_and_p: Literal[False] = False
 
+    @field_validator("force", "include_s_and_p", mode="before")
+    @classmethod
+    def _require_strict_bool_fields(cls, value: object) -> object:
+        return _require_strict_bool(value)
+
 
 class CrippenParameters(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     include_hs: Literal[True] = True
     force: Literal[True] = True
+
+    @field_validator("include_hs", "force", mode="before")
+    @classmethod
+    def _require_strict_bool_fields(cls, value: object) -> object:
+        return _require_strict_bool(value)
 
 
 class CharacterizationEffectiveParameters(BaseModel):
@@ -359,6 +477,30 @@ class Compute2DParameters(BaseModel):
     force_rdkit: Literal[True] = True
     use_ring_templates: Literal[False] = False
 
+    @field_validator(
+        "canon_orient",
+        "clear_confs",
+        "permute_deg4_nodes",
+        "force_rdkit",
+        "use_ring_templates",
+        mode="before",
+    )
+    @classmethod
+    def _require_strict_bool_fields(cls, value: object) -> object:
+        return _require_strict_bool(value)
+
+    @field_validator(
+        "n_flips_per_sample", "n_sample", "sample_seed", mode="before"
+    )
+    @classmethod
+    def _require_strict_int_fields(cls, value: object) -> object:
+        return _require_strict_int(value)
+
+    @field_validator("bond_length", mode="before")
+    @classmethod
+    def _require_strict_float_fields(cls, value: object) -> object:
+        return _require_strict_float(value)
+
 
 class PrepareParameters(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -368,6 +510,18 @@ class PrepareParameters(BaseModel):
     wedge_bonds: Literal[True] = True
     force_coords: Literal[False] = False
     wavy_bonds: Literal[False] = False
+
+    @field_validator(
+        "kekulize",
+        "add_chiral_hs",
+        "wedge_bonds",
+        "force_coords",
+        "wavy_bonds",
+        mode="before",
+    )
+    @classmethod
+    def _require_strict_bool_fields(cls, value: object) -> object:
+        return _require_strict_bool(value)
 
 
 class DrawerConstructorParameters(BaseModel):
@@ -379,6 +533,16 @@ class DrawerConstructorParameters(BaseModel):
     panel_height: Literal[-1] = -1
     no_freetype: Literal[False] = False
 
+    @field_validator("width", "height", "panel_width", "panel_height", mode="before")
+    @classmethod
+    def _require_strict_int_fields(cls, value: object) -> object:
+        return _require_strict_int(value)
+
+    @field_validator("no_freetype", mode="before")
+    @classmethod
+    def _require_strict_bool_fields(cls, value: object) -> object:
+        return _require_strict_bool(value)
+
 
 class DrawOptionsParameters(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -389,6 +553,18 @@ class DrawOptionsParameters(BaseModel):
     add_atom_indices: Literal[False] = False
     add_bond_indices: Literal[False] = False
     font_policy: Literal["rdkit-data-fonts-telex"] = "rdkit-data-fonts-telex"
+
+    @field_validator(
+        "prepare_mols_before_drawing",
+        "include_metadata",
+        "include_atom_tags",
+        "add_atom_indices",
+        "add_bond_indices",
+        mode="before",
+    )
+    @classmethod
+    def _require_strict_bool_fields(cls, value: object) -> object:
+        return _require_strict_bool(value)
 
 
 class DrawMoleculeParameters(BaseModel):
@@ -438,6 +614,11 @@ class DrawingResult(BaseModel):
     xml_parser_version_observed: str = Field(min_length=1)
     effective_parameters: DepictionEffectiveParameters = DepictionEffectiveParameters()
 
+    @field_validator("width_px", "height_px", "svg_size_bytes", mode="before")
+    @classmethod
+    def _require_strict_int_fields(cls, value: object) -> object:
+        return _require_strict_int(value)
+
     @field_validator("font_sha256_observed", "svg_sha256")
     @classmethod
     def _validate_hashes(cls, value: str) -> str:
@@ -481,6 +662,11 @@ class CharacterizationProvenance(BaseModel):
     @classmethod
     def _validate_id_format(cls, value: str) -> str:
         return validate_input_id(value)
+
+    @field_validator("representation_size_bytes", mode="before")
+    @classmethod
+    def _require_strict_int_fields(cls, value: object) -> object:
+        return _require_strict_int(value)
 
     @field_validator("state_record_sha256_observed", "representation_checksum_observed")
     @classmethod

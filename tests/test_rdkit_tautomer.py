@@ -14,6 +14,7 @@ from rdkit.Chem.MolStandardize import rdMolStandardize
 
 import hashlib
 import math
+from io import BytesIO
 
 import molecular.characterization as characterization_module
 import molecular.rdkit_tautomer as rdkit_tautomer_module
@@ -1269,6 +1270,128 @@ def test_absolute_stereo_group_is_not_rejected_by_eligibility_check():
     rdkit_tautomer_module._validate_graph_eligibility(mol)  # must not raise
 
 
+# =========================================================================
+# Checkpoint 1 corrections, MINOR-2: real SDF V3000 bytes, for SGroup and
+# for enhanced stereo AND/OR, through the full public adapter
+# (bytes -> real ForwardSDMolSupplier -> real eligibility check) - not a
+# monkeypatch of the parser or of _validate_graph_eligibility to fabricate
+# the rejection, and not a hand-written V3000 text block. Each fixture is
+# built the same way the architect's own research route confirmed
+# (synthetic molecule -> Chem.CreateMolSubstanceGroup/CreateStereoGroup ->
+# Chem.MolToMolBlock(forceV3000=True) + "$$$$\n") - reproduced here
+# independently in this test file's own code, not copied from the
+# evidence JSON, and verified byte-for-byte identical to it (same sizes
+# and SHA-256) during this correction's own development.
+# =========================================================================
+
+
+def _v3000_sgroup_sdf_bytes() -> bytes:
+    mol = Chem.RWMol(Chem.MolFromSmiles("CCO"))
+    sgroup = Chem.CreateMolSubstanceGroup(mol, "SUP")
+    sgroup.SetAtoms([0])
+    sgroup.SetProp("LABEL", "Me")
+    return (Chem.MolToMolBlock(mol, forceV3000=True) + "$$$$\n").encode("ascii")
+
+
+def _v3000_stereo_group_sdf_bytes(group_type) -> bytes:
+    mol = Chem.RWMol(Chem.MolFromSmiles("C[C@H](F)Cl"))
+    stereo_group = Chem.CreateStereoGroup(group_type, mol, [1])
+    mol.SetStereoGroups([stereo_group])
+    return (Chem.MolToMolBlock(mol, forceV3000=True) + "$$$$\n").encode("ascii")
+
+
+def test_v3000_sgroup_fixture_bytes_match_the_research_evidence_hash():
+    data = _v3000_sgroup_sdf_bytes()
+    assert len(data) == 428
+    assert _sha256(data) == "1ec45e31c09fc6b6ed6e0b248e839e49b4c43f897e0aca9ab2ac5d6d1c2a5671"
+
+
+def test_v3000_and_fixture_bytes_match_the_research_evidence_hash():
+    data = _v3000_stereo_group_sdf_bytes(Chem.StereoGroupType.STEREO_AND)
+    assert len(data) == 496
+    assert _sha256(data) == "74040ab45b9889d7aa6ab548ed85e020b261d49891ab715b47a24a7a59a8ce16"
+
+
+def test_v3000_or_fixture_bytes_match_the_research_evidence_hash():
+    data = _v3000_stereo_group_sdf_bytes(Chem.StereoGroupType.STEREO_OR)
+    assert len(data) == 496
+    assert _sha256(data) == "8a5f0741c4f63516c4f4b787500113a8321d0e7374de15eb332cb0ab69bfabe0"
+
+
+def test_v3000_sgroup_bytes_parse_with_the_group_retained_before_adapter_rejection():
+    """Guards against confusing an absent group or a syntax error with
+    the actual science policy (reconciliation's own instruction): parse
+    the real bytes independently of the adapter first, and confirm the
+    real ForwardSDMolSupplier retained exactly one SGroup on the parsed
+    molecule, before ever calling the public adapter."""
+
+    data = _v3000_sgroup_sdf_bytes()
+    supplier = Chem.ForwardSDMolSupplier(
+        BytesIO(data), sanitize=True, removeHs=False, strictParsing=True
+    )
+    items = list(supplier)
+    assert len(items) == 1
+    assert items[0] is not None
+    assert len(Chem.GetMolSubstanceGroups(items[0])) == 1
+    assert len(items[0].GetStereoGroups()) == 0
+
+
+@pytest.mark.parametrize(
+    "group_type,group_type_name",
+    [
+        (Chem.StereoGroupType.STEREO_AND, "STEREO_AND"),
+        (Chem.StereoGroupType.STEREO_OR, "STEREO_OR"),
+    ],
+)
+def test_v3000_stereo_group_bytes_parse_with_the_group_retained_before_adapter_rejection(
+    group_type, group_type_name
+):
+    data = _v3000_stereo_group_sdf_bytes(group_type)
+    supplier = Chem.ForwardSDMolSupplier(
+        BytesIO(data), sanitize=True, removeHs=False, strictParsing=True
+    )
+    items = list(supplier)
+    assert len(items) == 1
+    assert items[0] is not None
+    assert len(Chem.GetMolSubstanceGroups(items[0])) == 0
+    retained_types = [group.GetGroupType() for group in items[0].GetStereoGroups()]
+    assert retained_types == [group_type]
+    assert retained_types[0].name == group_type_name
+
+
+def test_v3000_sgroup_bytes_are_rejected_by_the_full_public_adapter_as_unsupported_structure():
+    data = _v3000_sgroup_sdf_bytes()
+    with pytest.raises(CharacterizationExecutionError) as excinfo:
+        _characterize(data, fmt="sdf")
+    assert excinfo.value.reason == "unsupported-structure"
+
+
+@pytest.mark.parametrize(
+    "group_type",
+    [Chem.StereoGroupType.STEREO_AND, Chem.StereoGroupType.STEREO_OR],
+    ids=["AND", "OR"],
+)
+def test_v3000_enhanced_stereo_bytes_are_rejected_by_the_full_public_adapter_as_unsupported_structure(
+    group_type,
+):
+    data = _v3000_stereo_group_sdf_bytes(group_type)
+    with pytest.raises(CharacterizationExecutionError) as excinfo:
+        _characterize(data, fmt="sdf")
+    assert excinfo.value.reason == "unsupported-structure"
+
+
+def test_v3000_absolute_stereo_bytes_are_not_rejected_by_the_full_public_adapter():
+    """Control case for the MINOR-2 integration fixtures: the same
+    construction route, but with STEREO_ABSOLUTE (not an enhanced AND/OR
+    group), must characterize normally through the full adapter - proving
+    the rejection above is specific to the AND/OR policy, not an
+    incidental V3000/CreateStereoGroup artifact."""
+
+    data = _v3000_stereo_group_sdf_bytes(Chem.StereoGroupType.STEREO_ABSOLUTE)
+    outcome = _characterize(data, fmt="sdf")
+    assert outcome.values.formula == "C2H4ClF"
+
+
 def test_empty_molecule_is_rejected():
     with pytest.raises(CharacterizationExecutionError) as excinfo:
         _characterize(b"\x20", fmt="smiles")  # single space - no token at all
@@ -1569,20 +1692,222 @@ def test_svg_binding_links_state_id_hash_and_engine_to_the_entry():
 # --- Section 13: RDKit native log suppression and restoration -----------
 
 
-def test_native_rdkit_logs_are_suppressed_and_restored(capfd):
+def test_native_rdkit_logs_are_suppressed_on_failure_and_restored_with_marker(capfd):
+    """Checkpoint 1 corrections, MINOR-1: a second successful call is only
+    indirect evidence of restoration (it would still succeed even if logs
+    stayed silenced). This follows the project's own already-established
+    direct-proof pattern instead (Increment 017's
+    test_enumeration_logs_are_suppressed_and_restored_after_incomplete_status):
+    emit rdBase.LogWarningMsg with a unique marker AFTER the operation and
+    assert the marker itself reaches stderr through capfd - proof the
+    BlockLogs suppression was actually lifted, not merely that a later
+    unrelated call happened to work. No EnableLog call is made to force
+    this; restoration relies entirely on BlockLogs's own __exit__."""
+
     garbage_sdf = b"garbage not a mol block\n$$$$\n"
+
+    capfd.readouterr()
     with pytest.raises(CharacterizationExecutionError):
         _characterize(garbage_sdf, fmt="sdf")
-
     captured = capfd.readouterr()
     assert "ERROR" not in captured.err
 
-    # logs must be restored, not permanently suppressed - a subsequent
-    # real parse failure through the pre-existing tautomer adapter must
-    # still be able to log if it chooses to (no global DisableLog was
-    # left behind by the characterization adapter's own BlockLogs scopes).
+    marker = "__020a_cp1_failure_logs_restored__"
+    rdBase.LogWarningMsg(marker)
+    restored = capfd.readouterr()
+    assert marker in restored.err
+
+
+def test_native_rdkit_logs_are_suppressed_on_success_and_restored_with_marker(capfd):
+    capfd.readouterr()
     outcome = _characterize(b"CCO\n", fmt="smiles")
+    captured = capfd.readouterr()
     assert outcome.values.formula == "C2H6O"
+    assert "ERROR" not in captured.err
+
+    marker = "__020a_cp1_success_logs_restored__"
+    rdBase.LogWarningMsg(marker)
+    restored = capfd.readouterr()
+    assert marker in restored.err
+
+
+# =========================================================================
+# Checkpoint 1 corrections, MAJOR-2 + MINOR-1: KeyboardInterrupt/SystemExit
+# injected at the point of use of a real production call, by adapter
+# phase, plus (for every phase that runs inside `rdBase.BlockLogs()`) a
+# direct LogWarningMsg-marker proof that log suppression was lifted after
+# the interruption - not merely that logs were suppressed during it.
+#
+# Phases mapped (reconciliation's own list): entry/request validation;
+# SDF parsing including iteration; SMILES parsing; value computation;
+# drawing coordinates+preparation; drawing rendering; SVG validation/
+# binding; result construction. CLI/service/reader phases (Checkpoints
+# 2/3) are out of scope and not included.
+#
+# Each injection patches exactly one real production call at its point of
+# use (never the whole adapter) - the rest of the production flow (real
+# grammar validation, real RDKit calls on either side of the patched one,
+# real BlockLogs scopes) executes exactly as in normal operation.
+# =========================================================================
+
+
+class _RaisingOnIteration:
+    """Mirrors the project's own established pattern (see
+    test_supplier_iteration_never_catches_keyboard_interrupt above) for
+    the ForwardSDMolSupplier this checkpoint's adapter uses, generalized
+    to carry any BaseException instance."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    def __iter__(self):
+        raise self._exc
+
+
+def _patch_entry_validation(monkeypatch, exc):
+    def _raise(*_args, **_kwargs):
+        raise exc
+
+    monkeypatch.setattr(rdkit_tautomer_module, "validate_input_id", _raise)
+    return dict(data=b"CCO\n", fmt="smiles", include_svg=False, uses_blocklogs=False)
+
+
+def _patch_sdf_parsing_iteration(monkeypatch, exc):
+    def _fake_supplier(*_args, **_kwargs):
+        return _RaisingOnIteration(exc)
+
+    monkeypatch.setattr(rdkit_tautomer_module.Chem, "ForwardSDMolSupplier", _fake_supplier)
+    return dict(
+        data=_sdf_bytes_from_smiles("CCO"), fmt="sdf", include_svg=False, uses_blocklogs=True
+    )
+
+
+def _patch_smiles_parsing(monkeypatch, exc):
+    def _raise(*_args, **_kwargs):
+        raise exc
+
+    monkeypatch.setattr(rdkit_tautomer_module.Chem, "MolFromSmiles", _raise)
+    return dict(data=b"CCO\n", fmt="smiles", include_svg=False, uses_blocklogs=True)
+
+
+def _patch_value_computation(monkeypatch, exc):
+    def _raise(*_args, **_kwargs):
+        raise exc
+
+    monkeypatch.setattr(rdkit_tautomer_module.rdMolDescriptors, "CalcTPSA", _raise)
+    return dict(data=b"CCO\n", fmt="smiles", include_svg=False, uses_blocklogs=True)
+
+
+def _patch_drawing_coordinates_and_preparation(monkeypatch, exc):
+    def _raise(*_args, **_kwargs):
+        raise exc
+
+    monkeypatch.setattr(rdkit_tautomer_module.rdDepictor, "Compute2DCoords", _raise)
+    return dict(data=b"CCO\n", fmt="smiles", include_svg=True, uses_blocklogs=True)
+
+
+def _patch_drawing_rendering(monkeypatch, exc):
+    def _raise(*_args, **_kwargs):
+        raise exc
+
+    monkeypatch.setattr(rdkit_tautomer_module.rdMolDraw2D, "MolDraw2DSVG", _raise)
+    return dict(data=b"CCO\n", fmt="smiles", include_svg=True, uses_blocklogs=True)
+
+
+def _patch_svg_validation_and_binding(monkeypatch, exc):
+    def _raise(*_args, **_kwargs):
+        raise exc
+
+    monkeypatch.setattr(rdkit_tautomer_module, "validate_and_bind_depiction_svg", _raise)
+    return dict(data=b"CCO\n", fmt="smiles", include_svg=True, uses_blocklogs=False)
+
+
+def _patch_result_construction(monkeypatch, exc):
+    def _raise(*_args, **_kwargs):
+        raise exc
+
+    monkeypatch.setattr(rdkit_tautomer_module, "RDKitCharacterizationOutcome", _raise)
+    return dict(data=b"CCO\n", fmt="smiles", include_svg=False, uses_blocklogs=False)
+
+
+_INTERRUPTION_PHASES = [
+    ("entry-validation", _patch_entry_validation),
+    ("sdf-parsing-iteration", _patch_sdf_parsing_iteration),
+    ("smiles-parsing", _patch_smiles_parsing),
+    ("value-computation", _patch_value_computation),
+    ("drawing-coordinates-and-preparation", _patch_drawing_coordinates_and_preparation),
+    ("drawing-rendering", _patch_drawing_rendering),
+    ("svg-validation-and-binding", _patch_svg_validation_and_binding),
+    ("result-construction", _patch_result_construction),
+]
+
+
+def _run_interruption_case(monkeypatch, capfd, apply_patch, exc):
+    setup = apply_patch(monkeypatch, exc)
+    data = setup["data"]
+
+    capfd.readouterr()
+    with pytest.raises(type(exc)) as excinfo:
+        characterize_molecule_rdkit(
+            data,
+            input_format=setup["fmt"],
+            input_state_id="s1",
+            representation_sha256=_sha256(data),
+            include_svg=setup["include_svg"],
+        )
+    captured = capfd.readouterr()
+
+    assert excinfo.value is exc  # same instance, never wrapped/converted
+    assert "ERROR" not in captured.err
+
+    if setup["uses_blocklogs"]:
+        marker = f"__020a_cp1_{type(exc).__name__}_{id(exc)}_logs_restored__"
+        rdBase.LogWarningMsg(marker)
+        restored = capfd.readouterr()
+        assert marker in restored.err
+
+
+@pytest.mark.parametrize(
+    "phase_name,apply_patch", _INTERRUPTION_PHASES, ids=[p[0] for p in _INTERRUPTION_PHASES]
+)
+def test_keyboard_interrupt_propagates_unconverted_by_adapter_phase(
+    phase_name, apply_patch, monkeypatch, capfd
+):
+    exc = KeyboardInterrupt()
+    _run_interruption_case(monkeypatch, capfd, apply_patch, exc)
+
+
+@pytest.mark.parametrize(
+    "phase_name,apply_patch", _INTERRUPTION_PHASES, ids=[p[0] for p in _INTERRUPTION_PHASES]
+)
+def test_system_exit_propagates_unconverted_by_adapter_phase(
+    phase_name, apply_patch, monkeypatch, capfd
+):
+    exc = SystemExit(42)
+    _run_interruption_case(monkeypatch, capfd, apply_patch, exc)
+    assert exc.code == 42
+
+
+def test_adapter_never_raises_except_basexception_itself():
+    """Static corroboration (not a substitute for the dynamic injection
+    tests above): the adapter module contains no `except BaseException`
+    clause anywhere, which is what structurally guarantees
+    KeyboardInterrupt/SystemExit are never caught/converted by any
+    handler added in this checkpoint."""
+
+    import ast
+    import pathlib
+
+    source = pathlib.Path(rdkit_tautomer_module.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ExceptHandler) and node.type is not None:
+            names = (
+                [alias.id for alias in node.type.elts]
+                if isinstance(node.type, ast.Tuple)
+                else [node.type.id if isinstance(node.type, ast.Name) else None]
+            )
+            assert "BaseException" not in names
 
 
 # --- Section 15: legacy enumeration/imports are unaffected ---------------

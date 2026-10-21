@@ -22,12 +22,21 @@ from molecular.characterization import (
     CharacterizationProvenance,
     CharacterizationStorageError,
     CharacterizationValues,
+    Compute2DParameters,
+    CrippenParameters,
+    DrawerConstructorParameters,
     DrawingResult,
+    DrawMoleculeParameters,
+    DrawOptionsParameters,
     EmptyCoordMap,
+    ExactMassParameters,
+    FormulaParameters,
     MolecularCharacterizationResult,
+    PrepareParameters,
     RDKitCharacterizationOutcome,
     SdfParserParameters,
     SmilesParserParameters,
+    TpsaParameters,
     validate_and_bind_depiction_svg,
 )
 
@@ -208,6 +217,181 @@ def test_non_positive_mass_is_rejected():
     kwargs["molar_mass_g_mol"] = 0.0
     with pytest.raises(ValidationError):
         CharacterizationValues(**kwargs)
+
+
+# =========================================================================
+# Checkpoint 1 corrections, MAJOR-1: real strict-type enforcement.
+#
+# `frozen=True, extra="forbid"` alone does not reject a numeric string, an
+# integral float, or a bool-for-int/float - confirmed independently by the
+# adversarial review (two reproductions, two different pydantic patch
+# versions, both against this exact DTO) before this fix. These tests
+# reproduce the review's own exhibited cases exactly (never "fixed to
+# pass" by weakening the assertion - these are the literal examples from
+# evidence/claude-dto-coercion-reproduction.json, every one previously
+# accepted, now reproduced here as the expected-rejection regression), and
+# extend the same check across every other new DTO/profile field the
+# finding applies to.
+# =========================================================================
+
+
+@pytest.mark.parametrize(
+    "field,bad_value",
+    [
+        ("heavy_atom_count", "3"),  # numeric string -> int (review exhibit)
+        ("heavy_atom_count", 3.0),  # integral float -> int (review exhibit)
+        ("formal_charge_e", "0"),  # numeric string -> int (review exhibit)
+        ("hbd_count", "1"),
+        ("hba_count", 1.0),
+        ("rotatable_bond_count", "0"),
+    ],
+)
+def test_int_fields_reject_numeric_strings_and_integral_floats(field, bad_value):
+    kwargs = _valid_values_kwargs()
+    kwargs[field] = bad_value
+    with pytest.raises(ValidationError):
+        CharacterizationValues(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "field,bad_value",
+    [
+        ("molar_mass_g_mol", "46.069"),  # numeric string -> float (review exhibit)
+        ("exact_mass_da", "194.08"),
+        ("tpsa_a2", "61.82"),
+        ("clogp_wildman_crippen", "-1.0293"),
+    ],
+)
+def test_float_fields_reject_numeric_strings(field, bad_value):
+    kwargs = _valid_values_kwargs()
+    kwargs[field] = bad_value
+    with pytest.raises(ValidationError):
+        CharacterizationValues(**kwargs)
+
+
+def test_float_fields_still_accept_a_native_int():
+    # Section 11 does not forbid a native int for a float-typed field -
+    # only bool and numeric strings are rejected (reconciliation's own
+    # explicit scoping of this finding).
+    kwargs = _valid_values_kwargs()
+    kwargs["molar_mass_g_mol"] = 46
+    values = CharacterizationValues(**kwargs)
+    assert values.molar_mass_g_mol == 46.0
+    assert isinstance(values.molar_mass_g_mol, float)
+
+
+def test_sdf_parser_parameters_literal_bool_rejects_int_one():
+    # the review's own exhibit: SdfParserParameters(sanitize=1) was
+    # previously accepted and silently coerced to True.
+    with pytest.raises(ValidationError):
+        SdfParserParameters(sanitize=1)
+
+
+@pytest.mark.parametrize(
+    "dto_factory,field,bad_value",
+    [
+        (lambda **kw: SdfParserParameters(**kw), "sanitize", 1),
+        (lambda **kw: SdfParserParameters(**kw), "remove_hs", 0),
+        (lambda **kw: SdfParserParameters(**kw), "strict_parsing", 1),
+        (lambda **kw: SmilesParserParameters(**kw), "sanitize", 1),
+        (lambda **kw: SmilesParserParameters(**kw), "allow_cxsmiles", 0),
+        (lambda **kw: FormulaParameters(**kw), "separate_isotopes", 1),
+        (lambda **kw: FormulaParameters(**kw), "abbreviate_h_isotopes", 0),
+        (lambda **kw: ExactMassParameters(**kw), "only_heavy", 0),
+        (lambda **kw: TpsaParameters(**kw), "force", 1),
+        (lambda **kw: TpsaParameters(**kw), "include_s_and_p", 0),
+        (lambda **kw: CrippenParameters(**kw), "include_hs", 1),
+        (lambda **kw: Compute2DParameters(**kw), "canon_orient", 1),
+        (lambda **kw: Compute2DParameters(**kw), "permute_deg4_nodes", 0),
+        (lambda **kw: Compute2DParameters(**kw), "force_rdkit", 1),
+        (lambda **kw: PrepareParameters(**kw), "kekulize", 0),
+        (lambda **kw: PrepareParameters(**kw), "wedge_bonds", 1),
+        (lambda **kw: DrawerConstructorParameters(**kw), "no_freetype", 0),
+        (lambda **kw: DrawOptionsParameters(**kw), "include_metadata", 0),
+        (lambda **kw: DrawOptionsParameters(**kw), "add_atom_indices", 1),
+    ],
+)
+def test_literal_bool_fields_reject_int_zero_or_one(dto_factory, field, bad_value):
+    with pytest.raises(ValidationError):
+        dto_factory(**{field: bad_value})
+
+
+@pytest.mark.parametrize(
+    "dto_factory,field,bad_value",
+    [
+        (lambda **kw: Compute2DParameters(**kw), "n_flips_per_sample", False),
+        (lambda **kw: Compute2DParameters(**kw), "n_sample", 0.0),
+        (lambda **kw: Compute2DParameters(**kw), "sample_seed", True),
+        (lambda **kw: DrawerConstructorParameters(**kw), "width", 600.0),
+        (lambda **kw: DrawerConstructorParameters(**kw), "height", True),
+        (lambda **kw: DrawerConstructorParameters(**kw), "panel_width", -1.0),
+    ],
+)
+def test_literal_int_fields_reject_bool_and_float_equivalents(dto_factory, field, bad_value):
+    with pytest.raises(ValidationError):
+        dto_factory(**{field: bad_value})
+
+
+def test_literal_float_field_rejects_int_and_bool_equivalents():
+    with pytest.raises(ValidationError):
+        Compute2DParameters(bond_length=-1)
+    with pytest.raises(ValidationError):
+        Compute2DParameters(bond_length=False)
+
+
+@pytest.mark.parametrize("field", ["width_px", "height_px", "svg_size_bytes"])
+def test_drawing_result_int_fields_reject_bool_float_and_str(field):
+    base = dict(
+        font_name="Telex-Regular.ttf",
+        font_sha256_observed="a" * 64,
+        svg_sha256="b" * 64,
+        svg_size_bytes=10,
+        xml_parser_version_observed="expat_2.6.0",
+    )
+    for bad_value in (True, 10.0, "10"):
+        kwargs = {**base, field: bad_value}
+        with pytest.raises(ValidationError):
+            DrawingResult(**kwargs)
+
+
+def test_provenance_representation_size_bytes_rejects_bool_float_and_str():
+    for bad_value in (True, 10.0, "10"):
+        with pytest.raises(ValidationError):
+            CharacterizationProvenance(
+                **_valid_provenance_kwargs(representation_size_bytes=bad_value)
+            )
+
+
+def test_strict_fixes_preserve_valid_json_round_trip():
+    values = CharacterizationValues(**_valid_values_kwargs())
+    restored = CharacterizationValues.model_validate_json(values.model_dump_json())
+    assert restored == values
+
+    effective = CharacterizationEffectiveParameters(parser=SmilesParserParameters())
+    restored_effective = CharacterizationEffectiveParameters.model_validate_json(
+        effective.model_dump_json()
+    )
+    assert restored_effective == effective
+
+    drawing = DrawMoleculeParameters()
+    assert DrawMoleculeParameters.model_validate_json(drawing.model_dump_json()) == drawing
+
+
+def test_all_default_profile_blocks_still_construct_with_no_arguments():
+    # the strict-type fix must not break the zero-argument defaults that
+    # every effective_parameters block relies on.
+    SdfParserParameters()
+    SmilesParserParameters()
+    FormulaParameters()
+    ExactMassParameters()
+    TpsaParameters()
+    CrippenParameters()
+    Compute2DParameters()
+    PrepareParameters()
+    DrawerConstructorParameters()
+    DrawOptionsParameters()
+    DrawMoleculeParameters()
+    EmptyCoordMap()
 
 
 # --- T-020A-004: svg/drawing consistency ---------------------------------
