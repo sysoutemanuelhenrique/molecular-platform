@@ -35,16 +35,22 @@ from molecular.receptor_materialization import (
     AtomDecision,
     AtomObservation,
     CategoryDecision,
+    ConnectionDecision,
     Engine,
     MaterializationConfigurationError,
+    MaterializationExecutionError,
     MaterializationInputError,
     MaterializationPlan,
     OccurrenceIdentity,
     OutsideEntry,
     PlanBinding,
     PolicyRecord,
+    RawCategoryTable,
+    RawConnectionEndpointTokens,
+    RawConnectionRow,
     RecordSnapshot,
     SourceContext,
+    SymmetryOperatorTables,
     XEntry,
     _compute_legacy_inspection_id,
     build_materialization_plan,
@@ -52,6 +58,7 @@ from molecular.receptor_materialization import (
     build_source_context,
     compute_atom_decisions_key,
     compute_atom_ids_key,
+    compute_category_decisions,
     compute_category_decisions_key,
     compute_connection_decisions_key,
     compute_exclusions_key,
@@ -62,6 +69,7 @@ from molecular.receptor_materialization import (
     compute_policy_id,
     compute_request_key,
     compute_source_context_key,
+    resolve_connection_decisions,
     validate_time_utc,
 )
 from molecular.receptor_resolution import (
@@ -1674,3 +1682,571 @@ def test_minor7_golden_request_key_envelope():
         application_version="0.0.0-documentary",
     )
     assert result == _GOLDEN_REQUEST_KEY_SHA256
+
+
+# ==========================================================================
+# Increment 021, Checkpoint 2: struct_conn/symmetry resolution (Section
+# 9/10/10.1) and the 94-category catalogue engine (Section 11). Scenario
+# ids below are the CP2 subset of increments/021/34-checkpoint2-
+# preparation/evidence/CP2_SCENARIO_SCOPE.csv (79 entries) - each test is
+# labeled with the exact id(s) it genuinely proves; a scenario this
+# checkpoint does not implement is never tagged here (it stays explicitly
+# pending, per the task's own "não convertido em skip aprovado" rule).
+# ==========================================================================
+
+
+def _no_tables() -> SymmetryOperatorTables:
+    return SymmetryOperatorTables(symmetry_equiv=None, space_group_symop=None)
+
+
+def _endpoint(*, asym="A", ccd="ALA", seq="1", atom_id_label="CA", auth_seq="1", symmetry=None) -> RawConnectionEndpointTokens:
+    return RawConnectionEndpointTokens(
+        label_asym_id=asym, label_comp_id=ccd, label_seq_id=seq, label_atom_id=atom_id_label,
+        auth_seq_id=auth_seq, insertion_token=None, altloc_aliases=(None, None, None), symmetry_token=symmetry,
+    )
+
+
+def _connection_scenario(
+    *, retained1, retained2, symmetry1, symmetry2, conn_type="disulf",
+    tables=None, asym1="A", asym2="B", reason1=None, reason2=None,
+):
+    tables = tables if tables is not None else _no_tables()
+    a1 = _atom(ordinal=0, atom_id="a1", label_asym_id=asym1, auth_asym_id=asym1, label_atom_id="CA")
+    a2 = _atom(ordinal=1, atom_id="a2", label_asym_id=asym2, auth_asym_id=asym2, entity_id="E2", label_atom_id="CA")
+    atoms_in_model = (a1, a2)
+    d1 = AtomDecision(
+        ordinal=0, atom_id="a1", occurrence_key=_hex(1), retained=retained1,
+        reason=reason1 or ("selected-asym" if retained1 else "chain-complement"),
+    )
+    d2 = AtomDecision(
+        ordinal=1, atom_id="a2", occurrence_key=_hex(2), retained=retained2,
+        reason=reason2 or ("selected-asym" if retained2 else "chain-complement"),
+    )
+    atom_decisions_by_ordinal = {0: d1, 1: d2}
+    row = RawConnectionRow(
+        ordinal=0, id="c1", conn_type=conn_type,
+        ptnr1=_endpoint(asym=asym1, symmetry=symmetry1), ptnr2=_endpoint(asym=asym2, symmetry=symmetry2),
+        ptnr3_present=False, source_tokens=(("id", "c1"),),
+    )
+    return resolve_connection_decisions(
+        source_context_key=_hex(9), atoms_in_model=atoms_in_model, atom_decisions_by_ordinal=atom_decisions_by_ordinal,
+        raw_connections=(row,), tables=tables,
+    )
+
+
+def test_k2_both_identity_preserves():  # T021-045
+    decisions = _connection_scenario(retained1=True, retained2=True, symmetry1="1_555", symmetry2="1_555")
+    assert decisions[0].action == "preserve"
+    assert decisions[0].reason == "both-retained"
+    assert decisions[0].symmetry_class == "both-identity"
+
+
+def _same_nonidentity_tables():
+    return SymmetryOperatorTables(symmetry_equiv={"2": "-x,-y,z"}, space_group_symop=None)
+
+
+def test_k2_same_nonidentity_rejects():  # T021-046
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        _connection_scenario(
+            retained1=True, retained2=True, symmetry1="2_555", symmetry2="2_555", tables=_same_nonidentity_tables(),
+        )
+    assert excinfo.value.code == "UNSUPPORTED_SYMMETRY"
+
+
+def test_k2_different_rejects():  # T021-047
+    tables = SymmetryOperatorTables(symmetry_equiv={"2": "-x,-y,z", "3": "-x,y,-z"}, space_group_symop=None)
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        _connection_scenario(retained1=True, retained2=True, symmetry1="2_555", symmetry2="3_555", tables=tables)
+    assert excinfo.value.code == "UNSUPPORTED_SYMMETRY"
+
+
+def test_k2_one_null_rejects():  # T021-048
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        _connection_scenario(retained1=True, retained2=True, symmetry1=None, symmetry2="1_555")
+    assert excinfo.value.code == "UNSUPPORTED_SYMMETRY"
+
+
+def test_k2_both_null_rejects():  # T021-049
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        _connection_scenario(retained1=True, retained2=True, symmetry1=None, symmetry2=None)
+    assert excinfo.value.code == "UNSUPPORTED_SYMMETRY"
+
+
+def test_k1_both_identity_metalc_omits_whole_partner_removed():  # T021-050 (metalc/hydrog half)
+    decisions = _connection_scenario(
+        retained1=True, retained2=False, symmetry1="1_555", symmetry2="1_555", conn_type="metalc",
+    )
+    assert decisions[0].action == "omit"
+    assert decisions[0].reason == "whole-partner-removed-metalc"
+    assert decisions[0].symmetry_class == "both-identity"
+
+
+def test_k1_both_identity_covalent_type_rejects():  # T021-050 (covalente recusa half)
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        _connection_scenario(
+            retained1=True, retained2=False, symmetry1="1_555", symmetry2="1_555", conn_type="disulf",
+        )
+    assert excinfo.value.code == "COVALENT_CUT"
+
+
+@pytest.mark.parametrize(
+    "symmetry1,symmetry2,tables,scenario_id",
+    [
+        ("2_555", "2_555", _same_nonidentity_tables(), "T021-051"),
+        ("2_555", "3_555", SymmetryOperatorTables(symmetry_equiv={"2": "-x,-y,z", "3": "-x,y,-z"}, space_group_symop=None), "T021-052"),
+        (None, "1_555", None, "T021-053"),
+        (None, None, None, "T021-054"),
+    ],
+)
+def test_k1_non_identity_symmetry_rejects(symmetry1, symmetry2, tables, scenario_id):  # T021-051/052/053/054
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        _connection_scenario(
+            retained1=True, retained2=False, symmetry1=symmetry1, symmetry2=symmetry2,
+            conn_type="metalc", tables=tables or _no_tables(),
+        )
+    assert excinfo.value.code == "UNSUPPORTED_SYMMETRY", scenario_id
+
+
+@pytest.mark.parametrize(
+    "symmetry1,symmetry2,tables,expected_class,scenario_id",
+    [
+        ("1_555", "1_555", None, "both-identity", "T021-055"),
+        ("2_555", "2_555", _same_nonidentity_tables(), "same-nonidentity", "T021-056"),
+        ("2_555", "3_555", SymmetryOperatorTables(symmetry_equiv={"2": "-x,-y,z", "3": "-x,y,-z"}, space_group_symop=None), "different", "T021-057"),
+        (None, "1_555", None, "one-null", "T021-058"),
+        (None, None, None, "both-null", "T021-059"),
+    ],
+)
+def test_k0_omits_with_audit_for_every_symmetry_class(symmetry1, symmetry2, tables, expected_class, scenario_id):  # T021-055-059
+    decisions = _connection_scenario(
+        retained1=False, retained2=False, symmetry1=symmetry1, symmetry2=symmetry2,
+        conn_type="metalc", tables=tables or _no_tables(),
+    )
+    assert decisions[0].action == "omit", scenario_id
+    assert decisions[0].reason == "both-removed", scenario_id
+    assert decisions[0].symmetry_class == expected_class, scenario_id
+
+
+def test_symmetry_preconditions_malformed_rejects_at_k_positive_but_omits_at_k0():  # T021-060
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        _connection_scenario(retained1=True, retained2=False, symmetry1="01_555", symmetry2="1_555", conn_type="metalc")
+    assert excinfo.value.code == "UNSUPPORTED_SYMMETRY"
+
+    decisions = _connection_scenario(retained1=False, retained2=False, symmetry1="01_555", symmetry2="1_555")
+    assert decisions[0].action == "omit"
+    assert decisions[0].symmetry_class == "unsupported-discarded"
+
+
+def test_identity_no_table_1_555_convention_without_fabricating_operators():  # T021-141
+    decisions = _connection_scenario(retained1=True, retained2=True, symmetry1="1_555", symmetry2="1_555", tables=_no_tables())
+    assert decisions[0].identity_basis == ("pdbx-1_555-convention", "pdbx-1_555-convention")
+    assert decisions[0].action == "preserve"
+
+
+def test_identity_contradiction_with_tables_present_never_falls_back_to_convention():  # T021-142
+    contradictory_tables = SymmetryOperatorTables(symmetry_equiv={"1": None}, space_group_symop=None)
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        _connection_scenario(
+            retained1=True, retained2=True, symmetry1="1_555", symmetry2="1_555", tables=contradictory_tables,
+        )
+    assert excinfo.value.code == "UNSUPPORTED_SYMMETRY"
+
+
+def test_other_operator_without_table_rejects_k_positive_never_uses_1_555_exception():  # T021-143
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        _connection_scenario(retained1=True, retained2=False, symmetry1="2_555", symmetry2="1_555", conn_type="metalc")
+    assert excinfo.value.code == "UNSUPPORTED_SYMMETRY"
+
+
+def test_different_image_reason_hydrog_1_555_vs_9_555_rejects_without_claiming_geometric_impossibility():  # T021-144
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        _connection_scenario(retained1=True, retained2=False, symmetry1="1_555", symmetry2="9_555", conn_type="hydrog")
+    error = excinfo.value
+    assert error.code == "UNSUPPORTED_SYMMETRY"
+    assert "geometr" not in str(error).lower()
+
+
+def test_third_partner_present_rejects():  # T021-044
+    a1 = _atom(ordinal=0, atom_id="a1", label_asym_id="A", label_atom_id="CA")
+    a2 = _atom(ordinal=1, atom_id="a2", label_asym_id="B", entity_id="E2", label_atom_id="CA")
+    atom_decisions_by_ordinal = {
+        0: AtomDecision(ordinal=0, atom_id="a1", occurrence_key=_hex(1), retained=True, reason="selected-asym"),
+        1: AtomDecision(ordinal=1, atom_id="a2", occurrence_key=_hex(2), retained=True, reason="selected-asym"),
+    }
+    row = RawConnectionRow(
+        ordinal=0, id="c1", conn_type="disulf",
+        ptnr1=_endpoint(asym="A", symmetry="1_555"), ptnr2=_endpoint(asym="B", symmetry="1_555"),
+        ptnr3_present=True, source_tokens=(("id", "c1"),),
+    )
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        resolve_connection_decisions(
+            source_context_key=_hex(9), atoms_in_model=(a1, a2), atom_decisions_by_ordinal=atom_decisions_by_ordinal,
+            raw_connections=(row,), tables=_no_tables(),
+        )
+    assert excinfo.value.code == "UNSUPPORTED_PARTNER"
+
+
+# --- T021-164-173: IdentityBasis pairs (all K=0) --------------------------
+
+
+_WITH_OPERATOR_2 = SymmetryOperatorTables(symmetry_equiv={"2": "-x,-y,z"}, space_group_symop=None)
+
+
+@pytest.mark.parametrize(
+    "symmetry1,symmetry2,tables,expected_basis,scenario_id",
+    [
+        ("1_555", "1_555", _no_tables(), ("pdbx-1_555-convention", "pdbx-1_555-convention"), "T021-164"),
+        ("1_555", None, _no_tables(), ("pdbx-1_555-convention", "not-applicable"), "T021-166"),
+        ("2_555", "2_555", _WITH_OPERATOR_2, ("source-operator", "source-operator"), "T021-168"),
+        ("2_555", None, _WITH_OPERATOR_2, ("source-operator", "not-applicable"), "T021-169"),
+        (None, "1_555", _no_tables(), ("not-applicable", "pdbx-1_555-convention"), "T021-170"),
+        (None, "2_555", _WITH_OPERATOR_2, ("not-applicable", "source-operator"), "T021-171"),
+        (None, None, _no_tables(), ("not-applicable", "not-applicable"), "T021-172"),
+    ],
+)
+def test_identity_basis_pairs_k0_reachable_pairs(symmetry1, symmetry2, tables, expected_basis, scenario_id):  # T021-164/166/168-172
+    decisions = _connection_scenario(
+        retained1=False, retained2=False, symmetry1=symmetry1, symmetry2=symmetry2, tables=tables,
+    )
+    assert decisions[0].action == "omit", scenario_id
+    assert decisions[0].identity_basis == expected_basis, scenario_id
+    # Section 13: connection_decisions_key/plan_key are pure functions of the
+    # same bytes/DTOs - hashing an identical decision vector twice must
+    # reproduce the identical digest, and partner order is preserved
+    # (ptnr1-then-ptnr2), never silently normalized/sorted.
+    key_a = compute_connection_decisions_key(source_context_key=_hex(9), decisions=decisions)
+    key_b = compute_connection_decisions_key(source_context_key=_hex(9), decisions=decisions)
+    assert key_a == key_b, scenario_id
+
+
+@pytest.mark.parametrize(
+    "identity_basis,scenario_id",
+    [
+        (("pdbx-1_555-convention", "source-operator"), "T021-165"),
+        (("source-operator", "pdbx-1_555-convention"), "T021-167"),
+    ],
+)
+def test_identity_basis_impossible_pairs_never_construct_an_accepted_connection_decision(identity_basis, scenario_id):  # T021-165/167
+    # These two pairs can never arise from `_resolve_symmetry_endpoint`
+    # itself (both endpoints always share one structure's `tables.any_present`),
+    # so this is the DTO's own defense-in-depth validator - exercised by
+    # direct construction, never produced by the real resolution pipeline.
+    with pytest.raises(ValidationError):
+        ConnectionDecision(
+            ordinal=0, id="c1", row_key=_hex(1), conn_type_token="metalc",
+            endpoint_atom_ids=(("a1",), ("a2",)), identity_basis=identity_basis,
+            retained_endpoints=0, symmetry_class="unsupported-discarded", action="omit", reason="both-removed",
+        )
+
+
+def test_identity_basis_precedence_applies_10_1_without_k_shortcuts():  # T021-173
+    # A non-null, malformed code (fails the n_klm grammar) must resolve to
+    # not-applicable/insufficient-proof regardless of K or table presence -
+    # never short-circuited by "it's at K=0 so it doesn't matter".
+    decisions = _connection_scenario(retained1=False, retained2=False, symmetry1="not-a-code", symmetry2=None)
+    assert decisions[0].identity_basis == ("not-applicable", "not-applicable")
+    assert decisions[0].symmetry_class == "unsupported-discarded"
+
+
+# --- Section 11: the catalogue engine -------------------------------------
+
+
+def _category_table(**columns):
+    return RawCategoryTable(columns=columns)
+
+
+def _full_atom_site_table(
+    *, ids, type_symbols, label_atom_ids, comp_ids, asym_ids, entity_ids, seq_ids, auth_asym_ids, auth_seq_ids,
+    model_nums=None,
+):
+    n = len(ids)
+    model_nums = model_nums or ("1",) * n
+    return _category_table(
+        id=ids, type_symbol=type_symbols, label_atom_id=label_atom_ids, label_alt_id=(None,) * n,
+        label_comp_id=comp_ids, label_asym_id=asym_ids, label_entity_id=entity_ids, label_seq_id=seq_ids,
+        auth_asym_id=auth_asym_ids, auth_seq_id=auth_seq_ids, pdbx_pdb_ins_code=(None,) * n,
+        pdbx_pdb_model_num=model_nums, cartn_x=("1.0",) * n, cartn_y=("1.0",) * n, cartn_z=("1.0",) * n,
+        occupancy=("1.0",) * n, b_iso_or_equiv=("10.0",) * n,
+    )
+
+
+def _minimal_catalogue_scenario():
+    atoms = (
+        _atom(ordinal=0, atom_id="a-ca", label_asym_id="A", ccd="ALA", label_seq_id="1", label_atom_id="CA"),
+        _atom(ordinal=1, atom_id="a-sg", label_asym_id="A", ccd="CYS", label_seq_id="2", label_atom_id="SG"),
+        _atom(ordinal=2, atom_id="b-sd", label_asym_id="B", ccd="MET", label_seq_id="1", auth_asym_id="B", entity_id="E2", label_atom_id="SD"),
+    )
+    source_context = _source_context()
+    resolution = _resolution()
+    plan = build_materialization_plan(
+        source_context=source_context, resolved_selection=resolution, unaddressed_components="preserve", atoms=atoms,
+    )
+    atom_decisions_by_ordinal = {d.ordinal: d for d in plan.atom_decisions}
+    atoms_by_ordinal = {a.ordinal: a for a in atoms}
+    retained_entity_ids = frozenset(
+        atoms_by_ordinal[o].entity_id for o, d in atom_decisions_by_ordinal.items() if d.retained
+    )
+    retained_asym_ids = frozenset(
+        atoms_by_ordinal[o].label_asym_id for o, d in atom_decisions_by_ordinal.items() if d.retained
+    )
+    return plan, atoms_by_ordinal, atom_decisions_by_ordinal, retained_entity_ids, retained_asym_ids
+
+
+def test_catalogue_atom_mask_filters_by_real_atom_decisions():  # T021-061
+    plan, atoms_by_ordinal, atom_decisions_by_ordinal, retained_entity_ids, retained_asym_ids = _minimal_catalogue_scenario()
+    categories = {
+        "_atom_site": _category_table(
+            id=("a-ca", "a-sg", "b-sd"), type_symbol=("C", "S", "S"), label_atom_id=("CA", "SG", "SD"),
+            label_alt_id=(None, None, None), label_comp_id=("ALA", "CYS", "MET"), label_asym_id=("A", "A", "B"),
+            label_entity_id=("E1", "E1", "E2"), label_seq_id=("1", "2", "1"), auth_asym_id=("A", "A", "B"),
+            auth_seq_id=("1", "2", "1"), pdbx_pdb_ins_code=(None, None, None), pdbx_pdb_model_num=("1", "1", "1"),
+            cartn_x=("1.0", "2.0", "3.0"), cartn_y=("1.0", "2.0", "3.0"), cartn_z=("1.0", "2.0", "3.0"),
+            occupancy=("1.0", "1.0", "1.0"), b_iso_or_equiv=("10.0", "10.0", "10.0"),
+        ),
+        "_entity": _category_table(id=("E1", "E2"), type=("polymer", "polymer")),
+        "_struct_asym": _category_table(id=("A", "B"), entity_id=("E1", "E2")),
+        "_chem_comp": _category_table(id=("ALA", "CYS", "MET"), type=("L-peptide linking",) * 3),
+    }
+    decisions = compute_category_decisions(
+        source_context_key=plan.plan.source_context_key, categories=categories,
+        retained_entity_ids=retained_entity_ids, retained_asym_ids=retained_asym_ids, resolved_model=1,
+        atoms_by_ordinal=atoms_by_ordinal, atom_decisions_by_ordinal=atom_decisions_by_ordinal,
+        connection_decisions=(),
+    )
+    by_cat = {d.category: d for d in decisions}
+    assert by_cat["_atom_site"].kept_row_ordinals == (0, 1)  # T021-061
+    assert by_cat["_struct_asym"].kept_row_ordinals == (0,)  # T021-063
+    assert by_cat["_entity"].kept_row_ordinals == (0,)  # T021-064
+    assert by_cat["_chem_comp"].kept_row_ordinals == (0, 1)  # T021-067 (CCD closure)
+    assert by_cat["_entry"].action == "generate"  # T021-082
+
+
+def test_catalogue_anisotrop_requires_complete_tensor_and_matching_atom_site_id():  # T021-062
+    plan, atoms_by_ordinal, atom_decisions_by_ordinal, retained_entity_ids, retained_asym_ids = _minimal_catalogue_scenario()
+    atom_site = _category_table(
+        id=("a-ca",), type_symbol=("C",), label_atom_id=("CA",), label_alt_id=(None,), label_comp_id=("ALA",),
+        label_asym_id=("A",), label_entity_id=("E1",), label_seq_id=("1",), auth_asym_id=("A",), auth_seq_id=("1",),
+        pdbx_pdb_ins_code=(None,), pdbx_pdb_model_num=("1",), cartn_x=("1.0",), cartn_y=("1.0",), cartn_z=("1.0",),
+        occupancy=("1.0",), b_iso_or_equiv=("10.0",),
+    )
+    base_categories = {
+        "_atom_site": atom_site, "_entity": _category_table(id=("E1",), type=("polymer",)),
+        "_struct_asym": _category_table(id=("A",), entity_id=("E1",)), "_chem_comp": _category_table(id=("ALA",), type=("x",)),
+    }
+
+    def run(anisotrop_columns):
+        categories = dict(base_categories, _atom_site_anisotrop=_category_table(**anisotrop_columns))
+        return compute_category_decisions(
+            source_context_key=plan.plan.source_context_key, categories=categories,
+            retained_entity_ids=frozenset({"E1"}), retained_asym_ids=frozenset({"A"}), resolved_model=1,
+            atoms_by_ordinal={0: atoms_by_ordinal[0]}, atom_decisions_by_ordinal={0: atom_decisions_by_ordinal[0]},
+            connection_decisions=(),
+        )
+
+    decisions = run({
+        "id": ("a-ca",), "u[1][1]": ("0.1",), "u[1][2]": ("0.0",), "u[1][3]": ("0.0",),
+        "u[2][2]": ("0.1",), "u[2][3]": ("0.0",), "u[3][3]": ("0.1",),
+    })
+    by_cat = {d.category: d for d in decisions}
+    assert by_cat["_atom_site_anisotrop"].kept_row_ordinals == (0,)
+
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        run({"id": ("a-ca",), "u[1][1]": ("0.1",), "u[1][2]": (None,), "u[1][3]": ("0.0",),
+             "u[2][2]": ("0.1",), "u[2][3]": ("0.0",), "u[3][3]": ("0.1",)})
+    assert excinfo.value.code == "INVALID_CIF"
+
+
+def test_catalogue_struct_conn_used_types_and_elements_from_real_connection_decisions():  # T021-075/076/077
+    plan, atoms_by_ordinal, atom_decisions_by_ordinal, retained_entity_ids, retained_asym_ids = _minimal_catalogue_scenario()
+    tables = _no_tables()
+    row = RawConnectionRow(
+        ordinal=0, id="conn1", conn_type="disulf",
+        ptnr1=_endpoint(asym="A", ccd="ALA", seq="1", atom_id_label="CA", symmetry="1_555"),
+        ptnr2=_endpoint(asym="A", ccd="CYS", seq="2", atom_id_label="SG", symmetry="1_555"),
+        ptnr3_present=False, source_tokens=(("id", "conn1"),),
+    )
+    connection_decisions = resolve_connection_decisions(
+        source_context_key=plan.plan.source_context_key, atoms_in_model=tuple(atoms_by_ordinal.values()),
+        atom_decisions_by_ordinal=atom_decisions_by_ordinal, raw_connections=(row,), tables=tables,
+    )
+    assert connection_decisions[0].action == "preserve"
+
+    categories = {
+        "_atom_site": _full_atom_site_table(
+            ids=("a-ca", "a-sg", "b-sd"), type_symbols=("C", "S", "S"), label_atom_ids=("CA", "SG", "SD"),
+            comp_ids=("ALA", "CYS", "MET"), asym_ids=("A", "A", "B"), entity_ids=("E1", "E1", "E2"),
+            seq_ids=("1", "2", "1"), auth_asym_ids=("A", "A", "B"), auth_seq_ids=("1", "2", "1"),
+        ),
+        "_entity": _category_table(id=("E1", "E2"), type=("polymer", "polymer")),
+        "_struct_asym": _category_table(id=("A", "B"), entity_id=("E1", "E2")),
+        "_chem_comp": _category_table(id=("ALA", "CYS", "MET"), type=("x",) * 3),
+        "_struct_conn": _category_table(
+            id=("conn1",), conn_type_id=("disulf",),
+            ptnr1_label_asym_id=("A",), ptnr1_label_comp_id=("ALA",), ptnr1_label_atom_id=("CA",),
+            ptnr2_label_asym_id=("A",), ptnr2_label_comp_id=("CYS",), ptnr2_label_atom_id=("SG",),
+        ),
+        "_struct_conn_type": _category_table(id=("disulf", "metalc")),
+        "_atom_type": _category_table(symbol=("C", "N", "S")),
+    }
+    decisions = compute_category_decisions(
+        source_context_key=plan.plan.source_context_key, categories=categories,
+        retained_entity_ids=retained_entity_ids, retained_asym_ids=retained_asym_ids, resolved_model=1,
+        atoms_by_ordinal=atoms_by_ordinal, atom_decisions_by_ordinal=atom_decisions_by_ordinal,
+        connection_decisions=connection_decisions,
+    )
+    by_cat = {d.category: d for d in decisions}
+    assert by_cat["_struct_conn"].kept_row_ordinals == (0,)  # T021-075
+    assert by_cat["_struct_conn_type"].kept_row_ordinals == (0,)  # T021-076 (disulf only, metalc never fabricated)
+    assert by_cat["_atom_type"].kept_row_ordinals == (0, 2)  # T021-077 (C, S used by retained atoms; N unused)
+
+
+def test_catalogue_cell_symmetry_singleton_and_operator_tables_preserved_verbatim():  # T021-078/079
+    plan, atoms_by_ordinal, atom_decisions_by_ordinal, retained_entity_ids, retained_asym_ids = _minimal_catalogue_scenario()
+    categories = {
+        "_atom_site": _full_atom_site_table(
+            ids=("a-ca", "a-sg", "b-sd"), type_symbols=("C", "S", "S"), label_atom_ids=("CA", "SG", "SD"),
+            comp_ids=("ALA", "CYS", "MET"), asym_ids=("A", "A", "B"), entity_ids=("E1", "E1", "E2"),
+            seq_ids=("1", "2", "1"), auth_asym_ids=("A", "A", "B"), auth_seq_ids=("1", "2", "1"),
+        ),
+        "_entity": _category_table(id=("E1", "E2"), type=("polymer", "polymer")),
+        "_struct_asym": _category_table(id=("A", "B"), entity_id=("E1", "E2")),
+        "_chem_comp": _category_table(id=("ALA", "CYS", "MET"), type=("x",) * 3),
+        "_cell": _category_table(length_a=("10.0",), length_b=("10.0",), length_c=("10.0",)),
+        "_symmetry": _category_table(**{"space_group_name_h-m": ("'P 1'",)}),
+        "_symmetry_equiv": _category_table(id=("1", "2"), pos_as_xyz=("x,y,z", "-x,-y,z")),
+    }
+    decisions = compute_category_decisions(
+        source_context_key=plan.plan.source_context_key, categories=categories,
+        retained_entity_ids=retained_entity_ids, retained_asym_ids=retained_asym_ids, resolved_model=1,
+        atoms_by_ordinal=atoms_by_ordinal, atom_decisions_by_ordinal=atom_decisions_by_ordinal,
+        connection_decisions=(),
+    )
+    by_cat = {d.category: d for d in decisions}
+    assert by_cat["_cell"].kept_row_ordinals == (0,)  # T021-078
+    assert by_cat["_cell"].generated_tags == ("entry_id",)
+    assert by_cat["_symmetry"].kept_row_ordinals == (0,)  # T021-078
+    assert by_cat["_symmetry_equiv"].kept_row_ordinals == (0, 1)  # T021-079 (verbatim, no filtering)
+
+
+def test_catalogue_omitted_family_and_unknown_category_and_tag():  # T021-083/084/085
+    plan, atoms_by_ordinal, atom_decisions_by_ordinal, retained_entity_ids, retained_asym_ids = _minimal_catalogue_scenario()
+    base = {
+        "_atom_site": _full_atom_site_table(
+            ids=("a-ca", "a-sg", "b-sd"), type_symbols=("C", "S", "S"), label_atom_ids=("CA", "SG", "SD"),
+            comp_ids=("ALA", "CYS", "MET"), asym_ids=("A", "A", "B"), entity_ids=("E1", "E1", "E2"),
+            seq_ids=("1", "2", "1"), auth_asym_ids=("A", "A", "B"), auth_seq_ids=("1", "2", "1"),
+        ),
+        "_entity": _category_table(id=("E1", "E2"), type=("polymer", "polymer")),
+        "_struct_asym": _category_table(id=("A", "B"), entity_id=("E1", "E2")),
+        "_chem_comp": _category_table(id=("ALA", "CYS", "MET"), type=("x",) * 3),
+    }
+
+    def run(categories):
+        return compute_category_decisions(
+            source_context_key=plan.plan.source_context_key, categories=dict(base, **categories),
+            retained_entity_ids=retained_entity_ids, retained_asym_ids=retained_asym_ids, resolved_model=1,
+            atoms_by_ordinal=atoms_by_ordinal, atom_decisions_by_ordinal=atom_decisions_by_ordinal,
+            connection_decisions=(),
+        )
+
+    decisions = run({"_pdbx_validate_rmsd_bond": _category_table(id=("1",))})
+    by_cat = {d.category: d for d in decisions}
+    assert by_cat["_pdbx_validate_rmsd_bond"].action == "omit"  # T021-083
+
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        run({"_my_unlisted_category": _category_table(id=("1",))})
+    assert excinfo.value.code == "UNSUPPORTED_CATEGORY"  # T021-084
+
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        run({"_entity": _category_table(id=("E1", "E2"), type=("polymer", "polymer"), bogus=("x", "y"))})
+    assert excinfo.value.code == "UNSUPPORTED_TAG"  # T021-085
+
+
+def test_catalogue_ncs_scenarios():  # T021-150/151/152/153/154
+    plan, atoms_by_ordinal, atom_decisions_by_ordinal, retained_entity_ids, retained_asym_ids = _minimal_catalogue_scenario()
+    base = {
+        "_atom_site": _full_atom_site_table(
+            ids=("a-ca", "a-sg", "b-sd"), type_symbols=("C", "S", "S"), label_atom_ids=("CA", "SG", "SD"),
+            comp_ids=("ALA", "CYS", "MET"), asym_ids=("A", "A", "B"), entity_ids=("E1", "E1", "E2"),
+            seq_ids=("1", "2", "1"), auth_asym_ids=("A", "A", "B"), auth_seq_ids=("1", "2", "1"),
+        ),
+        "_entity": _category_table(id=("E1", "E2"), type=("polymer", "polymer")),
+        "_struct_asym": _category_table(id=("A", "B"), entity_id=("E1", "E2")),
+        "_chem_comp": _category_table(id=("ALA", "CYS", "MET"), type=("x",) * 3),
+    }
+    identity_matrix = dict(
+        **{f"matrix[{i}][{j}]": ("1.0" if i == j else "0.0",) for i in (1, 2, 3) for j in (1, 2, 3)},
+        **{f"vector[{i}]": ("0.0",) for i in (1, 2, 3)},
+    )
+    nonidentity_matrix = dict(identity_matrix)
+    nonidentity_matrix["matrix[1][1]"] = ("0.0",)
+    nonidentity_matrix["matrix[1][2]"] = ("-1.0",)
+    nonidentity_matrix["matrix[2][1]"] = ("1.0",)
+    nonidentity_matrix["matrix[2][2]"] = ("0.0",)
+
+    def run(code, matrix):
+        categories = dict(base, _struct_ncs_oper=_category_table(id=("1",), code=(code,), **matrix))
+        return compute_category_decisions(
+            source_context_key=plan.plan.source_context_key, categories=categories,
+            retained_entity_ids=retained_entity_ids, retained_asym_ids=retained_asym_ids, resolved_model=1,
+            atoms_by_ordinal=atoms_by_ordinal, atom_decisions_by_ordinal=atom_decisions_by_ordinal,
+            connection_decisions=(),
+        )
+
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        run("generate", nonidentity_matrix)
+    assert excinfo.value.code == "UNSUPPORTED_NCS"  # T021-150
+
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        run(None, nonidentity_matrix)
+    assert excinfo.value.code == "UNSUPPORTED_NCS"  # T021-151
+
+    decisions = run("given", nonidentity_matrix)
+    by_cat = {d.category: d for d in decisions}
+    assert by_cat["_struct_ncs_oper"].action == "guard_then_omit"  # T021-152
+    assert by_cat["_struct_ncs_oper"].omitted_row_ordinals == (0,)
+
+    decisions = run("generate", identity_matrix)
+    by_cat = {d.category: d for d in decisions}
+    assert by_cat["_struct_ncs_oper"].omitted_row_ordinals == (0,)  # T021-153
+
+    partial_matrix = dict(identity_matrix)
+    partial_matrix["matrix[1][1]"] = (None,)
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        run("given", partial_matrix)
+    assert excinfo.value.code == "INVALID_CIF"  # T021-154 (partial matrix)
+
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        run("some-unknown-code", identity_matrix)
+    assert excinfo.value.code == "INVALID_CIF"  # T021-154 (unknown code)
+
+
+def test_catalogue_special_position_guard_requires_unambiguous_context():  # T021-158
+    plan, atoms_by_ordinal, atom_decisions_by_ordinal, retained_entity_ids, retained_asym_ids = _minimal_catalogue_scenario()
+    base = {
+        "_atom_site": _full_atom_site_table(
+            ids=("a-ca", "a-sg", "b-sd"), type_symbols=("C", "S", "S"), label_atom_ids=("CA", "SG", "SD"),
+            comp_ids=("ALA", "CYS", "MET"), asym_ids=("A", "A", "B"), entity_ids=("E1", "E1", "E2"),
+            seq_ids=("1", "2", "1"), auth_asym_ids=("A", "A", "B"), auth_seq_ids=("1", "2", "1"),
+        ),
+        "_entity": _category_table(id=("E1", "E2"), type=("polymer", "polymer")),
+        "_struct_asym": _category_table(id=("A", "B"), entity_id=("E1", "E2")),
+        "_chem_comp": _category_table(id=("ALA", "CYS", "MET"), type=("x",) * 3),
+    }
+
+    def run(special_columns):
+        categories = dict(base, _pdbx_struct_special_symmetry=_category_table(**special_columns))
+        return compute_category_decisions(
+            source_context_key=plan.plan.source_context_key, categories=categories,
+            retained_entity_ids=retained_entity_ids, retained_asym_ids=retained_asym_ids, resolved_model=1,
+            atoms_by_ordinal=atoms_by_ordinal, atom_decisions_by_ordinal=atom_decisions_by_ordinal,
+            connection_decisions=(),
+        )
+
+    decisions = run({"id": ("1",), "label_asym_id": ("A",)})
+    by_cat = {d.category: d for d in decisions}
+    assert by_cat["_pdbx_struct_special_symmetry"].action == "guard_then_omit"
+
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        run({"id": ("1",), "auth_asym_id": ("Z",)})
+    assert excinfo.value.code == "INVALID_CIF"  # ambiguity/unresolvable context refuses, per T021-158

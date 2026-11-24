@@ -1,34 +1,33 @@
-"""Domain model, canonicalization and pure planner for receptor
-materialization (Increment 021, Checkpoint 1 - frozen specification at
+"""Domain model, canonicalization and pure planner/resolver for receptor
+materialization (Increment 021, Checkpoints 1-2 - frozen specification at
 increments/021/15-final-specification/INCREMENT_021_FINAL_SPECIFICATION.md,
 governance commit b0e60f6528f6fcb828aa6dd5577824e08c7c9fac).
 
 This module is the *domain-only* slice of Increment 021: DTOs, hash
-canonicalization, and a pure planner that derives the S/D/U/X/O decisions
-(Sections 7-8 of the frozen spec) and the acknowledgement-checked
-`PolicyRecord` (Section 12-13). It never imports `gemmi`/`rdkit`, never
-opens a RAW artifact or a 020 YAML record, and never writes to storage -
-those are Checkpoint 2 (adapter), Checkpoint 3 (storage/registry/service)
-and Checkpoint 4 (CLI) responsibilities (Section 19 of the frozen spec).
+canonicalization, the pure planner that derives the S/D/U/X/O decisions
+(Sections 7-8), the `struct_conn`/symmetry/IdentityBasis resolver
+(`resolve_connection_decisions` - Sections 9-10/10.1), the pinned
+94-category catalogue engine (`compute_category_decisions` - Section 11),
+and the acknowledgement-checked `PolicyRecord` (Section 12-13). It never
+imports `gemmi`/`rdkit`, never opens a RAW artifact or a 020 YAML record,
+and never writes to storage - those are Checkpoint 2's adapter boundary
+(`receptor_parsing.materialize_receptor_cif021`, the only place both
+`gemmi` and this module are imported together), Checkpoint 3 (storage/
+registry/service) and Checkpoint 4 (CLI) responsibilities (Section 19).
 
-`AtomObservation` is the explicit boundary: Checkpoint 2's future Gemmi
-adapter will be the only code that ever constructs one from a real RAW
-document. In this checkpoint, only domain tests construct it directly, in
-memory, to exercise the planner - never a stub that fabricates a constant
-"scientific success".
+`AtomObservation`, `RawConnectionRow`, `SymmetryOperatorTables` and
+`RawCategoryTable` are the explicit boundary: the Checkpoint 2 Gemmi
+adapter in `receptor_parsing.py` is the only code that ever constructs
+these from a real RAW document (via a late, local reference to `gemmi`
+inside that other, dedicated module - never from this one). Domain tests
+construct them directly, in memory, to exercise the planner/resolver/
+catalogue engine - never a stub that fabricates a constant "scientific
+success".
 
-Deliberately not implemented here (Checkpoint 2-4, Section 19): the Gemmi
-adapter, `struct_conn`/symmetry resolution (`ConnectionDecision`,
-`IdentityBasis`, `SymmetryClass` - Sections 9-10), the closed catalogue's
-row-level filtering (Section 11), `Summary`/`PreviewOutcome`/
-`ManifestRecord`/`AuditRecord`/`ArtifactOutcome` (they need real output
-byte counts this checkpoint never produces), storage/reservation/registry,
-and the CLI. `PlanBinding.connection_decisions_key` is therefore always the
-canonical hash of an empty connection-decision vector in this checkpoint;
-`category_decisions` is accepted as an explicit, already-decided vector
-(Section 11's own filter/omit/generate/guard_then_omit shape is exercised
-here at the DTO level - T021-161) rather than computed from a real
-catalogue lookup.
+Deliberately not implemented here (Checkpoint 3-4, Section 19): `Summary`/
+`PreviewOutcome`/`ManifestRecord`/`AuditRecord`/`ArtifactOutcome` (they
+need real output byte counts and a persisted audit trail Checkpoint 2
+never writes to storage), storage/reservation/registry, and the CLI.
 
 All new records are frozen, `extra="forbid"`, and constructed with
 `strict=True` (Section 12: "rejeitam coerção: str/bytes, bool/int, int/str
@@ -42,10 +41,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import unicodedata
 from datetime import datetime
-from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Dict, FrozenSet, List, Literal, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -709,9 +709,17 @@ class AtomObservation(BaseModel):
     auth_asym_id: Optional[str] = None
     auth_seq_id: Optional[str] = None
     insertion_token: Optional[str] = None
+    # Checkpoint 2 additions (Section 9: struct_conn endpoint resolution
+    # needs the atom's chemical name and altloc code, neither of which
+    # Checkpoint 1's pure S/D/U/X/O planner ever reads). Optional, default
+    # `None`, so every Checkpoint 1 fixture/test - none of which sets
+    # these - keeps constructing unchanged.
+    label_atom_id: Optional[str] = None
+    altloc: Optional[str] = None
 
     @field_validator(
-        "atom_id", "label_asym_id", "entity_id", "ccd", "label_seq_id", "auth_asym_id", "auth_seq_id"
+        "atom_id", "label_asym_id", "entity_id", "ccd", "label_seq_id", "auth_asym_id", "auth_seq_id",
+        "label_atom_id", "altloc",
     )
     @classmethod
     def _validate_native_ids(cls, value: Optional[str]) -> Optional[str]:
@@ -861,17 +869,21 @@ def compute_atom_decisions_key(*, source_context_key: str, decisions: Sequence[A
     return compute_materialization_hash(payload)
 
 
-def compute_connection_decisions_key(*, source_context_key: str) -> str:
-    """Checkpoint 1 never resolves `struct_conn` (Section 9-10 is
-    Checkpoint 2): the connection-decision vector is always empty here,
-    still hashed under its own envelope so the key changes with
-    `source_context_key` even though the (always-empty) vector does not."""
+def compute_connection_decisions_key(
+    *, source_context_key: str, decisions: Sequence["ConnectionDecision"] = ()
+) -> str:
+    """Checkpoint 1 never resolved `struct_conn` (Section 9-10 was
+    Checkpoint 2's own delivery): `decisions` defaults to `()` so every
+    Checkpoint 1 call site - which never had a real connection vector to
+    pass - keeps hashing the exact same empty-vector payload it always
+    did. Checkpoint 2's real pipeline (`resolve_connection_decisions`)
+    always passes its real, possibly non-empty vector here."""
 
     payload = {
         "kind": "receptor-materialization-connection-decisions",
         "version": "1.0",
         "source_context_key": source_context_key,
-        "decisions": [],
+        "decisions": [decision.model_dump(mode="json") for decision in decisions],
     }
     return compute_materialization_hash(payload)
 
@@ -1093,6 +1105,7 @@ class MaterializationPlan(BaseModel):
     plan_key: str = Field(min_length=64, max_length=64)
     atom_decisions: Tuple[AtomDecision, ...]
     category_decisions: Tuple[CategoryDecision, ...]
+    connection_decisions: Tuple["ConnectionDecision", ...] = ()
 
     @field_validator("plan_key")
     @classmethod
@@ -1128,6 +1141,7 @@ def build_materialization_plan(
     unaddressed_components: UnaddressedComponentsPolicy,
     atoms: Tuple[AtomObservation, ...],
     category_decisions: Tuple[CategoryDecision, ...] = (),
+    connection_decisions: Tuple["ConnectionDecision", ...] = (),
 ) -> MaterializationPlan:
     """The pure planner (Section 7-8): derives S/D/U/X/O and every
     `AtomDecision` from `resolved_selection` (S and D) and `atoms` (the
@@ -1408,19 +1422,63 @@ def build_materialization_plan(
             )
         )
 
+    present_category_names = frozenset(decision.category for decision in category_decisions)
     warnings_set: set = set()
     if other_models_excluded:
         warnings_set.add("other-models-excluded")
     if outside_entries:
         warnings_set.add("outside-selected-asym-retained")
+    # Section 11: mechanical warnings derived directly from already-computed
+    # category/connection decisions - never fabricated, never guessed ahead
+    # of the real vectors.
+    if any(
+        decision.action == "omit" and decision.omitted_row_ordinals
+        for decision in category_decisions
+    ):
+        warnings_set.add("source-annotations-omitted")
+    if any(
+        decision.action == "omit" and decision.conn_type_token.lower() == "metalc"
+        for decision in connection_decisions
+    ):
+        warnings_set.add("coordination-connections-omitted")
+    if any(
+        decision.action == "omit" and decision.conn_type_token.lower() == "hydrog"
+        for decision in connection_decisions
+    ):
+        warnings_set.add("hydrogen-bonds-omitted")
+    if "_cell" in present_category_names or "_symmetry" in present_category_names:
+        warnings_set.add("source-symmetry-context-only")
+    if "_struct_ncs_oper" in present_category_names:
+        warnings_set.add("source-ncs-annotations-omitted")
+    if "_pdbx_struct_special_symmetry" in present_category_names:
+        warnings_set.add("special-position-annotations-omitted")
+    if category_decisions and "_struct_conn" not in present_category_names:
+        warnings_set.add("declared-connections-unavailable")
     warnings = tuple(sorted(warnings_set))
 
     exclusions_key = compute_exclusions_key(source_context_key=source_context_key, model=model, entries=exclusions)
     outside_key = compute_outside_key(source_context_key=source_context_key, model=model, entries=outside_entries)
     atom_decisions_key = compute_atom_decisions_key(source_context_key=source_context_key, decisions=atom_decisions)
-    connection_decisions_key = compute_connection_decisions_key(source_context_key=source_context_key)
+    connection_decisions_key = compute_connection_decisions_key(
+        source_context_key=source_context_key, decisions=connection_decisions
+    )
     category_decisions_key = compute_category_decisions_key(
         source_context_key=source_context_key, decisions=category_decisions
+    )
+
+    # Section 11: a non-trivial (ever filter/generate/guard_then_omit)
+    # catalogue category with no `CategoryDecision` at all is one the
+    # source simply never declared - tracked here, never silently dropped
+    # (`_entry`/DERIVED_ENTRY is excluded: it is always generated,
+    # regardless of source `_entry` presence, so its absence from source
+    # is not itself an "unavailable" fact worth auditing).
+    unavailable_categories = tuple(
+        sorted(
+            name for name, cat_def in _FROZEN_CATALOGUE.items()
+            if cat_def["row_rule"] != "AUDIT_OMITTED_CATEGORY"
+            and name != "_entry"
+            and name not in present_category_names
+        )
     )
 
     plan = PlanBinding(
@@ -1437,7 +1495,7 @@ def build_materialization_plan(
         atom_decisions_key=atom_decisions_key,
         connection_decisions_key=connection_decisions_key,
         category_decisions_key=category_decisions_key,
-        unavailable_categories=(),
+        unavailable_categories=unavailable_categories,
         warnings=warnings,
     )
 
@@ -1446,6 +1504,7 @@ def build_materialization_plan(
         plan_key=compute_plan_key(plan),
         atom_decisions=tuple(atom_decisions),
         category_decisions=category_decisions,
+        connection_decisions=connection_decisions,
     )
 
 
@@ -1722,3 +1781,2280 @@ def compute_request_key(
         "application_version": application_version,
     }
     return compute_materialization_hash(payload)
+
+
+# ===========================================================================
+# Increment 021, Checkpoint 2: connections, symmetry and IdentityBasis
+# (frozen specification Sections 9, 10, 10.1). This section is pure
+# Python - no `gemmi.*` reference anywhere; it operates on the generic
+# `RawCifCategory` rows the Checkpoint 2 adapter boundary
+# (`build_materialization_plan_cp2`, further below) extracts via a late,
+# local import of `molecular.receptor_parsing`. The module-level import
+# boundary established in Checkpoint 1 (TYPE_CHECKING-only for the 020
+# types, no `receptor_parsing`/`receptor_inspection`/`receptor_resolution`
+# at runtime - ARCH-01) is unchanged by this section.
+# ===========================================================================
+
+
+class MaterializationExecutionError(ValueError):
+    """A Checkpoint 2 execution-phase error over the native DOM/catalogue
+    (Section 16: INVALID_CIF, LIMIT_EXCEEDED, UNSUPPORTED_CATEGORY/TAG/
+    MODEL/SYMMETRY, UNSUPPORTED_NCS, AMBIGUOUS_ENDPOINT, UNSUPPORTED_
+    PARTNER/TYPE, COVALENT_CUT, INVALID_OUTPUT)."""
+
+    _CODES = frozenset(
+        {
+            "INVALID_CIF", "LIMIT_EXCEEDED", "UNSUPPORTED_CATEGORY", "UNSUPPORTED_TAG",
+            "UNSUPPORTED_MODEL", "UNSUPPORTED_SYMMETRY", "UNSUPPORTED_NCS", "AMBIGUOUS_ENDPOINT",
+            "UNSUPPORTED_PARTNER", "UNSUPPORTED_TYPE", "COVALENT_CUT", "INVALID_OUTPUT",
+        }
+    )
+
+    def __init__(self, code: str, message: str, *, phase: str = "parse") -> None:
+        if code not in self._CODES:
+            raise ValueError(f"unknown MaterializationExecutionError code {code!r}")
+        super().__init__(message)
+        self.code = code
+        self.phase = phase
+
+
+IdentityBasis = Literal["pdbx-1_555-convention", "source-operator", "not-applicable"]
+SymmetryClass = Literal[
+    "both-identity", "same-nonidentity", "different", "one-null", "both-null", "unsupported-discarded"
+]
+ConnectionAction = Literal["preserve", "omit"]
+ConnectionReason = Literal[
+    "both-retained", "both-removed", "whole-partner-removed-metalc", "whole-partner-removed-hydrog"
+]
+
+_COVALENT_CONNECTION_TYPES = frozenset(
+    {"covale", "covale_base", "covale_phosphate", "covale_sugar", "modres", "disulf"}
+)
+_EXCEPTION_CONNECTION_TYPES = frozenset({"metalc", "hydrog"})
+_RECOGNIZED_CONNECTION_TYPES = _COVALENT_CONNECTION_TYPES | _EXCEPTION_CONNECTION_TYPES
+
+_SYMMETRY_CODE_PATTERN = re.compile(r"^([1-9][0-9]*)_([1-9])([1-9])([1-9])$")
+_IDENTITY_EXPRESSION = "x,y,z"
+
+
+def _raw_cif_token_to_optional(token: Optional[str]) -> Optional[str]:
+    """A bare, unquoted `.`/`?` is a real CIF null; a quoted `'.'`/`'?'`
+    string (already de-quoted-or-not by the caller's own raw-token
+    convention) is a genuine token (Section 5). Deliberately NOT imported
+    from `receptor_parsing.raw_cif_null_to_optional_str` - a module-level
+    import of that name would load `receptor_parsing` (and therefore
+    Gemmi) at this module's import time, which ARCH-01 forbids; this is
+    the same two-line rule, duplicated locally rather than cross-module
+    coupled for a trivial null check."""
+
+    if token is None or token in (".", "?"):
+        return None
+    return token
+
+
+def _normalize_operator_expression(expression: str) -> str:
+    """Section 10: compare two operator expressions after removing ASCII
+    whitespace and a single leading `+` on each of the three comma-
+    separated coordinate terms - never a general symbolic simplification."""
+
+    parts = expression.split(",")
+    if len(parts) != 3:
+        return "".join(ch for ch in expression if ch not in " \t")
+    normalized_parts = []
+    for part in parts:
+        stripped = "".join(ch for ch in part if ch not in " \t")
+        if stripped.startswith("+"):
+            stripped = stripped[1:]
+        normalized_parts.append(stripped)
+    return ",".join(normalized_parts)
+
+
+def _is_identity_expression(expression: Optional[str]) -> bool:
+    if expression is None:
+        return False
+    return _normalize_operator_expression(expression) == _IDENTITY_EXPRESSION
+
+
+def _parse_symmetry_code(token: Optional[str]) -> Optional[str]:
+    """The `n_klm` grammar (Section 10): `n` a positive integer with no
+    leading zero; `k`/`l`/`m` single digits 1-9. Returns the canonical
+    `"n_klm"` string, or `None` if the token is null or does not match."""
+
+    if token is None:
+        return None
+    if _SYMMETRY_CODE_PATTERN.fullmatch(token):
+        return token
+    return None
+
+
+class SymmetryOperatorTables(NamedTuple):
+    """`None` for a table means that category is entirely absent from the
+    source (Section 10.1: "presença de tabelas é contexto comum do mesmo
+    RAW"). A present table maps decimal id string -> expression, or ->
+    `None` when that id is declared more than once within the *same*
+    table (a same-table duplicate - Section 10.1: "contraditório")."""
+
+    symmetry_equiv: Optional["dict[str, Optional[str]]"]
+    space_group_symop: Optional["dict[str, Optional[str]]"]
+
+    @property
+    def any_present(self) -> bool:
+        return self.symmetry_equiv is not None or self.space_group_symop is not None
+
+
+def _lookup_operator(operator_id: str, tables: SymmetryOperatorTables):
+    """Returns one of `("not_found",)`, `("contradictory",)`, or
+    `("found", expression, every_present_table_confirms_identity)`
+    (Section 10.1 points 3-4)."""
+
+    present_tables = [t for t in (tables.symmetry_equiv, tables.space_group_symop) if t is not None]
+    found_expressions = []
+    for table in present_tables:
+        if operator_id not in table:
+            continue
+        value = table[operator_id]
+        if value is None:
+            return ("contradictory",)
+        found_expressions.append(value)
+
+    if not found_expressions:
+        return ("not_found",)
+
+    normalized = {_normalize_operator_expression(e) for e in found_expressions}
+    if len(normalized) > 1:
+        return ("contradictory",)
+
+    every_present_table_confirms_identity = all(
+        (operator_id in table) and (table[operator_id] is not None) and _is_identity_expression(table[operator_id])
+        for table in present_tables
+    )
+    return ("found", found_expressions[0], every_present_table_confirms_identity)
+
+
+class _SymmetryEndpointResolution(NamedTuple):
+    is_null: bool
+    identity_basis: IdentityBasis
+    insufficient_proof: bool  # triggers unsupported-discarded precedence at K=0 (Section 10.1)
+    code: Optional[str]  # canonical "n_klm", for same/different comparison; None if null/malformed
+    proven_identity: bool  # True only if confirmed identity under this profile (Section 10)
+
+
+def _resolve_symmetry_endpoint(
+    raw_token: Optional[str], tables: SymmetryOperatorTables
+) -> _SymmetryEndpointResolution:
+    """One endpoint's IdentityBasis and identity-proof status (Section
+    10.1), independent of K - computed in a fixed order (ptnr1 then
+    ptnr2) by the caller, never by K or category-visit order."""
+
+    token = _raw_cif_token_to_optional(raw_token)
+    if token is None:
+        return _SymmetryEndpointResolution(True, "not-applicable", False, None, False)
+
+    code = _parse_symmetry_code(token)
+    if code is None:
+        return _SymmetryEndpointResolution(False, "not-applicable", True, None, False)
+
+    if not tables.any_present:
+        if code == "1_555":
+            return _SymmetryEndpointResolution(False, "pdbx-1_555-convention", False, code, True)
+        return _SymmetryEndpointResolution(False, "not-applicable", True, code, False)
+
+    n = code.split("_", 1)[0]
+    lookup = _lookup_operator(n, tables)
+    if lookup[0] != "found":
+        return _SymmetryEndpointResolution(False, "not-applicable", True, code, False)
+
+    _, _, every_present_table_confirms_identity = lookup
+    if code == "1_555":
+        proven_identity = every_present_table_confirms_identity
+        insufficient_proof = not every_present_table_confirms_identity
+    else:
+        proven_identity = False
+        insufficient_proof = False
+    return _SymmetryEndpointResolution(False, "source-operator", insufficient_proof, code, proven_identity)
+
+
+def _classify_symmetry_class(
+    ptnr1: _SymmetryEndpointResolution, ptnr2: _SymmetryEndpointResolution
+) -> SymmetryClass:
+    """The pairwise comparison (Section 10): any non-null side with
+    insufficient proof takes precedence over null-based classification
+    (Section 10.1); otherwise both-null/one-null/both-identity/
+    same-nonidentity/different, in that closed order."""
+
+    if (not ptnr1.is_null and ptnr1.insufficient_proof) or (not ptnr2.is_null and ptnr2.insufficient_proof):
+        return "unsupported-discarded"
+    if ptnr1.is_null and ptnr2.is_null:
+        return "both-null"
+    if ptnr1.is_null or ptnr2.is_null:
+        return "one-null"
+    if ptnr1.code == ptnr2.code:
+        return "both-identity" if (ptnr1.proven_identity and ptnr2.proven_identity) else "same-nonidentity"
+    return "different"
+
+
+_IMPOSSIBLE_IDENTITY_BASIS_PAIRS = frozenset(
+    {("pdbx-1_555-convention", "source-operator"), ("source-operator", "pdbx-1_555-convention")}
+)
+
+
+def compute_row_key(*, source_context_key: str, category: str, ordinal: int, tokens: Sequence[Tuple[str, str]]) -> str:
+    """row_key = H({kind:'receptor-materialization-source-row', version:
+    '1.0', source_context_key, category, ordinal, tokens:[{tag,token},...]})
+    (SCHEMAS Section 4), `tokens` already in canonical tag order."""
+
+    payload = {
+        "kind": "receptor-materialization-source-row",
+        "version": "1.0",
+        "source_context_key": source_context_key,
+        "category": category,
+        "ordinal": ordinal,
+        "tokens": [{"tag": tag, "token": token} for tag, token in tokens],
+    }
+    return compute_materialization_hash(payload)
+
+
+class ConnectionDecision(BaseModel):
+    """ConnectionDecision (SCHEMAS Section 4): one accepted `struct_conn`
+    row's retain/omit outcome. A row that is *rejected* (ambiguous
+    endpoint, unsupported symmetry/type, covalent K=1 cut, ...) never
+    produces a `ConnectionDecision` at all - the whole plan fails instead
+    (Section 9: "planos recusados não têm ConnectionDecision persistida")."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+    ordinal: int = Field(ge=0)
+    id: str = Field(min_length=1, max_length=256)
+    row_key: str = Field(min_length=64, max_length=64)
+    conn_type_token: str = Field(min_length=1, max_length=256)
+    endpoint_atom_ids: Tuple[Tuple[str, ...], Tuple[str, ...]]
+    identity_basis: Tuple[IdentityBasis, IdentityBasis]
+    retained_endpoints: int = Field(ge=0, le=2)
+    symmetry_class: SymmetryClass
+    action: ConnectionAction
+    reason: ConnectionReason
+
+    @field_validator("id", "conn_type_token")
+    @classmethod
+    def _validate_native(cls, value: str) -> str:
+        return validate_native_id(value)
+
+    @field_validator("row_key")
+    @classmethod
+    def _validate_hex(cls, value: str) -> str:
+        return validate_hex64(value)
+
+    @field_validator("endpoint_atom_ids")
+    @classmethod
+    def _validate_endpoint_sets(cls, value: Tuple[Tuple[str, ...], Tuple[str, ...]]) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+        for endpoint_set in value:
+            if not endpoint_set:
+                raise ValueError("an endpoint's atom id set must not be empty")
+            if len(set(endpoint_set)) != len(endpoint_set):
+                raise ValueError("an endpoint's atom id set must not repeat an atom id")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_identity_basis_pair(self) -> "ConnectionDecision":
+        if tuple(self.identity_basis) in _IMPOSSIBLE_IDENTITY_BASIS_PAIRS:
+            raise ValueError(
+                "identity_basis pair is contractually impossible "
+                "(pdbx-1_555-convention/source-operator in either order)"
+            )
+        if self.symmetry_class == "unsupported-discarded" and self.retained_endpoints != 0:
+            raise ValueError("unsupported-discarded symmetry_class only ever appears at K=0")
+        return self
+
+
+class RawConnectionEndpointTokens(NamedTuple):
+    """One `ptnr{1,2}` endpoint's raw tokens from one `_struct_conn` row -
+    already null-collapsed (`.`/`?` -> `None`) by the caller, case/content
+    preserved otherwise. `altloc_aliases` holds every alias column this
+    profile reads for that endpoint's altloc code, in a fixed order; all
+    non-null aliases must agree (Section 9)."""
+
+    label_asym_id: Optional[str]
+    label_comp_id: Optional[str]
+    label_seq_id: Optional[str]
+    label_atom_id: Optional[str]
+    auth_seq_id: Optional[str]
+    insertion_token: Optional[str]
+    altloc_aliases: Tuple[Optional[str], ...]
+    symmetry_token: Optional[str]
+
+
+class RawConnectionRow(NamedTuple):
+    ordinal: int
+    id: Optional[str]
+    conn_type: Optional[str]
+    ptnr1: RawConnectionEndpointTokens
+    ptnr2: RawConnectionEndpointTokens
+    ptnr3_present: bool
+    source_tokens: Tuple[Tuple[str, str], ...]
+
+
+def _resolve_endpoint_altloc(tokens: RawConnectionEndpointTokens) -> Optional[str]:
+    non_null_aliases = {alias for alias in tokens.altloc_aliases if alias is not None}
+    if len(non_null_aliases) > 1:
+        raise MaterializationExecutionError(
+            "AMBIGUOUS_ENDPOINT", "endpoint altloc alias columns disagree", phase="plan"
+        )
+    return next(iter(non_null_aliases), None)
+
+
+def _resolve_endpoint_atoms(
+    tokens: RawConnectionEndpointTokens, atoms_in_model: Sequence[AtomObservation]
+) -> Tuple[AtomObservation, ...]:
+    """Resolves one `struct_conn` endpoint to its unique occurrence in M,
+    then to the (possibly altloc-multi-valued) set of atoms named by
+    `label_atom_id` within it (Section 9). Raises `AMBIGUOUS_ENDPOINT`
+    if the endpoint does not exist, or exists more than once, in M - a
+    missing/ambiguous endpoint is never silently treated as a no-op row."""
+
+    if tokens.label_seq_id is not None:
+        occurrence_atoms = [
+            a for a in atoms_in_model
+            if a.label_asym_id == tokens.label_asym_id
+            and a.ccd == tokens.label_comp_id
+            and a.label_seq_id == tokens.label_seq_id
+        ]
+    else:
+        occurrence_atoms = [
+            a for a in atoms_in_model
+            if a.label_asym_id == tokens.label_asym_id
+            and a.ccd == tokens.label_comp_id
+            and a.label_seq_id is None
+            and a.auth_seq_id == tokens.auth_seq_id
+            and a.insertion_token == tokens.insertion_token
+        ]
+
+    occurrence_keys = {_occurrence_group_key(a) for a in occurrence_atoms}
+    if len(occurrence_keys) == 0:
+        raise MaterializationExecutionError(
+            "AMBIGUOUS_ENDPOINT", "struct_conn endpoint does not resolve to any occurrence in M", phase="plan"
+        )
+    if len(occurrence_keys) > 1:
+        raise MaterializationExecutionError(
+            "AMBIGUOUS_ENDPOINT", "struct_conn endpoint resolves to more than one occurrence in M", phase="plan"
+        )
+
+    name_matches = tuple(a for a in occurrence_atoms if a.label_atom_id == tokens.label_atom_id)
+    if not name_matches:
+        raise MaterializationExecutionError(
+            "AMBIGUOUS_ENDPOINT", "struct_conn endpoint names an atom absent from its resolved occurrence", phase="plan"
+        )
+
+    altloc = _resolve_endpoint_altloc(tokens)
+    if altloc is not None:
+        name_matches = tuple(a for a in name_matches if a.altloc == altloc)
+        if not name_matches:
+            raise MaterializationExecutionError(
+                "AMBIGUOUS_ENDPOINT", "struct_conn endpoint names an altloc variant absent from its occurrence", phase="plan"
+            )
+
+    return tuple(sorted(name_matches, key=lambda a: a.ordinal))
+
+
+def resolve_connection_decisions(
+    *,
+    source_context_key: str,
+    atoms_in_model: Sequence[AtomObservation],
+    atom_decisions_by_ordinal: "dict[int, AtomDecision]",
+    raw_connections: Sequence[RawConnectionRow],
+    tables: SymmetryOperatorTables,
+) -> Tuple[ConnectionDecision, ...]:
+    """The full Section 9/10/10.1 connection pipeline: resolve both
+    endpoints in M, reject a non-null `ptnr3`, compute K (retained
+    endpoint count) from the planner's own `atom_decisions`, classify
+    IdentityBasis per endpoint (independent of K, in ptnr1-then-ptnr2
+    order), classify `SymmetryClass`, and apply the closed 15-cell
+    matrix (Section 10) together with the covalent/metalc/hydrog K=1
+    exception (Section 9). A connection that fails any of these checks
+    raises `MaterializationExecutionError` - the whole plan fails with
+    it; a plan with any rejected connection is never produced with a
+    partial `ConnectionDecision` vector."""
+
+    decisions: List[ConnectionDecision] = []
+    for row in raw_connections:
+        if row.ptnr3_present:
+            raise MaterializationExecutionError(
+                "UNSUPPORTED_PARTNER", f"struct_conn row {row.ordinal} declares a non-null third partner", phase="plan"
+            )
+        if not row.id:
+            raise MaterializationExecutionError(
+                "INVALID_CIF", f"struct_conn row {row.ordinal} has an absent or empty id", phase="plan"
+            )
+        if not row.conn_type:
+            raise MaterializationExecutionError(
+                "INVALID_CIF", f"struct_conn row {row.ordinal} has an absent or empty conn_type_id", phase="plan"
+            )
+
+        atoms1 = _resolve_endpoint_atoms(row.ptnr1, atoms_in_model)
+        atoms2 = _resolve_endpoint_atoms(row.ptnr2, atoms_in_model)
+
+        retained1 = {atom_decisions_by_ordinal[a.ordinal].retained for a in atoms1}
+        retained2 = {atom_decisions_by_ordinal[a.ordinal].retained for a in atoms2}
+        if len(retained1) > 1 or len(retained2) > 1:
+            raise MaterializationExecutionError(
+                "AMBIGUOUS_ENDPOINT", f"struct_conn row {row.ordinal} endpoint atoms disagree on retention", phase="plan"
+            )
+        endpoint1_retained = next(iter(retained1))
+        endpoint2_retained = next(iter(retained2))
+        retained_endpoints = int(endpoint1_retained) + int(endpoint2_retained)
+
+        ptnr1_resolution = _resolve_symmetry_endpoint(row.ptnr1.symmetry_token, tables)
+        ptnr2_resolution = _resolve_symmetry_endpoint(row.ptnr2.symmetry_token, tables)
+        identity_basis = (ptnr1_resolution.identity_basis, ptnr2_resolution.identity_basis)
+        if identity_basis in _IMPOSSIBLE_IDENTITY_BASIS_PAIRS:
+            raise MaterializationExecutionError(
+                "UNSUPPORTED_SYMMETRY", f"struct_conn row {row.ordinal} has a contractually impossible identity_basis pair", phase="plan"
+            )
+
+        conn_type_lower = row.conn_type.lower()
+
+        if retained_endpoints == 0:
+            symmetry_class = _classify_symmetry_class(ptnr1_resolution, ptnr2_resolution)
+            action: ConnectionAction = "omit"
+            reason: ConnectionReason = "both-removed"
+        else:
+            if conn_type_lower not in _RECOGNIZED_CONNECTION_TYPES:
+                raise MaterializationExecutionError(
+                    "UNSUPPORTED_TYPE", f"struct_conn row {row.ordinal} has unrecognized conn_type {row.conn_type!r} at K>0", phase="plan"
+                )
+            if ptnr1_resolution.insufficient_proof or ptnr2_resolution.insufficient_proof:
+                raise MaterializationExecutionError(
+                    "UNSUPPORTED_SYMMETRY", f"struct_conn row {row.ordinal} has an unresolved symmetry operator at K>0", phase="plan"
+                )
+            symmetry_class = _classify_symmetry_class(ptnr1_resolution, ptnr2_resolution)
+
+            if retained_endpoints == 2:
+                if symmetry_class == "both-identity":
+                    action, reason = "preserve", "both-retained"
+                else:
+                    raise MaterializationExecutionError(
+                        "UNSUPPORTED_SYMMETRY",
+                        f"struct_conn row {row.ordinal} K=2 requires both-identity symmetry (got {symmetry_class!r})",
+                        phase="plan",
+                    )
+            else:  # retained_endpoints == 1
+                if symmetry_class != "both-identity":
+                    raise MaterializationExecutionError(
+                        "UNSUPPORTED_SYMMETRY",
+                        f"struct_conn row {row.ordinal} K=1 requires both-identity symmetry (got {symmetry_class!r})",
+                        phase="plan",
+                    )
+                if conn_type_lower not in _EXCEPTION_CONNECTION_TYPES:
+                    raise MaterializationExecutionError(
+                        "COVALENT_CUT",
+                        f"struct_conn row {row.ordinal} is a K=1 cut of a {conn_type_lower!r} connection, "
+                        "never a metalc/hydrog exception",
+                        phase="plan",
+                    )
+                removed_atoms, removed_decision_reason = (
+                    (atoms1, atom_decisions_by_ordinal[atoms1[0].ordinal].reason)
+                    if not endpoint1_retained
+                    else (atoms2, atom_decisions_by_ordinal[atoms2[0].ordinal].reason)
+                )
+                if removed_decision_reason not in ("chain-complement", "disposition-remove"):
+                    raise MaterializationExecutionError(
+                        "COVALENT_CUT",
+                        f"struct_conn row {row.ordinal} K=1 omission requires the removed partner to be a "
+                        "whole recognized exclusion (chain-complement/disposition-remove), "
+                        f"got reason={removed_decision_reason!r}",
+                        phase="plan",
+                    )
+                action = "omit"
+                reason = "whole-partner-removed-metalc" if conn_type_lower == "metalc" else "whole-partner-removed-hydrog"
+
+        decisions.append(
+            ConnectionDecision(
+                ordinal=row.ordinal,
+                id=row.id,
+                row_key=compute_row_key(
+                    source_context_key=source_context_key, category="struct_conn",
+                    ordinal=row.ordinal, tokens=row.source_tokens,
+                ),
+                conn_type_token=row.conn_type,
+                endpoint_atom_ids=(
+                    tuple(a.atom_id for a in atoms1),
+                    tuple(a.atom_id for a in atoms2),
+                ),
+                identity_basis=identity_basis,
+                retained_endpoints=retained_endpoints,
+                symmetry_class=symmetry_class,
+                action=action,
+                reason=reason,
+            )
+        )
+
+    return tuple(decisions)
+
+
+# --------------------------------------------------------------------------
+# Section 11: the pinned 94-category catalogue (CATALOGUE_SHA256 above is
+# the SHA-256 of the governance-committed bytes of CATALOG_021.json at the
+# authorized snapshot - verified via `git show <snapshot>:<path> | sha256sum`
+# before this literal was transcribed) and its row-rule engine.
+#
+# This constant is embedded, never read from disk at runtime (Section 11:
+# "não criar catálogo configurável, lookup por diretório corrente ou
+# dependência externa"). `row_rule` dispatch below treats
+# RETAINED_ENTITY/RETAINED_ENTITY_ALL_SEQUENCE/RETAINED_ENTITY_ALL_BRANCH as
+# one family (filter by the column whose `references` entry is
+# "_entity.id", or the category's own key column when self-referential -
+# i.e. `_entity` itself) and RETAINED_ASYM/RETAINED_ASYM_ALL_SEQUENCE/
+# RETAINED_ASYM_ALL_BRANCH as the symmetric family keyed on
+# "_struct_asym.id": the "ALL_SEQUENCE"/"ALL_BRANCH" suffix only documents
+# that the kept rows are the *entire* declared sequence/branch of a
+# surviving entity/asym (Section 11: "manter toda a sequência declarada...
+# não afirmar que sequência declarada equivale a átomos presentes"), not a
+# different membership test.
+_FROZEN_CATALOGUE: Dict[str, Dict[str, object]] = {'_atom_site': {'action': 'filter',
+                'key': ('id',),
+                'required_tags': ('id',
+                                  'type_symbol',
+                                  'label_atom_id',
+                                  'label_alt_id',
+                                  'label_comp_id',
+                                  'label_asym_id',
+                                  'label_entity_id',
+                                  'label_seq_id',
+                                  'auth_asym_id',
+                                  'auth_seq_id',
+                                  'pdbx_pdb_ins_code',
+                                  'pdbx_pdb_model_num',
+                                  'cartn_x',
+                                  'cartn_y',
+                                  'cartn_z',
+                                  'occupancy',
+                                  'b_iso_or_equiv'),
+                'preserve_tags': ('group_pdb',
+                                  'id',
+                                  'type_symbol',
+                                  'label_atom_id',
+                                  'label_alt_id',
+                                  'label_comp_id',
+                                  'label_asym_id',
+                                  'label_entity_id',
+                                  'label_seq_id',
+                                  'auth_atom_id',
+                                  'auth_comp_id',
+                                  'auth_asym_id',
+                                  'auth_seq_id',
+                                  'pdbx_pdb_ins_code',
+                                  'pdbx_pdb_model_num',
+                                  'cartn_x',
+                                  'cartn_y',
+                                  'cartn_z',
+                                  'occupancy',
+                                  'b_iso_or_equiv',
+                                  'pdbx_formal_charge'),
+                'omit_tags': (),
+                'generate_tags': (),
+                'row_rule': 'ATOM_MASK',
+                'references': {'label_asym_id': '_struct_asym.id',
+                               'label_entity_id': '_entity.id',
+                               'label_comp_id': '_chem_comp.id',
+                               'label_seq_id': 'conditional polymer: '
+                                               '_entity_poly_seq(entity_id,num,mon_id) using '
+                                               'label_entity_id,label_seq_id,label_comp_id; '
+                                               'nonpolymer true null accepted'}},
+ '_atom_site_anisotrop': {'action': 'filter',
+                          'key': ('id',),
+                          'required_tags': ('id',),
+                          'preserve_tags': ('id',
+                                            'type_symbol',
+                                            'pdbx_pdb_atom_name',
+                                            'pdbx_pdb_ins_code',
+                                            'pdbx_pdb_model_num',
+                                            'pdbx_pdb_residue_name',
+                                            'pdbx_pdb_residue_no',
+                                            'pdbx_pdb_strand_id',
+                                            'pdbx_auth_alt_id',
+                                            'pdbx_auth_asym_id',
+                                            'pdbx_auth_atom_id',
+                                            'pdbx_auth_atom_name',
+                                            'pdbx_auth_comp_id',
+                                            'pdbx_auth_seq_id',
+                                            'pdbx_label_alt_id',
+                                            'pdbx_label_asym_id',
+                                            'pdbx_label_atom_id',
+                                            'pdbx_label_comp_id',
+                                            'pdbx_label_ins_code',
+                                            'pdbx_label_seq_id',
+                                            'pdbx_not_in_asym',
+                                            'u[1][1]',
+                                            'u[1][2]',
+                                            'u[1][3]',
+                                            'u[2][2]',
+                                            'u[2][3]',
+                                            'u[3][3]',
+                                            'b[1][1]',
+                                            'b[1][2]',
+                                            'b[1][3]',
+                                            'b[2][2]',
+                                            'b[2][3]',
+                                            'b[3][3]',
+                                            'u[1][1]_esd',
+                                            'u[1][2]_esd',
+                                            'u[1][3]_esd',
+                                            'u[2][2]_esd',
+                                            'u[2][3]_esd',
+                                            'u[3][3]_esd',
+                                            'b[1][1]_esd',
+                                            'b[1][2]_esd',
+                                            'b[1][3]_esd',
+                                            'b[2][2]_esd',
+                                            'b[2][3]_esd',
+                                            'b[3][3]_esd'),
+                          'omit_tags': (),
+                          'generate_tags': (),
+                          'row_rule': 'ANISOTROP_ATOM_ID',
+                          'references': {'id': '_atom_site.id'}},
+ '_struct_asym': {'action': 'filter',
+                  'key': ('id',),
+                  'required_tags': ('id', 'entity_id'),
+                  'preserve_tags': ('id',
+                                    'entity_id',
+                                    'pdbx_blank_pdb_chainid_flag',
+                                    'pdbx_modified',
+                                    'details'),
+                  'omit_tags': (),
+                  'generate_tags': (),
+                  'row_rule': 'RETAINED_ASYM',
+                  'references': {'entity_id': '_entity.id'}},
+ '_entity': {'action': 'filter',
+             'key': ('id',),
+             'required_tags': ('id', 'type'),
+             'preserve_tags': ('id', 'type', 'src_method', 'pdbx_description', 'details'),
+             'omit_tags': ('formula_weight',
+                           'pdbx_number_of_molecules',
+                           'pdbx_ec',
+                           'pdbx_mutation',
+                           'pdbx_fragment'),
+             'generate_tags': (),
+             'row_rule': 'RETAINED_ENTITY',
+             'references': {}},
+ '_entity_poly': {'action': 'filter',
+                  'key': ('entity_id',),
+                  'required_tags': ('entity_id', 'type'),
+                  'preserve_tags': ('entity_id',
+                                    'type',
+                                    'nstd_linkage',
+                                    'nstd_monomer',
+                                    'pdbx_seq_one_letter_code',
+                                    'pdbx_seq_one_letter_code_can'),
+                  'omit_tags': ('pdbx_strand_id', 'pdbx_target_identifier'),
+                  'generate_tags': (),
+                  'row_rule': 'RETAINED_ENTITY',
+                  'references': {'entity_id': '_entity.id'}},
+ '_entity_poly_seq': {'action': 'filter',
+                      'key': ('entity_id', 'num', 'mon_id'),
+                      'required_tags': ('entity_id', 'num', 'mon_id'),
+                      'preserve_tags': ('entity_id', 'num', 'mon_id', 'hetero'),
+                      'omit_tags': (),
+                      'generate_tags': (),
+                      'row_rule': 'RETAINED_ENTITY_ALL_SEQUENCE',
+                      'references': {'entity_id': '_entity.id', 'mon_id': '_chem_comp.id'}},
+ '_chem_comp': {'action': 'filter',
+                'key': ('id',),
+                'required_tags': ('id', 'type'),
+                'preserve_tags': ('id',
+                                  'type',
+                                  'mon_nstd_flag',
+                                  'name',
+                                  'pdbx_synonyms',
+                                  'formula',
+                                  'formula_weight',
+                                  'pdbx_formal_charge',
+                                  'one_letter_code',
+                                  'three_letter_code',
+                                  'pdbx_type',
+                                  'pdbx_ambiguous_flag',
+                                  'pdbx_release_status',
+                                  'pdbx_modified_date',
+                                  'pdbx_initial_date',
+                                  'pdbx_replaced_by',
+                                  'pdbx_replaces',
+                                  'pdbx_processing_site'),
+                'omit_tags': (),
+                'generate_tags': (),
+                'row_rule': 'REFERENCED_CCD_CLOSURE',
+                'references': {}},
+ '_pdbx_entity_nonpoly': {'action': 'filter',
+                          'key': ('entity_id', 'comp_id'),
+                          'required_tags': ('entity_id', 'comp_id'),
+                          'preserve_tags': ('entity_id', 'comp_id', 'name'),
+                          'omit_tags': (),
+                          'generate_tags': (),
+                          'row_rule': 'RETAINED_ENTITY',
+                          'references': {'entity_id': '_entity.id', 'comp_id': '_chem_comp.id'}},
+ '_pdbx_poly_seq_scheme': {'action': 'filter',
+                           'key': ('asym_id', 'seq_id', 'mon_id'),
+                           'required_tags': ('asym_id', 'entity_id', 'seq_id', 'mon_id'),
+                           'preserve_tags': ('asym_id',
+                                             'entity_id',
+                                             'seq_id',
+                                             'mon_id',
+                                             'ndb_seq_num',
+                                             'pdb_seq_num',
+                                             'auth_seq_num',
+                                             'pdb_mon_id',
+                                             'auth_mon_id',
+                                             'pdb_strand_id',
+                                             'pdb_ins_code',
+                                             'hetero'),
+                           'omit_tags': (),
+                           'generate_tags': (),
+                           'row_rule': 'RETAINED_ASYM_ALL_SEQUENCE',
+                           'references': {'asym_id': '_struct_asym.id',
+                                          'entity_id': '_entity.id',
+                                          'mon_id': '_chem_comp.id'}},
+ '_pdbx_nonpoly_scheme': {'action': 'filter',
+                          'key': ('asym_id', 'ndb_seq_num', 'mon_id'),
+                          'required_tags': ('asym_id', 'entity_id', 'mon_id', 'ndb_seq_num'),
+                          'preserve_tags': ('asym_id',
+                                            'entity_id',
+                                            'mon_id',
+                                            'ndb_seq_num',
+                                            'pdb_seq_num',
+                                            'auth_seq_num',
+                                            'pdb_mon_id',
+                                            'auth_mon_id',
+                                            'pdb_strand_id',
+                                            'pdb_ins_code'),
+                          'omit_tags': (),
+                          'generate_tags': (),
+                          'row_rule': 'RETAINED_ASYM',
+                          'references': {'asym_id': '_struct_asym.id',
+                                         'entity_id': '_entity.id',
+                                         'mon_id': '_chem_comp.id'}},
+ '_pdbx_entity_branch': {'action': 'filter',
+                         'key': ('entity_id',),
+                         'required_tags': ('entity_id', 'type'),
+                         'preserve_tags': ('entity_id', 'type'),
+                         'omit_tags': (),
+                         'generate_tags': (),
+                         'row_rule': 'RETAINED_ENTITY',
+                         'references': {'entity_id': '_entity.id'}},
+ '_pdbx_entity_branch_list': {'action': 'filter',
+                              'key': ('entity_id', 'num', 'comp_id'),
+                              'required_tags': ('entity_id', 'num', 'comp_id'),
+                              'preserve_tags': ('entity_id', 'num', 'comp_id', 'hetero'),
+                              'omit_tags': (),
+                              'generate_tags': (),
+                              'row_rule': 'RETAINED_ENTITY_ALL_BRANCH',
+                              'references': {'entity_id': '_entity.id',
+                                             'comp_id': '_chem_comp.id'}},
+ '_pdbx_entity_branch_link': {'action': 'filter',
+                              'key': ('link_id',),
+                              'required_tags': ('link_id',
+                                                'entity_id',
+                                                'entity_branch_list_num_1',
+                                                'comp_id_1',
+                                                'atom_id_1',
+                                                'entity_branch_list_num_2',
+                                                'comp_id_2',
+                                                'atom_id_2'),
+                              'preserve_tags': ('link_id',
+                                                'entity_id',
+                                                'entity_branch_list_num_1',
+                                                'comp_id_1',
+                                                'atom_id_1',
+                                                'leaving_atom_id_1',
+                                                'atom_stereo_config_1',
+                                                'entity_branch_list_num_2',
+                                                'comp_id_2',
+                                                'atom_id_2',
+                                                'leaving_atom_id_2',
+                                                'atom_stereo_config_2',
+                                                'value_order',
+                                                'details'),
+                              'omit_tags': (),
+                              'generate_tags': (),
+                              'row_rule': 'RETAINED_ENTITY_ALL_BRANCH',
+                              'references': {'entity_id': '_entity.id',
+                                             'entity_branch_list_num_1': '_pdbx_entity_branch_list(entity_id,num,comp_id_1)',
+                                             'entity_branch_list_num_2': '_pdbx_entity_branch_list(entity_id,num,comp_id_2)'}},
+ '_pdbx_branch_scheme': {'action': 'filter',
+                         'key': ('asym_id', 'entity_id', 'mon_id', 'num'),
+                         'required_tags': ('asym_id', 'entity_id', 'mon_id', 'num'),
+                         'preserve_tags': ('asym_id',
+                                           'entity_id',
+                                           'mon_id',
+                                           'num',
+                                           'auth_asym_id',
+                                           'auth_mon_id',
+                                           'auth_seq_num',
+                                           'hetero',
+                                           'pdb_asym_id',
+                                           'pdb_ins_code',
+                                           'pdb_mon_id',
+                                           'pdb_seq_num'),
+                         'omit_tags': (),
+                         'generate_tags': (),
+                         'row_rule': 'RETAINED_ASYM_ALL_BRANCH',
+                         'references': {'asym_id': '_struct_asym.id',
+                                        'entity_id': '_entity.id',
+                                        'mon_id': '_chem_comp.id',
+                                        'num': '_pdbx_entity_branch_list(entity_id,num,mon_id)'}},
+ '_struct_conn': {'action': 'filter',
+                  'key': ('id',),
+                  'required_tags': ('id',
+                                    'conn_type_id',
+                                    'ptnr1_label_asym_id',
+                                    'ptnr1_label_comp_id',
+                                    'ptnr1_label_atom_id',
+                                    'ptnr2_label_asym_id',
+                                    'ptnr2_label_comp_id',
+                                    'ptnr2_label_atom_id'),
+                  'preserve_tags': ('id',
+                                    'conn_type_id',
+                                    'details',
+                                    'pdbx_dist_value',
+                                    'pdbx_value_order',
+                                    'pdbx_role',
+                                    'pdbx_leaving_atom_flag',
+                                    'ptnr1_label_asym_id',
+                                    'ptnr1_label_comp_id',
+                                    'ptnr1_label_seq_id',
+                                    'ptnr1_label_atom_id',
+                                    'ptnr1_auth_asym_id',
+                                    'ptnr1_auth_comp_id',
+                                    'ptnr1_auth_seq_id',
+                                    'ptnr1_auth_atom_id',
+                                    'ptnr1_symmetry',
+                                    'ptnr1_role',
+                                    'ptnr1_label_alt_id',
+                                    'pdbx_ptnr1_pdb_ins_code',
+                                    'pdbx_ptnr1_label_alt_id',
+                                    'pdbx_ptnr1_auth_alt_id',
+                                    'ptnr2_label_asym_id',
+                                    'ptnr2_label_comp_id',
+                                    'ptnr2_label_seq_id',
+                                    'ptnr2_label_atom_id',
+                                    'ptnr2_auth_asym_id',
+                                    'ptnr2_auth_comp_id',
+                                    'ptnr2_auth_seq_id',
+                                    'ptnr2_auth_atom_id',
+                                    'ptnr2_symmetry',
+                                    'ptnr2_role',
+                                    'ptnr2_label_alt_id',
+                                    'pdbx_ptnr2_pdb_ins_code',
+                                    'pdbx_ptnr2_label_alt_id',
+                                    'pdbx_ptnr2_auth_alt_id',
+                                    'pdbx_ptnr3_pdb_ins_code',
+                                    'pdbx_ptnr3_auth_alt_id',
+                                    'pdbx_ptnr3_auth_asym_id',
+                                    'pdbx_ptnr3_auth_atom_id',
+                                    'pdbx_ptnr3_auth_comp_id',
+                                    'pdbx_ptnr3_auth_ins_code',
+                                    'pdbx_ptnr3_auth_seq_id',
+                                    'pdbx_ptnr3_label_alt_id',
+                                    'pdbx_ptnr3_label_asym_id',
+                                    'pdbx_ptnr3_label_atom_id',
+                                    'pdbx_ptnr3_label_comp_id',
+                                    'pdbx_ptnr3_label_seq_id'),
+                  'omit_tags': ('pdbx_pdb_id',
+                                'pdbx_ptnr1_standard_comp_id',
+                                'pdbx_ptnr1_atom_stereo_config',
+                                'pdbx_ptnr1_leaving_atom_id',
+                                'pdbx_ptnr1_mod_name',
+                                'pdbx_ptnr1_replaced_atom',
+                                'pdbx_ptnr1_sugar_name',
+                                'pdbx_ptnr2_atom_stereo_config',
+                                'pdbx_ptnr2_leaving_atom_id'),
+                  'generate_tags': (),
+                  'row_rule': 'CONNECTION_ACTIONS',
+                  'references': {'conn_type_id': '_struct_conn_type.id'}},
+ '_struct_conn_type': {'action': 'filter',
+                       'key': ('id',),
+                       'required_tags': ('id',),
+                       'preserve_tags': ('id', 'criteria', 'reference'),
+                       'omit_tags': (),
+                       'generate_tags': (),
+                       'row_rule': 'USED_CONNECTION_TYPES',
+                       'references': {}},
+ '_atom_type': {'action': 'filter',
+                'key': ('symbol',),
+                'required_tags': ('symbol',),
+                'preserve_tags': ('symbol',),
+                'omit_tags': (),
+                'generate_tags': (),
+                'row_rule': 'USED_ELEMENTS',
+                'references': {}},
+ '_cell': {'action': 'filter',
+           'key': ('entry_id',),
+           'required_tags': (),
+           'preserve_tags': ('length_a',
+                             'length_b',
+                             'length_c',
+                             'angle_alpha',
+                             'angle_beta',
+                             'angle_gamma',
+                             'z_pdb',
+                             'angle_alpha_esd',
+                             'angle_beta_esd',
+                             'angle_gamma_esd',
+                             'details',
+                             'formula_units_z',
+                             'length_a_esd',
+                             'length_b_esd',
+                             'length_c_esd',
+                             'volume',
+                             'volume_esd',
+                             'reciprocal_angle_alpha',
+                             'reciprocal_angle_beta',
+                             'reciprocal_angle_gamma',
+                             'reciprocal_angle_alpha_esd',
+                             'reciprocal_angle_beta_esd',
+                             'reciprocal_angle_gamma_esd',
+                             'reciprocal_length_a',
+                             'reciprocal_length_b',
+                             'reciprocal_length_c',
+                             'reciprocal_length_a_esd',
+                             'reciprocal_length_b_esd',
+                             'reciprocal_length_c_esd',
+                             'pdbx_esd_method'),
+           'omit_tags': ('pdbx_unique_axis',),
+           'generate_tags': ('entry_id',),
+           'row_rule': 'SOURCE_FRAME_SINGLETON',
+           'references': {}},
+ '_symmetry': {'action': 'filter',
+               'key': ('entry_id',),
+               'required_tags': (),
+               'preserve_tags': ('space_group_name_h-m',
+                                 'int_tables_number',
+                                 'space_group_name_hall',
+                                 'cell_setting',
+                                 'pdbx_full_space_group_name_h-m'),
+               'omit_tags': (),
+               'generate_tags': ('entry_id',),
+               'row_rule': 'SOURCE_FRAME_SINGLETON',
+               'references': {}},
+ '_symmetry_equiv': {'action': 'filter',
+                     'key': ('id',),
+                     'required_tags': ('id', 'pos_as_xyz'),
+                     'preserve_tags': ('id', 'pos_as_xyz'),
+                     'omit_tags': (),
+                     'generate_tags': (),
+                     'row_rule': 'SOURCE_OPERATORS',
+                     'references': {}},
+ '_space_group_symop': {'action': 'filter',
+                        'key': ('id',),
+                        'required_tags': ('id', 'operation_xyz'),
+                        'preserve_tags': ('id', 'operation_xyz'),
+                        'omit_tags': ('sg_id',),
+                        'generate_tags': (),
+                        'row_rule': 'SOURCE_OPERATORS',
+                        'references': {}},
+ '_pdbx_struct_mod_residue': {'action': 'filter',
+                              'key': ('id',),
+                              'required_tags': ('id',),
+                              'preserve_tags': ('id',
+                                                'label_asym_id',
+                                                'label_comp_id',
+                                                'label_seq_id',
+                                                'auth_asym_id',
+                                                'auth_comp_id',
+                                                'auth_seq_id',
+                                                'pdb_ins_code',
+                                                'pdb_model_num',
+                                                'parent_comp_id',
+                                                'details'),
+                              'omit_tags': (),
+                              'generate_tags': (),
+                              'row_rule': 'MODIFIED_RESIDUE_CONTEXT',
+                              'references': {'parent_comp_id': '_chem_comp.id'}},
+ '_pdbx_unobs_or_zero_occ_residues': {'action': 'filter',
+                                      'key': ('id',),
+                                      'required_tags': ('id',),
+                                      'preserve_tags': ('id',
+                                                        'polymer_flag',
+                                                        'occupancy_flag',
+                                                        'pdb_model_num',
+                                                        'auth_asym_id',
+                                                        'auth_comp_id',
+                                                        'auth_seq_id',
+                                                        'pdb_ins_code',
+                                                        'label_asym_id',
+                                                        'label_comp_id',
+                                                        'label_seq_id'),
+                                      'omit_tags': (),
+                                      'generate_tags': (),
+                                      'row_rule': 'MISSING_RESIDUE_CONTEXT',
+                                      'references': {}},
+ '_pdbx_unobs_or_zero_occ_atoms': {'action': 'filter',
+                                   'key': ('id',),
+                                   'required_tags': ('id',),
+                                   'preserve_tags': ('id',
+                                                     'polymer_flag',
+                                                     'occupancy_flag',
+                                                     'pdb_model_num',
+                                                     'auth_asym_id',
+                                                     'auth_comp_id',
+                                                     'auth_seq_id',
+                                                     'pdb_ins_code',
+                                                     'auth_atom_id',
+                                                     'label_asym_id',
+                                                     'label_comp_id',
+                                                     'label_seq_id',
+                                                     'label_atom_id',
+                                                     'label_alt_id'),
+                                   'omit_tags': (),
+                                   'generate_tags': (),
+                                   'row_rule': 'MISSING_ATOM_CONTEXT',
+                                   'references': {}},
+ '_entry': {'action': 'generate',
+            'key': ('id',),
+            'required_tags': (),
+            'preserve_tags': (),
+            'omit_tags': (),
+            'generate_tags': ('id',),
+            'row_rule': 'DERIVED_ENTRY',
+            'references': {}},
+ '_audit_conform': {'action': 'omit',
+                    'key': (),
+                    'required_tags': (),
+                    'preserve_tags': (),
+                    'omit_tags': (),
+                    'generate_tags': (),
+                    'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                    'references': {}},
+ '_database_2': {'action': 'omit',
+                 'key': (),
+                 'required_tags': (),
+                 'preserve_tags': (),
+                 'omit_tags': (),
+                 'generate_tags': (),
+                 'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                 'references': {}},
+ '_pdbx_database_status': {'action': 'omit',
+                           'key': (),
+                           'required_tags': (),
+                           'preserve_tags': (),
+                           'omit_tags': (),
+                           'generate_tags': (),
+                           'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                           'references': {}},
+ '_audit_author': {'action': 'omit',
+                   'key': (),
+                   'required_tags': (),
+                   'preserve_tags': (),
+                   'omit_tags': (),
+                   'generate_tags': (),
+                   'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                   'references': {}},
+ '_citation': {'action': 'omit',
+               'key': (),
+               'required_tags': (),
+               'preserve_tags': (),
+               'omit_tags': (),
+               'generate_tags': (),
+               'row_rule': 'AUDIT_OMITTED_CATEGORY',
+               'references': {}},
+ '_citation_author': {'action': 'omit',
+                      'key': (),
+                      'required_tags': (),
+                      'preserve_tags': (),
+                      'omit_tags': (),
+                      'generate_tags': (),
+                      'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                      'references': {}},
+ '_pdbx_entity_src_syn': {'action': 'omit',
+                          'key': (),
+                          'required_tags': (),
+                          'preserve_tags': (),
+                          'omit_tags': (),
+                          'generate_tags': (),
+                          'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                          'references': {}},
+ '_entity_src_gen': {'action': 'omit',
+                     'key': (),
+                     'required_tags': (),
+                     'preserve_tags': (),
+                     'omit_tags': (),
+                     'generate_tags': (),
+                     'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                     'references': {}},
+ '_entity_src_nat': {'action': 'omit',
+                     'key': (),
+                     'required_tags': (),
+                     'preserve_tags': (),
+                     'omit_tags': (),
+                     'generate_tags': (),
+                     'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                     'references': {}},
+ '_struct_ref': {'action': 'omit',
+                 'key': (),
+                 'required_tags': (),
+                 'preserve_tags': (),
+                 'omit_tags': (),
+                 'generate_tags': (),
+                 'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                 'references': {}},
+ '_struct_ref_seq': {'action': 'omit',
+                     'key': (),
+                     'required_tags': (),
+                     'preserve_tags': (),
+                     'omit_tags': (),
+                     'generate_tags': (),
+                     'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                     'references': {}},
+ '_struct_ref_seq_dif': {'action': 'omit',
+                         'key': (),
+                         'required_tags': (),
+                         'preserve_tags': (),
+                         'omit_tags': (),
+                         'generate_tags': (),
+                         'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                         'references': {}},
+ '_chem_comp_atom': {'action': 'omit',
+                     'key': (),
+                     'required_tags': (),
+                     'preserve_tags': (),
+                     'omit_tags': (),
+                     'generate_tags': (),
+                     'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                     'references': {}},
+ '_chem_comp_bond': {'action': 'omit',
+                     'key': (),
+                     'required_tags': (),
+                     'preserve_tags': (),
+                     'omit_tags': (),
+                     'generate_tags': (),
+                     'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                     'references': {}},
+ '_exptl': {'action': 'omit',
+            'key': (),
+            'required_tags': (),
+            'preserve_tags': (),
+            'omit_tags': (),
+            'generate_tags': (),
+            'row_rule': 'AUDIT_OMITTED_CATEGORY',
+            'references': {}},
+ '_exptl_crystal': {'action': 'omit',
+                    'key': (),
+                    'required_tags': (),
+                    'preserve_tags': (),
+                    'omit_tags': (),
+                    'generate_tags': (),
+                    'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                    'references': {}},
+ '_exptl_crystal_grow': {'action': 'omit',
+                         'key': (),
+                         'required_tags': (),
+                         'preserve_tags': (),
+                         'omit_tags': (),
+                         'generate_tags': (),
+                         'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                         'references': {}},
+ '_diffrn': {'action': 'omit',
+             'key': (),
+             'required_tags': (),
+             'preserve_tags': (),
+             'omit_tags': (),
+             'generate_tags': (),
+             'row_rule': 'AUDIT_OMITTED_CATEGORY',
+             'references': {}},
+ '_diffrn_detector': {'action': 'omit',
+                      'key': (),
+                      'required_tags': (),
+                      'preserve_tags': (),
+                      'omit_tags': (),
+                      'generate_tags': (),
+                      'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                      'references': {}},
+ '_diffrn_radiation': {'action': 'omit',
+                       'key': (),
+                       'required_tags': (),
+                       'preserve_tags': (),
+                       'omit_tags': (),
+                       'generate_tags': (),
+                       'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                       'references': {}},
+ '_diffrn_radiation_wavelength': {'action': 'omit',
+                                  'key': (),
+                                  'required_tags': (),
+                                  'preserve_tags': (),
+                                  'omit_tags': (),
+                                  'generate_tags': (),
+                                  'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                                  'references': {}},
+ '_diffrn_source': {'action': 'omit',
+                    'key': (),
+                    'required_tags': (),
+                    'preserve_tags': (),
+                    'omit_tags': (),
+                    'generate_tags': (),
+                    'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                    'references': {}},
+ '_reflns': {'action': 'omit',
+             'key': (),
+             'required_tags': (),
+             'preserve_tags': (),
+             'omit_tags': (),
+             'generate_tags': (),
+             'row_rule': 'AUDIT_OMITTED_CATEGORY',
+             'references': {}},
+ '_reflns_shell': {'action': 'omit',
+                   'key': (),
+                   'required_tags': (),
+                   'preserve_tags': (),
+                   'omit_tags': (),
+                   'generate_tags': (),
+                   'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                   'references': {}},
+ '_refine': {'action': 'omit',
+             'key': (),
+             'required_tags': (),
+             'preserve_tags': (),
+             'omit_tags': (),
+             'generate_tags': (),
+             'row_rule': 'AUDIT_OMITTED_CATEGORY',
+             'references': {}},
+ '_refine_hist': {'action': 'omit',
+                  'key': (),
+                  'required_tags': (),
+                  'preserve_tags': (),
+                  'omit_tags': (),
+                  'generate_tags': (),
+                  'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                  'references': {}},
+ '_refine_ls_restr': {'action': 'omit',
+                      'key': (),
+                      'required_tags': (),
+                      'preserve_tags': (),
+                      'omit_tags': (),
+                      'generate_tags': (),
+                      'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                      'references': {}},
+ '_refine_ls_shell': {'action': 'omit',
+                      'key': (),
+                      'required_tags': (),
+                      'preserve_tags': (),
+                      'omit_tags': (),
+                      'generate_tags': (),
+                      'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                      'references': {}},
+ '_struct': {'action': 'omit',
+             'key': (),
+             'required_tags': (),
+             'preserve_tags': (),
+             'omit_tags': (),
+             'generate_tags': (),
+             'row_rule': 'AUDIT_OMITTED_CATEGORY',
+             'references': {}},
+ '_struct_keywords': {'action': 'omit',
+                      'key': (),
+                      'required_tags': (),
+                      'preserve_tags': (),
+                      'omit_tags': (),
+                      'generate_tags': (),
+                      'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                      'references': {}},
+ '_struct_conf': {'action': 'omit',
+                  'key': (),
+                  'required_tags': (),
+                  'preserve_tags': (),
+                  'omit_tags': (),
+                  'generate_tags': (),
+                  'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                  'references': {}},
+ '_struct_conf_type': {'action': 'omit',
+                       'key': (),
+                       'required_tags': (),
+                       'preserve_tags': (),
+                       'omit_tags': (),
+                       'generate_tags': (),
+                       'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                       'references': {}},
+ '_struct_sheet': {'action': 'omit',
+                   'key': (),
+                   'required_tags': (),
+                   'preserve_tags': (),
+                   'omit_tags': (),
+                   'generate_tags': (),
+                   'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                   'references': {}},
+ '_struct_sheet_order': {'action': 'omit',
+                         'key': (),
+                         'required_tags': (),
+                         'preserve_tags': (),
+                         'omit_tags': (),
+                         'generate_tags': (),
+                         'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                         'references': {}},
+ '_struct_sheet_range': {'action': 'omit',
+                         'key': (),
+                         'required_tags': (),
+                         'preserve_tags': (),
+                         'omit_tags': (),
+                         'generate_tags': (),
+                         'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                         'references': {}},
+ '_struct_sheet_hbond': {'action': 'omit',
+                         'key': (),
+                         'required_tags': (),
+                         'preserve_tags': (),
+                         'omit_tags': (),
+                         'generate_tags': (),
+                         'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                         'references': {}},
+ '_struct_mon_prot_cis': {'action': 'omit',
+                          'key': (),
+                          'required_tags': (),
+                          'preserve_tags': (),
+                          'omit_tags': (),
+                          'generate_tags': (),
+                          'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                          'references': {}},
+ '_struct_site': {'action': 'omit',
+                  'key': (),
+                  'required_tags': (),
+                  'preserve_tags': (),
+                  'omit_tags': (),
+                  'generate_tags': (),
+                  'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                  'references': {}},
+ '_struct_site_gen': {'action': 'omit',
+                      'key': (),
+                      'required_tags': (),
+                      'preserve_tags': (),
+                      'omit_tags': (),
+                      'generate_tags': (),
+                      'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                      'references': {}},
+ '_atom_sites': {'action': 'omit',
+                 'key': (),
+                 'required_tags': (),
+                 'preserve_tags': (),
+                 'omit_tags': (),
+                 'generate_tags': (),
+                 'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                 'references': {}},
+ '_pdbx_struct_special_symmetry': {'action': 'guard_then_omit',
+                                   'key': ('id',),
+                                   'required_tags': ('id',),
+                                   'preserve_tags': (),
+                                   'omit_tags': ('id',
+                                                 'pdb_model_num',
+                                                 'auth_comp_id',
+                                                 'auth_asym_id',
+                                                 'auth_seq_id',
+                                                 'pdb_ins_code',
+                                                 'label_alt_id',
+                                                 'label_asym_id',
+                                                 'label_comp_id',
+                                                 'label_seq_id'),
+                                   'generate_tags': (),
+                                   'row_rule': 'SPECIAL_POSITION_GUARD_THEN_OMIT',
+                                   'references': {}},
+ '_pdbx_struct_assembly': {'action': 'omit',
+                           'key': (),
+                           'required_tags': (),
+                           'preserve_tags': (),
+                           'omit_tags': (),
+                           'generate_tags': (),
+                           'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                           'references': {}},
+ '_pdbx_struct_assembly_gen': {'action': 'omit',
+                               'key': (),
+                               'required_tags': (),
+                               'preserve_tags': (),
+                               'omit_tags': (),
+                               'generate_tags': (),
+                               'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                               'references': {}},
+ '_pdbx_struct_oper_list': {'action': 'omit',
+                            'key': (),
+                            'required_tags': (),
+                            'preserve_tags': (),
+                            'omit_tags': (),
+                            'generate_tags': (),
+                            'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                            'references': {}},
+ '_struct_ncs_oper': {'action': 'guard_then_omit',
+                      'key': ('id',),
+                      'required_tags': ('id',
+                                        'matrix[1][1]',
+                                        'matrix[1][2]',
+                                        'matrix[1][3]',
+                                        'matrix[2][1]',
+                                        'matrix[2][2]',
+                                        'matrix[2][3]',
+                                        'matrix[3][1]',
+                                        'matrix[3][2]',
+                                        'matrix[3][3]',
+                                        'vector[1]',
+                                        'vector[2]',
+                                        'vector[3]'),
+                      'preserve_tags': (),
+                      'omit_tags': ('id',
+                                    'code',
+                                    'matrix[1][1]',
+                                    'matrix[1][2]',
+                                    'matrix[1][3]',
+                                    'matrix[2][1]',
+                                    'matrix[2][2]',
+                                    'matrix[2][3]',
+                                    'matrix[3][1]',
+                                    'matrix[3][2]',
+                                    'matrix[3][3]',
+                                    'vector[1]',
+                                    'vector[2]',
+                                    'vector[3]',
+                                    'details'),
+                      'generate_tags': (),
+                      'row_rule': 'NCS_GUARD_THEN_OMIT',
+                      'references': {}},
+ '_pdbx_audit_revision_history': {'action': 'omit',
+                                  'key': (),
+                                  'required_tags': (),
+                                  'preserve_tags': (),
+                                  'omit_tags': (),
+                                  'generate_tags': (),
+                                  'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                                  'references': {}},
+ '_pdbx_audit_revision_details': {'action': 'omit',
+                                  'key': (),
+                                  'required_tags': (),
+                                  'preserve_tags': (),
+                                  'omit_tags': (),
+                                  'generate_tags': (),
+                                  'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                                  'references': {}},
+ '_pdbx_audit_revision_group': {'action': 'omit',
+                                'key': (),
+                                'required_tags': (),
+                                'preserve_tags': (),
+                                'omit_tags': (),
+                                'generate_tags': (),
+                                'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                                'references': {}},
+ '_software': {'action': 'omit',
+               'key': (),
+               'required_tags': (),
+               'preserve_tags': (),
+               'omit_tags': (),
+               'generate_tags': (),
+               'row_rule': 'AUDIT_OMITTED_CATEGORY',
+               'references': {}},
+ '_pdbx_audit_support': {'action': 'omit',
+                         'key': (),
+                         'required_tags': (),
+                         'preserve_tags': (),
+                         'omit_tags': (),
+                         'generate_tags': (),
+                         'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                         'references': {}},
+ '_pdbx_database_related': {'action': 'omit',
+                            'key': (),
+                            'required_tags': (),
+                            'preserve_tags': (),
+                            'omit_tags': (),
+                            'generate_tags': (),
+                            'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                            'references': {}},
+ '_pdbx_database_pdb_obs_spr': {'action': 'omit',
+                                'key': (),
+                                'required_tags': (),
+                                'preserve_tags': (),
+                                'omit_tags': (),
+                                'generate_tags': (),
+                                'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                                'references': {}},
+ '_entity_name_com': {'action': 'omit',
+                      'key': (),
+                      'required_tags': (),
+                      'preserve_tags': (),
+                      'omit_tags': (),
+                      'generate_tags': (),
+                      'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                      'references': {}},
+ '_exptl_crystal_grow_comp': {'action': 'omit',
+                              'key': (),
+                              'required_tags': (),
+                              'preserve_tags': (),
+                              'omit_tags': (),
+                              'generate_tags': (),
+                              'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                              'references': {}},
+ '_refine_analyze': {'action': 'omit',
+                     'key': (),
+                     'required_tags': (),
+                     'preserve_tags': (),
+                     'omit_tags': (),
+                     'generate_tags': (),
+                     'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                     'references': {}},
+ '_pdbx_refine': {'action': 'omit',
+                  'key': (),
+                  'required_tags': (),
+                  'preserve_tags': (),
+                  'omit_tags': (),
+                  'generate_tags': (),
+                  'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                  'references': {}},
+ '_struct_biol': {'action': 'omit',
+                  'key': (),
+                  'required_tags': (),
+                  'preserve_tags': (),
+                  'omit_tags': (),
+                  'generate_tags': (),
+                  'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                  'references': {}},
+ '_database_pdb_matrix': {'action': 'omit',
+                          'key': (),
+                          'required_tags': (),
+                          'preserve_tags': (),
+                          'omit_tags': (),
+                          'generate_tags': (),
+                          'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                          'references': {}},
+ '_pdbx_molecule_features': {'action': 'omit',
+                             'key': (),
+                             'required_tags': (),
+                             'preserve_tags': (),
+                             'omit_tags': (),
+                             'generate_tags': (),
+                             'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                             'references': {}},
+ '_pdbx_molecule': {'action': 'omit',
+                    'key': (),
+                    'required_tags': (),
+                    'preserve_tags': (),
+                    'omit_tags': (),
+                    'generate_tags': (),
+                    'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                    'references': {}},
+ '_struct_site_keywords': {'action': 'omit',
+                           'key': (),
+                           'required_tags': (),
+                           'preserve_tags': (),
+                           'omit_tags': (),
+                           'generate_tags': (),
+                           'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                           'references': {}},
+ '_pdbx_struct_assembly_prop': {'action': 'omit',
+                                'key': (),
+                                'required_tags': (),
+                                'preserve_tags': (),
+                                'omit_tags': (),
+                                'generate_tags': (),
+                                'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                                'references': {}},
+ '_pdbx_entry_details': {'action': 'omit',
+                         'key': (),
+                         'required_tags': (),
+                         'preserve_tags': (),
+                         'omit_tags': (),
+                         'generate_tags': (),
+                         'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                         'references': {}},
+ '_ndb_struct_conf_na': {'action': 'omit',
+                         'key': (),
+                         'required_tags': (),
+                         'preserve_tags': (),
+                         'omit_tags': (),
+                         'generate_tags': (),
+                         'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                         'references': {}},
+ '_ndb_struct_na_base_pair': {'action': 'omit',
+                              'key': (),
+                              'required_tags': (),
+                              'preserve_tags': (),
+                              'omit_tags': (),
+                              'generate_tags': (),
+                              'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                              'references': {}},
+ '_ndb_struct_na_base_pair_step': {'action': 'omit',
+                                   'key': (),
+                                   'required_tags': (),
+                                   'preserve_tags': (),
+                                   'omit_tags': (),
+                                   'generate_tags': (),
+                                   'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                                   'references': {}},
+ '_pdbx_refine_tls': {'action': 'omit',
+                      'key': (),
+                      'required_tags': (),
+                      'preserve_tags': (),
+                      'omit_tags': (),
+                      'generate_tags': (),
+                      'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                      'references': {}},
+ '_pdbx_refine_tls_group': {'action': 'omit',
+                            'key': (),
+                            'required_tags': (),
+                            'preserve_tags': (),
+                            'omit_tags': (),
+                            'generate_tags': (),
+                            'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                            'references': {}},
+ '_pdbx_struct_conn_angle': {'action': 'omit',
+                             'key': (),
+                             'required_tags': (),
+                             'preserve_tags': (),
+                             'omit_tags': (),
+                             'generate_tags': (),
+                             'row_rule': 'AUDIT_OMITTED_CATEGORY',
+                             'references': {}}}
+
+
+class RawCategoryTable(NamedTuple):
+    """A plain (gemmi-free) column-major view of one CIF category's rows:
+    `columns[tag]` is a tuple of raw tokens, one per row, already decoded
+    to `None`/`str` by the Checkpoint 2 adapter boundary
+    (`receptor_parsing.raw_cif_null_to_optional_str` - never imported here,
+    ARCH-01). Every column tuple has the same length; a category with no
+    declared columns has `row_count == 0`."""
+
+    columns: Dict[str, Tuple[Optional[str], ...]]
+
+    @property
+    def row_count(self) -> int:
+        if not self.columns:
+            return 0
+        return len(next(iter(self.columns.values())))
+
+    def value(self, column: str, row_index: int) -> Optional[str]:
+        return self.columns[column][row_index]
+
+
+def compute_source_rows_key(*, source_context_key: str, category: str, table: "RawCategoryTable") -> str:
+    """Section 11: "fonte presente vazia também tem hash não nulo" - this
+    hash is always computed over the category's *own* declared columns
+    (sorted, for determinism), independent of which rows the catalogue
+    later keeps/omits."""
+
+    columns_sorted = tuple(sorted(table.columns.keys()))
+    payload = {
+        "kind": "receptor-materialization-source-rows",
+        "version": "1.0",
+        "source_context_key": source_context_key,
+        "category": category,
+        "columns": list(columns_sorted),
+        "rows": [
+            [table.columns[column][row_index] for column in columns_sorted]
+            for row_index in range(table.row_count)
+        ],
+    }
+    return compute_materialization_hash(payload)
+
+
+def _reference_filter_column(cat_def: Dict[str, object], target_reference: str) -> str:
+    references = cat_def["references"]
+    for column, reference in references.items():
+        if reference == target_reference:
+            return column
+    # Self-referential category (e.g. `_entity` filtering its own rows by
+    # `_entity.id`, `_struct_asym` filtering its own rows by
+    # `_struct_asym.id`): no column in `references` points at the target
+    # table because this category *is* that table - its own key column is
+    # the filter column.
+    key = cat_def["key"]
+    return key[0]
+
+
+def _filter_rows_by_membership(
+    *, table: "RawCategoryTable", column: str, retained_ids: FrozenSet[str],
+) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+    kept: List[int] = []
+    omitted: List[int] = []
+    for row_index in range(table.row_count):
+        value = table.value(column, row_index)
+        if value is not None and value in retained_ids:
+            kept.append(row_index)
+        else:
+            omitted.append(row_index)
+    return tuple(kept), tuple(omitted)
+
+
+def _cat_def_for(category: str) -> Optional[Dict[str, object]]:
+    cat_def = _FROZEN_CATALOGUE.get(category)
+    if cat_def is not None:
+        return cat_def
+    if _CATALOGUE_OMISSION_FAMILY_PATTERN.fullmatch(category):
+        return {
+            "action": "omit", "key": (), "required_tags": (), "preserve_tags": (),
+            "omit_tags": (), "generate_tags": (), "row_rule": "AUDIT_OMITTED_CATEGORY", "references": {},
+        }
+    return None
+
+
+def _finite_numeric_token(token: Optional[str]) -> bool:
+    if token is None:
+        return False
+    try:
+        return math.isfinite(float(token))
+    except ValueError:
+        return False
+
+
+_ANISOTROP_U_COLUMNS = ("u[1][1]", "u[1][2]", "u[1][3]", "u[2][2]", "u[2][3]", "u[3][3]")
+_ANISOTROP_B_COLUMNS = ("b[1][1]", "b[1][2]", "b[1][3]", "b[2][2]", "b[2][3]", "b[3][3]")
+_ANISOTROP_LABEL_AGREEMENT_COLUMNS = (
+    ("pdbx_label_atom_id", "label_atom_id"),
+    ("pdbx_label_asym_id", "label_asym_id"),
+    ("pdbx_label_comp_id", "label_comp_id"),
+)
+_NCS_MATRIX_COLUMNS = (
+    "matrix[1][1]", "matrix[1][2]", "matrix[1][3]",
+    "matrix[2][1]", "matrix[2][2]", "matrix[2][3]",
+    "matrix[3][1]", "matrix[3][2]", "matrix[3][3]",
+)
+_NCS_VECTOR_COLUMNS = ("vector[1]", "vector[2]", "vector[3]")
+_NCS_IDENTITY_MATRIX = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+_NCS_IDENTITY_TOLERANCE = 1e-6
+_CCD_CLOSURE_SOURCE_COLUMN = {
+    "_entity_poly_seq": "mon_id",
+    "_pdbx_entity_branch_list": "comp_id",
+    "_pdbx_nonpoly_scheme": "mon_id",
+    "_pdbx_poly_seq_scheme": "mon_id",
+    "_pdbx_branch_scheme": "mon_id",
+}
+
+
+def _tensor_family_state(
+    table: "RawCategoryTable", row_index: int, columns: Sequence[str], present_columns: FrozenSet[str],
+) -> str:
+    if not all(column in present_columns for column in columns):
+        return "absent"
+    values = [table.value(column, row_index) for column in columns]
+    if all(value is None for value in values):
+        return "absent"
+    if all(value is not None and _finite_numeric_token(value) for value in values):
+        return "complete"
+    return "partial"
+
+
+def _validate_anisotrop_tensor_row(
+    category: str, table: "RawCategoryTable", row_index: int, present_columns: FrozenSet[str],
+) -> None:
+    # Section 11: "exigir ao menos um tensor U ou B com seus seis
+    # componentes numéricos finitos; família com algum valor numérico e
+    # outros componentes faltantes/null é recusada."
+    u_state = _tensor_family_state(table, row_index, _ANISOTROP_U_COLUMNS, present_columns)
+    b_state = _tensor_family_state(table, row_index, _ANISOTROP_B_COLUMNS, present_columns)
+    if u_state == "partial" or b_state == "partial":
+        raise MaterializationExecutionError(
+            "INVALID_CIF",
+            f"category {category!r} row {row_index} has a partial anisotropic tensor "
+            "(some but not all of its six numeric components present/finite)",
+            phase="plan",
+        )
+    if u_state == "absent" and b_state == "absent":
+        raise MaterializationExecutionError(
+            "INVALID_CIF",
+            f"category {category!r} row {row_index} has neither a complete U nor a complete B tensor",
+            phase="plan",
+        )
+
+
+def _validate_anisotrop_field_agreement(
+    category: str, table: "RawCategoryTable", row_index: int,
+    atom_site_table: "RawCategoryTable", atom_site_ordinal: int, present_columns: FrozenSet[str],
+) -> None:
+    # Section 11: "id precisa corresponder inequivocamente a átomo fonte e
+    # demais campos informados concordam."
+    for anisotrop_column, atom_site_column in _ANISOTROP_LABEL_AGREEMENT_COLUMNS:
+        if anisotrop_column not in present_columns or atom_site_column not in atom_site_table.columns:
+            continue
+        anisotrop_value = table.value(anisotrop_column, row_index)
+        atom_site_value = atom_site_table.value(atom_site_column, atom_site_ordinal)
+        if anisotrop_value is not None and anisotrop_value != atom_site_value:
+            raise MaterializationExecutionError(
+                "INVALID_CIF",
+                f"category {category!r} row {row_index} {anisotrop_column}={anisotrop_value!r} disagrees "
+                f"with the referenced _atom_site.{atom_site_column}={atom_site_value!r}",
+                phase="plan",
+            )
+
+
+def _guard_ncs_row(category: str, table: "RawCategoryTable", row_index: int) -> None:
+    # Section 11: "NCS não identidade com generate/null recusa
+    # UNSUPPORTED_NCS antes de omitir; given/identidade podem ser omitidos
+    # auditados... Código/matriz incompletos inválidos recusam INVALID_CIF."
+    values: Dict[str, float] = {}
+    for column in _NCS_MATRIX_COLUMNS + _NCS_VECTOR_COLUMNS:
+        token = table.value(column, row_index) if column in table.columns else None
+        if not _finite_numeric_token(token):
+            raise MaterializationExecutionError(
+                "INVALID_CIF",
+                f"category {category!r} row {row_index} has a missing/non-finite NCS operator component {column!r}",
+                phase="plan",
+            )
+        values[column] = float(token)
+
+    is_identity = all(
+        abs(values[column] - expected) <= _NCS_IDENTITY_TOLERANCE
+        for column, expected in zip(_NCS_MATRIX_COLUMNS, _NCS_IDENTITY_MATRIX)
+    ) and all(abs(values[column]) <= _NCS_IDENTITY_TOLERANCE for column in _NCS_VECTOR_COLUMNS)
+
+    code = table.value("code", row_index) if "code" in table.columns else None
+    code_normalized = code.strip().lower() if isinstance(code, str) else None
+    # Section 11 (T021-154): `code` is a closed two-value mmCIF enum
+    # ("given"/"generate") plus null/absent - any other literal string is
+    # malformed data, never a silently-tolerated third option.
+    if code_normalized not in (None, "given", "generate"):
+        raise MaterializationExecutionError(
+            "INVALID_CIF",
+            f"category {category!r} row {row_index} declares an unrecognized NCS code {code!r} "
+            "(expected 'given', 'generate', or null)",
+            phase="plan",
+        )
+    if not is_identity and code_normalized in (None, "generate"):
+        raise MaterializationExecutionError(
+            "UNSUPPORTED_NCS",
+            f"category {category!r} row {row_index} declares a non-identity NCS operator with "
+            f"code={code!r}; this checkpoint never applies NCS transformations",
+            phase="plan",
+        )
+
+
+def _guard_special_position_row(
+    category: str, table: "RawCategoryTable", row_index: int,
+    present_columns: FrozenSet[str], auth_to_label_asym: Dict[str, "set[str]"],
+) -> None:
+    # Section 11: "Posições especiais exigem contexto inequívoco."
+    label_asym_id = table.value("label_asym_id", row_index) if "label_asym_id" in present_columns else None
+    if label_asym_id is not None:
+        return
+    auth_asym_id = table.value("auth_asym_id", row_index) if "auth_asym_id" in present_columns else None
+    if auth_asym_id is None:
+        raise MaterializationExecutionError(
+            "INVALID_CIF",
+            f"category {category!r} row {row_index} has neither label_asym_id nor auth_asym_id; "
+            "its context cannot be resolved unambiguously before omission",
+            phase="plan",
+        )
+    candidates = auth_to_label_asym.get(auth_asym_id, set())
+    if len(candidates) != 1:
+        raise MaterializationExecutionError(
+            "INVALID_CIF",
+            f"category {category!r} row {row_index} auth_asym_id={auth_asym_id!r} does not resolve to "
+            f"exactly one label_asym_id in M ({sorted(candidates)!r})",
+            phase="plan",
+        )
+
+
+def compute_category_decisions(
+    *,
+    source_context_key: str,
+    categories: Mapping[str, "RawCategoryTable"],
+    retained_entity_ids: FrozenSet[str],
+    retained_asym_ids: FrozenSet[str],
+    resolved_model: int,
+    atoms_by_ordinal: Mapping[int, AtomObservation],
+    atom_decisions_by_ordinal: Mapping[int, AtomDecision],
+    connection_decisions: Sequence[ConnectionDecision],
+) -> Tuple[CategoryDecision, ...]:
+    """Section 11: applies the pinned 94-category catalogue
+    (`CATALOGUE_SHA256`) to one parsed CIF DOM (`categories` - gemmi-free
+    plain tables keyed by the catalogue's own leading-underscore names,
+    e.g. `"_atom_site"`; the Checkpoint 2 adapter boundary converts a real
+    `receptor_parsing.ParsedCifDom021` into this shape by a late, local
+    import, never at this module's top level - ARCH-01), given the
+    already-decided S/D/U/X atom retention (`atom_decisions_by_ordinal`,
+    keyed by the same ordinals as `atoms_by_ordinal`) and the
+    already-resolved `struct_conn` connections (`connection_decisions`).
+
+    Only catalogue categories *present* in `categories` ever produce a
+    `CategoryDecision` here (an entirely absent category is not itself a
+    decision to audit) - `_entry` (DERIVED_ENTRY) is the one exception,
+    always generated regardless of source presence. A present category
+    outside the pinned catalogue and outside the three approved
+    `_pdbx_validate_`/`_pdbx_nmr_`/`_em_` omission families raises
+    `UNSUPPORTED_CATEGORY`; a present, recognized category with a column
+    outside its own preserve/omit/generate tags raises `UNSUPPORTED_TAG`.
+    """
+
+    resolved_model_token = str(resolved_model)
+    kept_atom_ordinals = frozenset(
+        ordinal for ordinal, decision in atom_decisions_by_ordinal.items() if decision.retained
+    )
+    retained_atom_ccds = frozenset(
+        atoms_by_ordinal[ordinal].ccd for ordinal in kept_atom_ordinals if ordinal in atoms_by_ordinal
+    )
+    preserved_connection_type_tokens = frozenset(
+        decision.conn_type_token for decision in connection_decisions if decision.action == "preserve"
+    )
+
+    auth_to_label_asym: Dict[str, "set[str]"] = {}
+    for atom in atoms_by_ordinal.values():
+        auth_to_label_asym.setdefault(atom.auth_asym_id, set()).add(atom.label_asym_id)
+
+    cat_defs: Dict[str, Optional[Dict[str, object]]] = {name: _cat_def_for(name) for name in categories}
+    unknown_present = sorted(name for name, cat_def in cat_defs.items() if cat_def is None)
+    if unknown_present:
+        raise MaterializationExecutionError(
+            "UNSUPPORTED_CATEGORY",
+            f"source CIF declares categor(y/ies) outside the pinned catalogue and its approved "
+            f"omission families: {unknown_present!r}",
+            phase="plan",
+        )
+
+    decisions: Dict[str, CategoryDecision] = {}
+    ccd_closure_extra: "set[str]" = set()
+
+    for category in sorted(categories):
+        if category == "_chem_comp":
+            continue  # REFERENCED_CCD_CLOSURE - deferred until every contributor is known.
+        if category == "_entry":
+            continue  # DERIVED_ENTRY - always generated below, regardless of source presence.
+
+        cat_def = cat_defs[category]
+        table = categories[category]
+        present_columns = frozenset(table.columns.keys())
+        row_rule = cat_def["row_rule"]
+
+        if row_rule == "AUDIT_OMITTED_CATEGORY":
+            decisions[category] = CategoryDecision(
+                category=category, action="omit",
+                omitted_row_ordinals=tuple(range(table.row_count)),
+                source_rows_key=compute_source_rows_key(
+                    source_context_key=source_context_key, category=category, table=table,
+                ),
+            )
+            continue
+
+        allowed_tags = set(cat_def["preserve_tags"]) | set(cat_def["omit_tags"]) | set(cat_def["generate_tags"])
+        unknown_tags = present_columns - allowed_tags
+        if unknown_tags:
+            raise MaterializationExecutionError(
+                "UNSUPPORTED_TAG",
+                f"category {category!r} has unrecognized tag(s) {sorted(unknown_tags)!r} outside the pinned catalogue",
+                phase="plan",
+            )
+        missing_required = [t for t in cat_def["required_tags"] if t not in present_columns]
+        if missing_required:
+            raise MaterializationExecutionError(
+                "INVALID_CIF",
+                f"category {category!r} is missing required tag(s) {missing_required!r}",
+                phase="plan",
+            )
+
+        if row_rule in ("RETAINED_ENTITY", "RETAINED_ENTITY_ALL_SEQUENCE", "RETAINED_ENTITY_ALL_BRANCH"):
+            column = _reference_filter_column(cat_def, "_entity.id")
+            kept, omitted = _filter_rows_by_membership(table=table, column=column, retained_ids=retained_entity_ids)
+            decisions[category] = CategoryDecision(
+                category=category, action="filter",
+                kept_row_ordinals=kept, omitted_row_ordinals=omitted,
+                preserved_tags=tuple(t for t in cat_def["preserve_tags"] if t in present_columns),
+                omitted_tags=tuple(t for t in cat_def["omit_tags"] if t in present_columns),
+                source_rows_key=compute_source_rows_key(
+                    source_context_key=source_context_key, category=category, table=table,
+                ),
+            )
+            closure_column = _CCD_CLOSURE_SOURCE_COLUMN.get(category)
+            if closure_column is not None:
+                for row_index in kept:
+                    value = table.value(closure_column, row_index)
+                    if value is not None:
+                        ccd_closure_extra.add(value)
+            continue
+
+        if row_rule in ("RETAINED_ASYM", "RETAINED_ASYM_ALL_SEQUENCE", "RETAINED_ASYM_ALL_BRANCH"):
+            column = _reference_filter_column(cat_def, "_struct_asym.id")
+            kept, omitted = _filter_rows_by_membership(table=table, column=column, retained_ids=retained_asym_ids)
+            decisions[category] = CategoryDecision(
+                category=category, action="filter",
+                kept_row_ordinals=kept, omitted_row_ordinals=omitted,
+                preserved_tags=tuple(t for t in cat_def["preserve_tags"] if t in present_columns),
+                omitted_tags=tuple(t for t in cat_def["omit_tags"] if t in present_columns),
+                source_rows_key=compute_source_rows_key(
+                    source_context_key=source_context_key, category=category, table=table,
+                ),
+            )
+            closure_column = _CCD_CLOSURE_SOURCE_COLUMN.get(category)
+            if closure_column is not None:
+                for row_index in kept:
+                    value = table.value(closure_column, row_index)
+                    if value is not None:
+                        ccd_closure_extra.add(value)
+            continue
+
+        if row_rule == "ATOM_MASK":
+            if table.row_count != len(atoms_by_ordinal):
+                raise MaterializationExecutionError(
+                    "INVALID_CIF",
+                    f"_atom_site row count {table.row_count} does not match the "
+                    f"{len(atoms_by_ordinal)} AtomObservation(s) handed to the planner",
+                    phase="plan",
+                )
+            kept = tuple(sorted(kept_atom_ordinals))
+            omitted = tuple(sorted(set(range(table.row_count)) - kept_atom_ordinals))
+            decisions[category] = CategoryDecision(
+                category=category, action="filter",
+                kept_row_ordinals=kept, omitted_row_ordinals=omitted,
+                preserved_tags=tuple(t for t in cat_def["preserve_tags"] if t in present_columns),
+                source_rows_key=compute_source_rows_key(
+                    source_context_key=source_context_key, category=category, table=table,
+                ),
+            )
+            continue
+
+        if row_rule == "CONNECTION_ACTIONS":
+            if table.row_count != len(connection_decisions):
+                raise MaterializationExecutionError(
+                    "INVALID_CIF",
+                    f"_struct_conn row count {table.row_count} does not match the "
+                    f"{len(connection_decisions)} ConnectionDecision(s) resolved",
+                    phase="plan",
+                )
+            kept = tuple(sorted(d.ordinal for d in connection_decisions if d.action == "preserve"))
+            omitted = tuple(sorted(d.ordinal for d in connection_decisions if d.action == "omit"))
+            decisions[category] = CategoryDecision(
+                category=category, action="filter",
+                kept_row_ordinals=kept, omitted_row_ordinals=omitted,
+                preserved_tags=tuple(t for t in cat_def["preserve_tags"] if t in present_columns),
+                omitted_tags=tuple(t for t in cat_def["omit_tags"] if t in present_columns),
+                source_rows_key=compute_source_rows_key(
+                    source_context_key=source_context_key, category=category, table=table,
+                ),
+            )
+            continue
+
+        if row_rule == "USED_CONNECTION_TYPES":
+            kept, omitted = _filter_rows_by_membership(
+                table=table, column="id", retained_ids=preserved_connection_type_tokens,
+            )
+            decisions[category] = CategoryDecision(
+                category=category, action="filter",
+                kept_row_ordinals=kept, omitted_row_ordinals=omitted,
+                preserved_tags=tuple(t for t in cat_def["preserve_tags"] if t in present_columns),
+                source_rows_key=compute_source_rows_key(
+                    source_context_key=source_context_key, category=category, table=table,
+                ),
+            )
+            continue
+
+        if row_rule == "USED_ELEMENTS":
+            used_elements: FrozenSet[str] = frozenset()
+            atom_site_table = categories.get("_atom_site")
+            if atom_site_table is not None and "type_symbol" in atom_site_table.columns:
+                used_elements = frozenset(
+                    value for ordinal in kept_atom_ordinals
+                    if (value := atom_site_table.value("type_symbol", ordinal)) is not None
+                )
+            kept, omitted = _filter_rows_by_membership(table=table, column="symbol", retained_ids=used_elements)
+            decisions[category] = CategoryDecision(
+                category=category, action="filter",
+                kept_row_ordinals=kept, omitted_row_ordinals=omitted,
+                preserved_tags=tuple(t for t in cat_def["preserve_tags"] if t in present_columns),
+                source_rows_key=compute_source_rows_key(
+                    source_context_key=source_context_key, category=category, table=table,
+                ),
+            )
+            continue
+
+        if row_rule == "SOURCE_FRAME_SINGLETON":
+            if table.row_count > 1:
+                raise MaterializationExecutionError(
+                    "INVALID_CIF",
+                    f"category {category!r} (SOURCE_FRAME_SINGLETON) declares {table.row_count} rows, expected at most one",
+                    phase="plan",
+                )
+            decisions[category] = CategoryDecision(
+                category=category, action="filter",
+                kept_row_ordinals=tuple(range(table.row_count)), omitted_row_ordinals=(),
+                preserved_tags=tuple(t for t in cat_def["preserve_tags"] if t in present_columns),
+                omitted_tags=tuple(t for t in cat_def["omit_tags"] if t in present_columns),
+                generated_tags=tuple(cat_def["generate_tags"]),
+                source_rows_key=compute_source_rows_key(
+                    source_context_key=source_context_key, category=category, table=table,
+                ),
+            )
+            continue
+
+        if row_rule == "SOURCE_OPERATORS":
+            decisions[category] = CategoryDecision(
+                category=category, action="filter",
+                kept_row_ordinals=tuple(range(table.row_count)), omitted_row_ordinals=(),
+                preserved_tags=tuple(t for t in cat_def["preserve_tags"] if t in present_columns),
+                omitted_tags=tuple(t for t in cat_def["omit_tags"] if t in present_columns),
+                source_rows_key=compute_source_rows_key(
+                    source_context_key=source_context_key, category=category, table=table,
+                ),
+            )
+            continue
+
+        if row_rule in ("MODIFIED_RESIDUE_CONTEXT", "MISSING_RESIDUE_CONTEXT", "MISSING_ATOM_CONTEXT"):
+            if "label_asym_id" not in present_columns:
+                raise MaterializationExecutionError(
+                    "UNSUPPORTED_CATEGORY",
+                    f"category {category!r} has no label_asym_id column; this checkpoint declares itself "
+                    "incapable of unambiguously resolving its residue/atom context without it",
+                    phase="plan",
+                )
+            kept_list: List[int] = []
+            omitted_list: List[int] = []
+            parent_comp_ids: "set[str]" = set()
+            for row_index in range(table.row_count):
+                label_asym_id = table.value("label_asym_id", row_index)
+                if label_asym_id is None:
+                    auth_asym_id = (
+                        table.value("auth_asym_id", row_index) if "auth_asym_id" in present_columns else None
+                    )
+                    if auth_asym_id is None:
+                        raise MaterializationExecutionError(
+                            "INVALID_CIF",
+                            f"category {category!r} row {row_index} has neither label_asym_id nor "
+                            "auth_asym_id; its residue/atom context cannot be resolved",
+                            phase="plan",
+                        )
+                    candidates = auth_to_label_asym.get(auth_asym_id, set())
+                    if len(candidates) != 1:
+                        raise MaterializationExecutionError(
+                            "INVALID_CIF",
+                            f"category {category!r} row {row_index} auth_asym_id={auth_asym_id!r} does not "
+                            f"resolve to exactly one label_asym_id in M ({sorted(candidates)!r})",
+                            phase="plan",
+                        )
+                    label_asym_id = next(iter(candidates))
+                model_token = (
+                    table.value("pdb_model_num", row_index) if "pdb_model_num" in present_columns else None
+                )
+                model_matches = model_token is None or model_token == resolved_model_token
+                if model_matches and label_asym_id in retained_asym_ids:
+                    kept_list.append(row_index)
+                    if category == "_pdbx_struct_mod_residue" and "parent_comp_id" in present_columns:
+                        parent_comp_id = table.value("parent_comp_id", row_index)
+                        if parent_comp_id is not None:
+                            parent_comp_ids.add(parent_comp_id)
+                else:
+                    omitted_list.append(row_index)
+            decisions[category] = CategoryDecision(
+                category=category, action="filter",
+                kept_row_ordinals=tuple(kept_list), omitted_row_ordinals=tuple(omitted_list),
+                preserved_tags=tuple(t for t in cat_def["preserve_tags"] if t in present_columns),
+                source_rows_key=compute_source_rows_key(
+                    source_context_key=source_context_key, category=category, table=table,
+                ),
+            )
+            ccd_closure_extra |= parent_comp_ids
+            continue
+
+        if row_rule == "ANISOTROP_ATOM_ID":
+            atom_site_table = categories.get("_atom_site")
+            if atom_site_table is None or "id" not in atom_site_table.columns:
+                raise MaterializationExecutionError(
+                    "UNSUPPORTED_CATEGORY",
+                    f"category {category!r} (ANISOTROP_ATOM_ID) requires a present _atom_site.id column to resolve against",
+                    phase="plan",
+                )
+            atom_site_id_to_ordinal: Dict[str, int] = {}
+            for ordinal in range(atom_site_table.row_count):
+                value = atom_site_table.value("id", ordinal)
+                if value is None:
+                    continue
+                if value in atom_site_id_to_ordinal:
+                    raise MaterializationExecutionError(
+                        "INVALID_CIF", f"_atom_site.id {value!r} is not unique", phase="plan",
+                    )
+                atom_site_id_to_ordinal[value] = ordinal
+            kept_list = []
+            omitted_list = []
+            for row_index in range(table.row_count):
+                _validate_anisotrop_tensor_row(category, table, row_index, present_columns)
+                row_id = table.value("id", row_index)
+                ordinal = atom_site_id_to_ordinal.get(row_id) if row_id is not None else None
+                if ordinal is None:
+                    raise MaterializationExecutionError(
+                        "INVALID_CIF",
+                        f"category {category!r} row {row_index} id={row_id!r} does not correspond to any _atom_site.id",
+                        phase="plan",
+                    )
+                _validate_anisotrop_field_agreement(
+                    category, table, row_index, atom_site_table, ordinal, present_columns,
+                )
+                if ordinal in kept_atom_ordinals:
+                    kept_list.append(row_index)
+                else:
+                    omitted_list.append(row_index)
+            decisions[category] = CategoryDecision(
+                category=category, action="filter",
+                kept_row_ordinals=tuple(kept_list), omitted_row_ordinals=tuple(omitted_list),
+                preserved_tags=tuple(t for t in cat_def["preserve_tags"] if t in present_columns),
+                source_rows_key=compute_source_rows_key(
+                    source_context_key=source_context_key, category=category, table=table,
+                ),
+            )
+            continue
+
+        if row_rule == "NCS_GUARD_THEN_OMIT":
+            for row_index in range(table.row_count):
+                _guard_ncs_row(category, table, row_index)
+            decisions[category] = CategoryDecision(
+                category=category, action="guard_then_omit",
+                omitted_row_ordinals=tuple(range(table.row_count)),
+                omitted_tags=tuple(t for t in cat_def["omit_tags"] if t in present_columns),
+                source_rows_key=compute_source_rows_key(
+                    source_context_key=source_context_key, category=category, table=table,
+                ),
+            )
+            continue
+
+        if row_rule == "SPECIAL_POSITION_GUARD_THEN_OMIT":
+            for row_index in range(table.row_count):
+                _guard_special_position_row(category, table, row_index, present_columns, auth_to_label_asym)
+            decisions[category] = CategoryDecision(
+                category=category, action="guard_then_omit",
+                omitted_row_ordinals=tuple(range(table.row_count)),
+                omitted_tags=tuple(t for t in cat_def["omit_tags"] if t in present_columns),
+                source_rows_key=compute_source_rows_key(
+                    source_context_key=source_context_key, category=category, table=table,
+                ),
+            )
+            continue
+
+        raise MaterializationExecutionError(
+            "UNSUPPORTED_CATEGORY",
+            f"category {category!r} declares row_rule {row_rule!r}, which this checkpoint does not "
+            "yet execute (a declared, explicit gap - never silently approved)",
+            phase="plan",
+        )
+
+    # DERIVED_ENTRY: always generated, regardless of source `_entry` presence.
+    decisions["_entry"] = CategoryDecision(category="_entry", action="generate", generated_tags=("id",))
+
+    # REFERENCED_CCD_CLOSURE (_chem_comp), deferred until every other
+    # category's kept rows (and therefore every closure contributor) are
+    # known.
+    closure = retained_atom_ccds | ccd_closure_extra
+    if "_chem_comp" in categories:
+        cat_def = cat_defs["_chem_comp"]
+        table = categories["_chem_comp"]
+        present_columns = frozenset(table.columns.keys())
+        allowed_tags = set(cat_def["preserve_tags"]) | set(cat_def["omit_tags"]) | set(cat_def["generate_tags"])
+        unknown_tags = present_columns - allowed_tags
+        if unknown_tags:
+            raise MaterializationExecutionError(
+                "UNSUPPORTED_TAG",
+                f"category '_chem_comp' has unrecognized tag(s) {sorted(unknown_tags)!r} outside the pinned catalogue",
+                phase="plan",
+            )
+        missing_required = [t for t in cat_def["required_tags"] if t not in present_columns]
+        if missing_required:
+            raise MaterializationExecutionError(
+                "INVALID_CIF", f"category '_chem_comp' is missing required tag(s) {missing_required!r}", phase="plan",
+            )
+        kept, omitted = _filter_rows_by_membership(table=table, column="id", retained_ids=closure)
+        decisions["_chem_comp"] = CategoryDecision(
+            category="_chem_comp", action="filter",
+            kept_row_ordinals=kept, omitted_row_ordinals=omitted,
+            preserved_tags=tuple(t for t in cat_def["preserve_tags"] if t in present_columns),
+            source_rows_key=compute_source_rows_key(
+                source_context_key=source_context_key, category="_chem_comp", table=table,
+            ),
+        )
+    elif closure:
+        raise MaterializationExecutionError(
+            "INVALID_CIF",
+            "retained atoms/sequences/branches/modified-residues reference chem_comp entries but the "
+            "source has no _chem_comp category",
+            phase="plan",
+        )
+
+    return tuple(decisions[name] for name in sorted(decisions))
