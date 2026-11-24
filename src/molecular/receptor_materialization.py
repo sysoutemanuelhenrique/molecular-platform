@@ -45,13 +45,26 @@ import json
 import re
 import unicodedata
 from datetime import datetime
-from typing import Dict, List, Literal, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Sequence, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from molecular.inputs import validate_input_id
-from molecular.receptor_inspection import ReceptorInspectionReport, compute_inspection_id
-from molecular.receptor_resolution import ResolvedReceptorSelection
+from molecular.inputs import ProteinInput, validate_input_id
+from molecular.promotion import compute_semantic_key
+from molecular.receptor_selection import ReceptorSelectionPolicy
+
+if TYPE_CHECKING:
+    # ARCH-01 (corrections reconciliation 521500c): `receptor_inspection` and
+    # `receptor_resolution` both transitively import Gemmi via
+    # `receptor_parsing` (`import gemmi` at module level). This pure domain
+    # module must stay importable with Gemmi/RDKit entirely absent (Section
+    # 3/19; T021-040), so these two names are annotation-only - never
+    # imported at runtime. `from __future__ import annotations` (above)
+    # already makes every annotation a string; nothing here ever calls
+    # `typing.get_type_hints()` on them. Duck-typed attribute access on the
+    # real objects a caller passes in is all this module ever needs.
+    from molecular.receptor_inspection import ReceptorInspectionReport
+    from molecular.receptor_resolution import ResolvedReceptorSelection
 
 MATERIALIZATION_SCHEMA_VERSION = "1.0"
 MATERIALIZATION_PROFILE_VERSION = "1.0"
@@ -65,6 +78,40 @@ CATALOGUE_SHA256 = "8561039fd15137811b60316336dff04539df3732710dca6ec4009f23150d
 
 ENGINE_NAME = "gemmi"
 ENGINE_VERSION = "0.7.5"
+
+# The 94 canonical category names of the pinned catalogue (CATALOGUE_SHA256
+# above) plus the three explicitly approved omission-family prefixes
+# (Section 11: "_pdbx_validate_, _pdbx_nmr_ e _em_"). MINOR-3: a
+# `CategoryDecision.category` must be one or the other - never an arbitrary
+# string - even though CP1 never reads the catalogue file itself.
+_CATALOGUE_CATEGORY_NAMES = frozenset(
+    {
+        "_atom_site", "_atom_site_anisotrop", "_atom_sites", "_atom_type", "_audit_author", "_audit_conform",
+        "_cell", "_chem_comp", "_chem_comp_atom", "_chem_comp_bond", "_citation", "_citation_author",
+        "_database_2", "_database_pdb_matrix", "_diffrn", "_diffrn_detector", "_diffrn_radiation",
+        "_diffrn_radiation_wavelength", "_diffrn_source", "_entity", "_entity_name_com", "_entity_poly",
+        "_entity_poly_seq", "_entity_src_gen", "_entity_src_nat", "_entry", "_exptl", "_exptl_crystal",
+        "_exptl_crystal_grow", "_exptl_crystal_grow_comp", "_ndb_struct_conf_na", "_ndb_struct_na_base_pair",
+        "_ndb_struct_na_base_pair_step", "_pdbx_audit_revision_details", "_pdbx_audit_revision_group",
+        "_pdbx_audit_revision_history", "_pdbx_audit_support", "_pdbx_branch_scheme",
+        "_pdbx_database_pdb_obs_spr", "_pdbx_database_related", "_pdbx_database_status",
+        "_pdbx_entity_branch", "_pdbx_entity_branch_link", "_pdbx_entity_branch_list", "_pdbx_entity_nonpoly",
+        "_pdbx_entity_src_syn", "_pdbx_entry_details", "_pdbx_molecule", "_pdbx_molecule_features",
+        "_pdbx_nonpoly_scheme", "_pdbx_poly_seq_scheme", "_pdbx_refine", "_pdbx_refine_tls",
+        "_pdbx_refine_tls_group", "_pdbx_struct_assembly", "_pdbx_struct_assembly_gen",
+        "_pdbx_struct_assembly_prop", "_pdbx_struct_conn_angle", "_pdbx_struct_mod_residue",
+        "_pdbx_struct_oper_list", "_pdbx_struct_special_symmetry", "_pdbx_unobs_or_zero_occ_atoms",
+        "_pdbx_unobs_or_zero_occ_residues", "_refine", "_refine_analyze", "_refine_hist",
+        "_refine_ls_restr", "_refine_ls_shell", "_reflns", "_reflns_shell", "_software",
+        "_space_group_symop", "_struct", "_struct_asym", "_struct_biol", "_struct_conf",
+        "_struct_conf_type", "_struct_conn", "_struct_conn_type", "_struct_keywords",
+        "_struct_mon_prot_cis", "_struct_ncs_oper", "_struct_ref", "_struct_ref_seq",
+        "_struct_ref_seq_dif", "_struct_sheet", "_struct_sheet_hbond", "_struct_sheet_order",
+        "_struct_sheet_range", "_struct_site", "_struct_site_gen", "_struct_site_keywords",
+        "_symmetry", "_symmetry_equiv",
+    }
+)
+_CATALOGUE_OMISSION_PREFIXES: Tuple[str, ...] = ("_pdbx_validate_", "_pdbx_nmr_", "_em_")
 
 _HEX64_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _TIME_UTC_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$")
@@ -106,7 +153,11 @@ class MaterializationInputError(ValueError):
     )
 
     def __init__(self, code: str, message: str, *, phase: str = "plan") -> None:
-        assert code in self._CODES, f"unknown MaterializationInputError code {code!r}"
+        # MINOR-6 (corrections reconciliation 521500c): an explicit `raise`,
+        # never `assert` - `assert` is stripped under `python -O`, which
+        # would silently accept a code outside the closed set in production.
+        if code not in self._CODES:
+            raise ValueError(f"unknown MaterializationInputError code {code!r}")
         super().__init__(message)
         self.code = code
         self.phase = phase
@@ -130,7 +181,10 @@ class MaterializationConfigurationError(ValueError):
     )
 
     def __init__(self, code: str, message: str, *, phase: str = "metadata") -> None:
-        assert code in self._CODES, f"unknown MaterializationConfigurationError code {code!r}"
+        # MINOR-6: see MaterializationInputError.__init__ - `raise`, never
+        # `assert`, so this survives `python -O`.
+        if code not in self._CODES:
+            raise ValueError(f"unknown MaterializationConfigurationError code {code!r}")
         super().__init__(message)
         self.code = code
         self.phase = phase
@@ -216,6 +270,37 @@ def compute_materialization_hash(payload: dict) -> str:
 
     canonical = canonicalize_materialization_payload(payload)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+_LEGACY_INSPECTION_SCHEMA_VERSION = "1.0"
+_LEGACY_INSPECTION_PROFILE_VERSION = "1.0"
+
+
+def _compute_legacy_inspection_id(
+    *, parser_name: str, parser_version: str, protein_input_id: str, raw_checksum: str, raw_format: str,
+) -> str:
+    """ARCH-01 (corrections reconciliation 521500c): reproduces
+    `receptor_inspection.compute_inspection_id`'s exact seven-field payload
+    and exact backend (`promotion.compute_semantic_key` - NFC-normalizing,
+    per the 020 frozen spec Section 15.1-15.2) *without* importing
+    `receptor_inspection`, which transitively pulls Gemmi. This is a
+    narrow, versioned duplication of one seven-key payload projection, not
+    a reimplementation of inspection logic, and it deliberately keeps the
+    legacy NFC-normalizing canonicalization - never the 021 token-preserving
+    `compute_materialization_hash` - because identity compatibility with
+    the already-published `inspection_id` values requires the exact same
+    bytes, not a new algorithm."""
+
+    payload = {
+        "inspection_schema_version": _LEGACY_INSPECTION_SCHEMA_VERSION,
+        "inspection_profile_version": _LEGACY_INSPECTION_PROFILE_VERSION,
+        "parser_name": parser_name,
+        "parser_version": parser_version,
+        "protein_input_id": protein_input_id,
+        "raw_checksum": raw_checksum,
+        "raw_format": raw_format,
+    }
+    return compute_semantic_key(payload)
 
 
 def _build_nfc_injective_index(tokens: Sequence[str]) -> Dict[str, str]:
@@ -366,11 +451,9 @@ def compute_source_context_key(source_context: SourceContext) -> str:
 
 def build_source_context(
     *,
-    protein_input_id: str,
+    protein_input: ProteinInput,
     inspection_report: ReceptorInspectionReport,
-    policy_selection_id: str,
-    policy_inspection_id: str,
-    policy_raw_checksum_observed: str,
+    policy: ReceptorSelectionPolicy,
     resolved_selection: ResolvedReceptorSelection,
     raw_size_bytes: int,
     records: Tuple[RecordSnapshot, ...],
@@ -379,13 +462,27 @@ def build_source_context(
     records (Section 5-6, NOTE-F1 minus the actual byte capture - that is
     Checkpoint 2-3's storage reader). Never opens a file and never calls a
     020 loader; every argument is an already-validated, in-memory 020
-    record or a plain scalar the (future) storage reader will have
-    measured.
+    record the (future) storage reader will have loaded, or a plain scalar
+    it will have measured.
 
-    `policy_selection_id`/`policy_inspection_id`/`policy_raw_checksum_observed`
-    are passed as plain scalars - not the full `ReceptorSelectionPolicy` -
-    because only those three fields participate in this cross-check
-    (Section 5)."""
+    MAJOR-A (corrections reconciliation 521500c): receives the full typed
+    `ProteinInput`/`ReceptorSelectionPolicy` - not bare scalars - so every
+    field the frozen spec's Section 5 names ("conferir protein_input_id,
+    inspection_id, checksums acquisition/raw_checksum_observed/raw_checksum,
+    formato e parser") is actually cross-checked, including the inspection's
+    own parser (previously only `resolved_selection.parser` was checked),
+    the resolution's `structure_format` against the inspection's, the
+    policy's own `protein_input_id`, and the `ProteinInput.acquisition.
+    raw_artifact.checksum` against the observed raw_checksum - none of
+    which can be inferred from the records already being cross-checked."""
+
+    # Order: engine -> sources -> selection (Section 16), preserved exactly.
+    if inspection_report.parser.name != ENGINE_NAME or inspection_report.parser.version != ENGINE_VERSION:
+        raise MaterializationConfigurationError(
+            "ENGINE_VERSION",
+            f"inspection parser {inspection_report.parser.name}/{inspection_report.parser.version} "
+            f"does not match the pinned {ENGINE_NAME}/{ENGINE_VERSION}",
+        )
 
     if resolved_selection.parser.name != ENGINE_NAME or resolved_selection.parser.version != ENGINE_VERSION:
         raise MaterializationConfigurationError(
@@ -402,8 +499,15 @@ def build_source_context(
 
     if inspection_report.structure_format != "mmcif":
         raise MaterializationConfigurationError(
-            "UNSUPPORTED_PLATFORM",
+            "INVALID_RECORD",
             f"receptor materialization requires full mmCIF input, got {inspection_report.structure_format!r}",
+        )
+
+    if resolved_selection.structure_format != inspection_report.structure_format:
+        raise MaterializationConfigurationError(
+            "INVALID_RECORD",
+            f"resolved selection structure_format {resolved_selection.structure_format!r} disagrees "
+            f"with the inspection's {inspection_report.structure_format!r}",
         )
 
     if inspection_report.selection_capability != "full":
@@ -419,31 +523,39 @@ def build_source_context(
         )
 
     if not (
-        protein_input_id == inspection_report.protein_input_id == resolved_selection.protein_input_id
+        protein_input.id
+        == inspection_report.protein_input_id
+        == resolved_selection.protein_input_id
+        == policy.protein_input_id
     ):
         raise MaterializationConfigurationError(
             "IDENTITY_MISMATCH", "protein_input_id disagrees across the captured records"
         )
 
-    if not (policy_selection_id == resolved_selection.policy_selection_id == resolved_selection.resolved_selection_id):
+    if not (policy.selection_id == resolved_selection.policy_selection_id == resolved_selection.resolved_selection_id):
         raise MaterializationConfigurationError(
             "IDENTITY_MISMATCH", "selection_id disagrees across the captured records"
         )
 
-    if not (policy_inspection_id == inspection_report.inspection_id == resolved_selection.inspection_id):
+    if not (policy.inspection_id == inspection_report.inspection_id == resolved_selection.inspection_id):
         raise MaterializationConfigurationError(
             "IDENTITY_MISMATCH", "inspection_id disagrees across the captured records"
         )
 
-    if not (policy_raw_checksum_observed == inspection_report.raw_checksum == resolved_selection.raw_checksum):
+    if not (
+        protein_input.acquisition.raw_artifact.checksum
+        == policy.raw_checksum_observed
+        == inspection_report.raw_checksum
+        == resolved_selection.raw_checksum
+    ):
         raise MaterializationConfigurationError(
             "CHECKSUM_MISMATCH", "raw_checksum disagrees across the captured records"
         )
 
-    recomputed_inspection_id = compute_inspection_id(
+    recomputed_inspection_id = _compute_legacy_inspection_id(
         parser_name=inspection_report.parser.name,
         parser_version=inspection_report.parser.version,
-        protein_input_id=protein_input_id,
+        protein_input_id=protein_input.id,
         raw_checksum=inspection_report.raw_checksum,
         raw_format=inspection_report.structure_format,
     )
@@ -466,8 +578,8 @@ def build_source_context(
         )
 
     return SourceContext(
-        protein_input_id=protein_input_id,
-        selection_id=policy_selection_id,
+        protein_input_id=protein_input.id,
+        selection_id=policy.selection_id,
         inspection_id=inspection_report.inspection_id,
         model=resolved_selection.resolved_model,
         records=records,
@@ -758,6 +870,29 @@ class CategoryDecision(BaseModel):
 
     @model_validator(mode="after")
     def _validate_action_invariants(self) -> "CategoryDecision":
+        # MINOR-3 (corrections reconciliation 521500c): `category` must be
+        # one of the pinned catalogue's 94 canonical names, or an approved
+        # omission-family prefix (Section 11) - which is only ever valid
+        # with action="omit". An arbitrary or non-catalogue name is refused
+        # even though CP1 never reads the catalogue file itself.
+        if self.category not in _CATALOGUE_CATEGORY_NAMES:
+            if not any(self.category.startswith(prefix) for prefix in _CATALOGUE_OMISSION_PREFIXES):
+                raise ValueError(
+                    f"category {self.category!r} is neither a canonical catalogue category "
+                    "nor an approved omission-family prefix"
+                )
+            if self.action != "omit":
+                raise ValueError(
+                    f"category {self.category!r} matches an approved omission-family prefix, "
+                    "which is only ever valid with action='omit'"
+                )
+
+        # MINOR-3: ordinals are real, non-negative source positions.
+        if any(ordinal < 0 for ordinal in self.kept_row_ordinals) or any(
+            ordinal < 0 for ordinal in self.omitted_row_ordinals
+        ):
+            raise ValueError("row ordinals must be non-negative")
+
         if set(self.kept_row_ordinals) & set(self.omitted_row_ordinals):
             raise ValueError("kept_row_ordinals and omitted_row_ordinals must not overlap")
 
@@ -768,6 +903,11 @@ class CategoryDecision(BaseModel):
             raise ValueError("preserve/omit/generate tag arrays must not contain duplicates")
         if preserved & omitted or preserved & generated or omitted & generated:
             raise ValueError("preserve/omit/generate tags must always be disjoint arrays")
+
+        # MINOR-3: "quando a categoria é omitida, nenhuma tag/linha
+        # sobrevive" - omit/guard_then_omit must never retain a row.
+        if self.action in ("omit", "guard_then_omit") and self.kept_row_ordinals:
+            raise ValueError(f"action={self.action!r} must retain no row (kept_row_ordinals must be empty)")
 
         if self.action == "guard_then_omit":
             # The guard's own enumerated tag list must exist and be validated
@@ -782,12 +922,27 @@ class CategoryDecision(BaseModel):
         elif self.action == "omit":
             if self.preserved_tags or self.generated_tags:
                 raise ValueError("omit must not preserve or generate tags")
-        elif self.action == "filter":
-            if self.generated_tags:
-                raise ValueError("filter must not generate tags")
         elif self.action == "generate":
             if self.preserved_tags or self.omitted_tags:
                 raise ValueError("generate must not preserve or omit tags")
+        # ARCH-03 (corrections reconciliation 521500c): action="filter" has
+        # no extra restriction beyond the generic disjointness check above -
+        # the pinned catalogue's own _cell/_symmetry entries are filter with
+        # non-empty preserve_tags, omit_tags AND generate_tags=['entry_id']
+        # (DERIVED_ENTRY/SOURCE_FRAME_SINGLETON, Section 11); a blanket
+        # "filter must not generate tags" rule contradicted that annex.
+
+        # MINOR-3: filter/omit/guard_then_omit always reference real source
+        # rows - even an empty source category still has a non-null hash
+        # ("fonte presente vazia também tem hash não nulo"); only
+        # action="generate" may legitimately have no source at all.
+        if self.action in ("filter", "omit", "guard_then_omit") and self.source_rows_key is None:
+            raise ValueError(
+                f"action={self.action!r} always references real source rows; source_rows_key "
+                "must not be null, even for an empty source category"
+            )
+        if self.source_rows_key is None and (self.kept_row_ordinals or self.omitted_row_ordinals):
+            raise ValueError("row ordinals require a non-null source_rows_key")
 
         return self
 
@@ -820,7 +975,11 @@ class PlanBinding(BaseModel):
     version: Literal["1.0"] = "1.0"
     profile: Literal["1.0"] = "1.0"
     algorithm: Literal["1.0"] = "1.0"
-    catalogue_sha256: str = Field(min_length=64, max_length=64)
+    # MINOR-4 (corrections reconciliation 521500c): pinned to the one
+    # approved catalogue identity - a divergent value is rejected by the
+    # closed `Literal` itself, never accepted as a configurable input
+    # (T021-005 "catalogue divergente").
+    catalogue_sha256: Literal[CATALOGUE_SHA256] = CATALOGUE_SHA256
     engine: Engine
     sources: SourceContext
     source_context_key: str = Field(min_length=64, max_length=64)
@@ -836,7 +995,7 @@ class PlanBinding(BaseModel):
     unavailable_categories: Tuple[str, ...] = ()
     warnings: Tuple[WarningCode, ...] = ()
 
-    @field_validator("catalogue_sha256", "source_context_key", "exclusions_key", "outside_key",
+    @field_validator("source_context_key", "exclusions_key", "outside_key",
                       "atom_decisions_key", "connection_decisions_key", "category_decisions_key")
     @classmethod
     def _validate_hex_fields(cls, value: str) -> str:
@@ -925,21 +1084,53 @@ def build_materialization_plan(
 
     selected_set = {chain.label_asym_id for chain in resolved_selection.resolved_chains}
 
+    # --- MINOR-1 (corrections reconciliation 521500c): guards over the
+    # received atom vector itself. The planner is the declared guard here -
+    # it never infers, remaps or repairs a malformed vector (Section 6:
+    # "atom_site.id é não nulo e único globalmente no arquivo"). ---
+    seen_ordinals: set = set()
+    seen_atom_ids: set = set()
+    for atom in atoms:
+        if atom.ordinal in seen_ordinals:
+            raise MaterializationInputError(
+                "INVALID_ID", f"duplicate atom ordinal {atom.ordinal} in the supplied atom vector"
+            )
+        seen_ordinals.add(atom.ordinal)
+        if atom.atom_id in seen_atom_ids:
+            raise MaterializationInputError(
+                "INVALID_ID",
+                f"duplicate atom_id {atom.atom_id!r} in the supplied atom vector; atom_site.id "
+                "must be globally unique (Section 6)",
+            )
+        seen_atom_ids.add(atom.atom_id)
+
+    atoms_in_model = tuple(atom for atom in atoms if atom.model == model)
+    if not atoms_in_model:
+        raise MaterializationInputError("EMPTY_SELECTION", "no atom rows are present in the resolved model M")
+
+    # ARCH-02 (corrections reconciliation 521500c): a (label_asym_id, CCD)
+    # disposition key whose CCD never occurs in M must have no effect on M
+    # (Section 7: "chave ausente em M não tem efeito"). The asym-level
+    # keep/remove aggregates used below for the *polymer* conflict check
+    # must therefore be built only from keys actually present in M - unlike
+    # `disposition_by_asym_ccd` itself, whose non-polymer lookups below are
+    # always keyed by a CCD drawn from an atom already known to be in M.
+    present_asym_ccd_pairs = {(atom.label_asym_id, atom.ccd) for atom in atoms_in_model}
+
     disposition_by_asym_ccd: Dict[Tuple[str, str], str] = {}
     disposition_keep_asyms: set = set()
     disposition_remove_asyms: set = set()
     for disposition in resolved_selection.resolved_component_dispositions:
         if disposition.disposition is None:
             continue
-        disposition_by_asym_ccd[(disposition.label_asym_id, disposition.ccd_code)] = disposition.disposition
+        key = (disposition.label_asym_id, disposition.ccd_code)
+        disposition_by_asym_ccd[key] = disposition.disposition
+        if key not in present_asym_ccd_pairs:
+            continue
         if disposition.disposition == "keep":
             disposition_keep_asyms.add(disposition.label_asym_id)
         else:
             disposition_remove_asyms.add(disposition.label_asym_id)
-
-    atoms_in_model = tuple(atom for atom in atoms if atom.model == model)
-    if not atoms_in_model:
-        raise MaterializationInputError("EMPTY_SELECTION", "no atom rows are present in the resolved model M")
 
     asym_entity_type: Dict[str, str] = {}
     asym_entity_id: Dict[str, str] = {}
@@ -958,7 +1149,26 @@ def build_materialization_plan(
                 f"({previous_type!r} and {atom.entity_type!r}) in M",
             )
         asym_entity_type[atom.label_asym_id] = atom.entity_type
-        asym_entity_id.setdefault(atom.label_asym_id, atom.entity_id)
+        # MINOR-1: an asym must bind to exactly one entity_id in M - the
+        # previous `setdefault` silently kept whichever entity_id was seen
+        # first and accepted any later contradiction.
+        previous_entity_id = asym_entity_id.get(atom.label_asym_id)
+        if previous_entity_id is not None and previous_entity_id != atom.entity_id:
+            raise MaterializationInputError(
+                "INVALID_ID",
+                f"label_asym_id {atom.label_asym_id!r} links to contradictory entity_id values "
+                f"({previous_entity_id!r} and {atom.entity_id!r}) in M",
+            )
+        asym_entity_id[atom.label_asym_id] = atom.entity_id
+
+    # MINOR-1: every asym named by S must actually resolve in M - a selected
+    # asym absent from M is never silently accepted as a no-op.
+    missing_selected = selected_set - set(asym_entity_type)
+    if missing_selected:
+        raise MaterializationInputError(
+            "INVALID_ID",
+            f"S names label_asym_id(s) {sorted(missing_selected)} that are not present in M",
+        )
 
     polymer_asyms = {asym for asym, kind in asym_entity_type.items() if kind == "polymer"}
     nonpolymer_asyms = {asym for asym, kind in asym_entity_type.items() if kind != "polymer"}
@@ -984,14 +1194,16 @@ def build_materialization_plan(
                 )
             polymer_retained[asym] = False
 
-    # --- the NFC-injective auth_asym_id index over polymer asyms, for O's
-    #     author_id_coincidence classification (Section 3/7, T021-013/037) ---
-    polymer_auth_tokens: List[str] = []
-    for asym in polymer_asyms:
-        for atom in atoms_in_model:
-            if atom.label_asym_id == asym and atom.auth_asym_id is not None:
-                polymer_auth_tokens.append(atom.auth_asym_id)
-    _build_nfc_injective_index(polymer_auth_tokens)  # raises on a genuine distinct-token collision
+    # --- MINOR-2 (corrections reconciliation 521500c): the NFC-injective
+    # correspondence must cover *every* auth_asym_id token involved in M's
+    # correspondence - water/ligand included, not only polymer tokens - so
+    # that a water auth id under NFD can never silently collide-and-merge
+    # with a polymer auth id under NFC (Section 6). The same literal token
+    # repeated across several distinct asyms remains legitimate (that is
+    # the ordinary "multiple" classification, T021-037) - only *distinct*
+    # raw tokens colliding under NFC are refused. ---
+    all_auth_tokens_in_m = {atom.auth_asym_id for atom in atoms_in_model if atom.auth_asym_id is not None}
+    _build_nfc_injective_index(all_auth_tokens_in_m)  # raises on a genuine distinct-token collision
     polymer_auth_index: Dict[str, List[Tuple[str, bool]]] = {}
     for asym in polymer_asyms:
         auth_values = {
@@ -1201,7 +1413,8 @@ class PolicyRecord(BaseModel):
     schema_version: Literal["1.0"] = "1.0"
     profile_version: Literal["1.0"] = "1.0"
     algorithm_version: Literal["1.0"] = "1.0"
-    catalogue_sha256: str = Field(min_length=64, max_length=64)
+    # MINOR-4: pinned exactly like PlanBinding.catalogue_sha256 above.
+    catalogue_sha256: Literal[CATALOGUE_SHA256] = CATALOGUE_SHA256
     engine: Engine
     policy_id: str = Field(min_length=64, max_length=64)
     sources: SourceContext
@@ -1219,7 +1432,7 @@ class PolicyRecord(BaseModel):
     declared_at: str
 
     @field_validator(
-        "catalogue_sha256", "policy_id", "source_context_key", "plan_key",
+        "policy_id", "source_context_key", "plan_key",
         "exclusions_key", "outside_key", "acknowledge_plan_key",
     )
     @classmethod
@@ -1259,6 +1472,24 @@ class PolicyRecord(BaseModel):
                 raise ValueError("acknowledge_outside_key must equal outside_key when O is non-empty")
         elif self.acknowledge_outside_key is not None:
             raise ValueError("acknowledge_outside_key must be null when O is empty")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_policy_id_matches_payload(self) -> "PolicyRecord":
+        """MAJOR-B (corrections reconciliation 521500c): `policy_id` is
+        never an arbitrary caller-supplied value - it must equal H() of
+        this record's own Section 13 payload (Section 13: policy_id
+        identifies the restricted payload; nothing derived "fixes" it)."""
+
+        expected = compute_policy_id(
+            plan_key=self.plan_key,
+            acknowledge_plan_key=self.acknowledge_plan_key,
+            acknowledge_exclusions_key=self.acknowledge_exclusions_key,
+            acknowledge_outside_key=self.acknowledge_outside_key,
+            declared_by=self.declared_by,
+        )
+        if self.policy_id != expected:
+            raise ValueError("policy_id does not match H() of its own declared payload")
         return self
 
 
@@ -1358,11 +1589,7 @@ def build_policy_record(
         declared_by=declared_by,
     )
 
-    effective_declared_at = declared_at
-    if existing is not None and existing.policy_id == policy_id:
-        effective_declared_at = existing.declared_at
-
-    return PolicyRecord(
+    candidate = PolicyRecord(
         catalogue_sha256=plan.catalogue_sha256,
         engine=plan.engine,
         policy_id=policy_id,
@@ -1378,8 +1605,32 @@ def build_policy_record(
         acknowledge_exclusions_key=acknowledge_exclusions_key,
         acknowledge_outside_key=acknowledge_outside_key,
         declared_by=declared_by,
-        declared_at=effective_declared_at,
+        declared_at=declared_at,
     )
+
+    if existing is None or existing.policy_id != candidate.policy_id:
+        return candidate
+
+    # MAJOR-B (corrections reconciliation 521500c): a matching policy_id
+    # alone never proves `existing` is a legitimate repeat - policy_id only
+    # hashes plan_key/acks/declared_by (Section 13), so every other
+    # semantic/derived field must still be verified equal before reuse
+    # (Section 13: "verificar integridade e equivalência"); only
+    # `declared_at` may differ. A mismatch is a typed configuration error,
+    # never a silent overwrite.
+    candidate_fields = candidate.model_dump(mode="json")
+    existing_fields = existing.model_dump(mode="json")
+    for field_name, candidate_value in candidate_fields.items():
+        if field_name == "declared_at":
+            continue
+        if existing_fields.get(field_name) != candidate_value:
+            raise MaterializationConfigurationError(
+                "SOURCE_CHANGED",
+                f"existing PolicyRecord field {field_name!r} does not match the value this "
+                "declaration would produce for the same policy_id; refusing to reuse a "
+                "tampered or divergent record",
+            )
+    return existing
 
 
 def compute_request_key(
