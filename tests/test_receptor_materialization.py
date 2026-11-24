@@ -1564,6 +1564,37 @@ def test_minor7_golden_atom_ids_key_preserves_given_order_independent_of_product
     assert compute_atom_ids_key(atoms) == _GOLDEN_ATOM_IDS_KEY_SHA256
 
 
+def test_atom_ids_key_preserves_given_order_against_ordinal_and_id_sorting():
+    """R-1 (final focal review edb8764b4d4ee56e49ff849b65b950e5e430fae0;
+    architect response 771ae24f6289e41a2f8c7e17906bf294925bd375): the
+    single-atom golden above stopped exercising order preservation at all
+    once the residual-corrections round replaced the original two-atom,
+    out-of-order vector with it - a concrete test regression, not a
+    production defect. This restores a genuine two-atom vector whose
+    *given* order ((ordinal=3,"a") then (ordinal=1,"Z")) differs from both
+    ordinal-ascending and ASCII-id-ascending sort order, so a mutant that
+    sorted by either key inside `compute_atom_ids_key` would be caught.
+    Both of those wrong orderings happen to coincide on the same
+    reordering here - (1,"Z") before (3,"a") - so the single reversed
+    literal below discriminates both mutants at once. Expected literals
+    are copied from the architect's documentary vector
+    (increments/021/28-checkpoint1-r1-test-correction/evidence/
+    R1_ORDER_GOLDEN_VECTOR.json), never computed by calling production."""
+
+    given_order_bytes = b'{"atoms":[{"id":"a","ordinal":3},{"id":"Z","ordinal":1}],"kind":"receptor-materialization-atom-ids","version":"1.0"}'
+    _assert_hand_bytes_hash_to_literal(given_order_bytes, "96fd3eacd89d16753dbdc5ec22bb79db0740e9f355e6322cb0c4641bc0f3106a")
+    reversed_order_bytes = b'{"atoms":[{"id":"Z","ordinal":1},{"id":"a","ordinal":3}],"kind":"receptor-materialization-atom-ids","version":"1.0"}'
+    _assert_hand_bytes_hash_to_literal(reversed_order_bytes, "bf820fe14730b4b8ede9d8e007e4c3d32f71def5d8a4747c657d6d76dac562d1")
+
+    given_order = (_atom(ordinal=3, atom_id="a"), _atom(ordinal=1, atom_id="Z"))
+    assert compute_atom_ids_key(given_order) == "96fd3eacd89d16753dbdc5ec22bb79db0740e9f355e6322cb0c4641bc0f3106a"
+
+    # A mutant sorting by ordinal, or by atom_id, would both produce this
+    # same wrong digest instead - never the literal above.
+    reversed_order = (_atom(ordinal=1, atom_id="Z"), _atom(ordinal=3, atom_id="a"))
+    assert compute_atom_ids_key(reversed_order) == "bf820fe14730b4b8ede9d8e007e4c3d32f71def5d8a4747c657d6d76dac562d1"
+
+
 def test_minor7_golden_exclusions_key_envelope():
     xentry = XEntry(model=1, label_asym_id="B", entity_id="E2", atom_count=1, atom_ids_key=_GOLDEN_ATOM_IDS_KEY_SHA256)
     assert compute_exclusions_key(source_context_key=_GOLDEN_SOURCE_CONTEXT_KEY, model=1, entries=(xentry,)) == _GOLDEN_EXCLUSIONS_KEY_SHA256
