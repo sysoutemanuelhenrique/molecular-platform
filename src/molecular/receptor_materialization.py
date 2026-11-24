@@ -79,6 +79,14 @@ CATALOGUE_SHA256 = "8561039fd15137811b60316336dff04539df3732710dca6ec4009f23150d
 ENGINE_NAME = "gemmi"
 ENGINE_VERSION = "0.7.5"
 
+# MAJOR-A residual (reconciliation 155661115851c2a5fb70f5d905425baeb4d23c9f):
+# the same declared-format label aliasing the 020 baseline already applies
+# (receptor_inspection.py's `_DECLARED_FORMAT_ALIASES`, `raw_format_declared.
+# strip().lower()`) - projected here, not imported, so this module never
+# loads receptor_inspection at runtime (ARCH-01). This alias rule is for
+# format *labels* only, never for scientific tokens/ids/checksums.
+_DECLARED_FORMAT_ALIASES = {"cif": "mmcif", "mmcif": "mmcif", "pdb": "pdb", "ent": "pdb"}
+
 # The 94 canonical category names of the pinned catalogue (CATALOGUE_SHA256
 # above) plus the three explicitly approved omission-family prefixes
 # (Section 11: "_pdbx_validate_, _pdbx_nmr_ e _em_"). MINOR-3: a
@@ -111,7 +119,14 @@ _CATALOGUE_CATEGORY_NAMES = frozenset(
         "_symmetry", "_symmetry_equiv",
     }
 )
-_CATALOGUE_OMISSION_PREFIXES: Tuple[str, ...] = ("_pdbx_validate_", "_pdbx_nmr_", "_em_")
+# MINOR-3 residual (reconciliation 155661115851c2a5fb70f5d905425baeb4d23c9f):
+# a delimited category-name grammar for the three approved omission
+# families - lowercase/digits/underscore only, after the prefix, with at
+# least one such character. `re.fullmatch` (never `startswith` alone, never
+# a `$`-anchored pattern that would admit a trailing LF) rejects a bare
+# prefix, an item name (contains '.'), whitespace/control characters and
+# uppercase. This is not a general CIF category parser.
+_CATALOGUE_OMISSION_FAMILY_PATTERN = re.compile(r"(?:_pdbx_validate_|_pdbx_nmr_|_em_)[a-z0-9_]+")
 
 _HEX64_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _TIME_UTC_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$")
@@ -510,6 +525,34 @@ def build_source_context(
             f"with the inspection's {inspection_report.structure_format!r}",
         )
 
+    # MAJOR-A residual: cross-check the acquisition's own declared format
+    # label and the inspection's `raw_format_declared` - neither was
+    # compared before. Both are normalized via the 020 alias rule
+    # (strip().lower() + the same four-entry map); an unrecognized label on
+    # either side, or a recognized-but-contradictory pair between them or
+    # against the detected canonical mmcif, is a configuration error. The
+    # `declared-format-mismatch` warning the 020 inspection may already
+    # carry is never read as authorization to materialize with
+    # contradictory provenance - nothing here is rewritten or reclassified.
+    acquisition_format = _DECLARED_FORMAT_ALIASES.get(
+        protein_input.acquisition.raw_artifact.format.strip().lower()
+    )
+    declared_format = _DECLARED_FORMAT_ALIASES.get(
+        inspection_report.raw_format_declared.strip().lower()
+    )
+    if (
+        acquisition_format is None
+        or declared_format is None
+        or acquisition_format != declared_format
+        or acquisition_format != "mmcif"
+    ):
+        raise MaterializationConfigurationError(
+            "INVALID_RECORD",
+            f"acquisition format {protein_input.acquisition.raw_artifact.format!r} and declared "
+            f"format {inspection_report.raw_format_declared!r} must both be recognized aliases of "
+            "the detected canonical 'mmcif', and must agree with each other",
+        )
+
     if inspection_report.selection_capability != "full":
         raise MaterializationConfigurationError(
             "INCOMPLETE_INSPECTION",
@@ -876,18 +919,30 @@ class CategoryDecision(BaseModel):
         # with action="omit". An arbitrary or non-catalogue name is refused
         # even though CP1 never reads the catalogue file itself.
         if self.category not in _CATALOGUE_CATEGORY_NAMES:
-            if not any(self.category.startswith(prefix) for prefix in _CATALOGUE_OMISSION_PREFIXES):
+            # MINOR-3 residual: a delimited fullmatch grammar, never a bare
+            # `startswith` - rejects a bare prefix, an item name ("_em_
+            # entity.id"), embedded whitespace/LF, and uppercase, none of
+            # which `startswith(prefix)` alone would have refused.
+            if not _CATALOGUE_OMISSION_FAMILY_PATTERN.fullmatch(self.category):
                 raise ValueError(
                     f"category {self.category!r} is neither a canonical catalogue category "
-                    "nor an approved omission-family prefix"
+                    "nor an approved omission-family name (fullmatch "
+                    f"{_CATALOGUE_OMISSION_FAMILY_PATTERN.pattern!r})"
                 )
             if self.action != "omit":
                 raise ValueError(
-                    f"category {self.category!r} matches an approved omission-family prefix, "
+                    f"category {self.category!r} matches an approved omission-family name, "
                     "which is only ever valid with action='omit'"
                 )
 
-        # MINOR-3: ordinals are real, non-negative source positions.
+        # MINOR-3 residual: ordinals are real, non-negative source positions,
+        # unique *within* each tuple (not only disjoint *between* the two
+        # tuples) - (0, 0) previously passed because only the cross-tuple
+        # overlap was checked.
+        if len(set(self.kept_row_ordinals)) != len(self.kept_row_ordinals):
+            raise ValueError("kept_row_ordinals must not contain a duplicate ordinal")
+        if len(set(self.omitted_row_ordinals)) != len(self.omitted_row_ordinals):
+            raise ValueError("omitted_row_ordinals must not contain a duplicate ordinal")
         if any(ordinal < 0 for ordinal in self.kept_row_ordinals) or any(
             ordinal < 0 for ordinal in self.omitted_row_ordinals
         ):

@@ -40,16 +40,28 @@ from molecular.receptor_materialization import (
     MaterializationInputError,
     MaterializationPlan,
     OccurrenceIdentity,
+    OutsideEntry,
     PlanBinding,
     PolicyRecord,
     RecordSnapshot,
+    SourceContext,
+    XEntry,
+    _compute_legacy_inspection_id,
     build_materialization_plan,
     build_policy_record,
     build_source_context,
+    compute_atom_decisions_key,
+    compute_atom_ids_key,
+    compute_category_decisions_key,
+    compute_connection_decisions_key,
+    compute_exclusions_key,
     compute_materialization_hash,
     compute_occurrence_key,
+    compute_outside_key,
+    compute_plan_key,
     compute_policy_id,
     compute_request_key,
+    compute_source_context_key,
     validate_time_utc,
 )
 from molecular.receptor_resolution import (
@@ -313,6 +325,63 @@ def test_major_a_policy_protein_input_id_divergent_rejected():
     with pytest.raises(MaterializationConfigurationError) as exc_info:
         _source_context(policy=_policy(protein_input_id="other-protein"))
     assert exc_info.value.code == "IDENTITY_MISMATCH"
+
+
+# --- MAJOR-A residual (reconciliation 155661115851c2a5fb70f5d905425baeb4d23c9f):
+# acquisition/declared/detected format cross-check, with the 020 alias map.
+
+
+def _source_context_with_formats(acquisition_format: str, declared_format: str):
+    return _source_context(
+        protein_input=_protein_input(
+            acquisition=AcquisitionRecord(
+                method="uploaded", acquired_at=datetime.now(timezone.utc),
+                raw_artifact=RawArtifact(path="x", format=acquisition_format, checksum=RAW_SHA),
+            )
+        ),
+        inspection_report=_inspection_report(raw_format_declared=declared_format),
+    )
+
+
+def test_major_a_residual_pdb_acquisition_and_declared_with_mmcif_detected_rejected():
+    # The 020 inspection's own declared-format-mismatch warning (detected
+    # mmcif vs declared pdb) is never read as authorization to materialize
+    # with contradictory provenance.
+    with pytest.raises(MaterializationConfigurationError) as exc_info:
+        _source_context_with_formats(acquisition_format="pdb", declared_format="pdb")
+    assert exc_info.value.code == "INVALID_RECORD"
+
+
+def test_major_a_residual_acquisition_and_declared_format_disagree_rejected():
+    with pytest.raises(MaterializationConfigurationError) as exc_info:
+        _source_context_with_formats(acquisition_format="mmcif", declared_format="pdb")
+    assert exc_info.value.code == "INVALID_RECORD"
+    with pytest.raises(MaterializationConfigurationError):  # reverse direction
+        _source_context_with_formats(acquisition_format="pdb", declared_format="mmcif")
+
+
+def test_major_a_residual_unknown_format_label_rejected_on_either_side():
+    with pytest.raises(MaterializationConfigurationError) as exc_info:
+        _source_context_with_formats(acquisition_format="xyz", declared_format="xyz")
+    assert exc_info.value.code == "INVALID_RECORD"
+    with pytest.raises(MaterializationConfigurationError):  # unknown only on the declared side
+        _source_context_with_formats(acquisition_format="mmcif", declared_format="xyz")
+
+
+def test_major_a_residual_020_aliases_accepted_both_directions():
+    # cif -> mmcif is the 020 alias; both directions must be accepted, and
+    # the 020 strip().lower() normalization of the label itself is honored.
+    sc1 = _source_context_with_formats(acquisition_format="cif", declared_format="mmcif")
+    assert sc1.raw_format == "mmcif"
+    sc2 = _source_context_with_formats(acquisition_format="mmcif", declared_format="cif")
+    assert sc2.raw_format == "mmcif"
+    sc3 = _source_context_with_formats(acquisition_format="  MMCIF  ", declared_format="CIF")
+    assert sc3.raw_format == "mmcif"
+
+
+def test_major_a_residual_coherent_mmcif_control_accepted():
+    sc = _source_context_with_formats(acquisition_format="mmcif", declared_format="mmcif")
+    assert sc.raw_format == "mmcif"
 
 
 # --- T021-009-011: model/assembly/empty-selection guards ------------------
@@ -1244,6 +1313,51 @@ def test_minor3_row_ordinals_without_source_rows_key_rejected():
         CategoryDecision(category="_entry", action="generate", generated_tags=("id",), kept_row_ordinals=(0,))
 
 
+# --- MINOR-3 residual (reconciliation 155661115851c2a5fb70f5d905425baeb4d23c9f):
+# intra-tuple ordinal uniqueness and the delimited family-name grammar.
+
+
+def test_minor3_residual_duplicate_ordinal_within_the_same_tuple_rejected():
+    with pytest.raises(ValidationError):
+        CategoryDecision(category="_struct_conf", action="filter", kept_row_ordinals=(0, 0), source_rows_key=_hex(30))
+    with pytest.raises(ValidationError):
+        CategoryDecision(category="_struct_conf", action="omit", omitted_row_ordinals=(0, 0), source_rows_key=_hex(31))
+    # the pre-existing cross-tuple overlap and type/negative controls remain in force.
+    with pytest.raises(ValidationError):
+        CategoryDecision(category="_struct_conf", action="filter", kept_row_ordinals=(0,), omitted_row_ordinals=(0,), source_rows_key=_hex(32))
+    with pytest.raises(ValidationError):
+        CategoryDecision(category="_struct_conf", action="filter", kept_row_ordinals=(-1,), source_rows_key=_hex(33))
+    valid = CategoryDecision(category="_struct_conf", action="filter", kept_row_ordinals=(0, 1), source_rows_key=_hex(34))
+    assert valid.kept_row_ordinals == (0, 1)
+
+
+def test_minor3_residual_malformed_omission_family_names_rejected():
+    for malformed_category in (
+        "_em_example\n",       # bare prefix family name followed by a trailing LF
+        "_em_",                 # bare prefix, no category characters at all
+        "_pdbx_nmr_ x",         # embedded space
+        "_em_entity.id",        # an item name (contains '.'), not a category name
+        "_EM_EXAMPLE",          # uppercase
+        "_pdbx_validate_\x00x",  # control character
+    ):
+        with pytest.raises(ValidationError):
+            CategoryDecision(category=malformed_category, action="omit", source_rows_key=_hex(35))
+
+
+def test_minor3_residual_valid_omission_family_names_in_all_three_families_accepted():
+    for category in ("_em_example", "_pdbx_nmr_example", "_pdbx_validate_close_contact", "_pdbx_validate_torsion_2"):
+        decision = CategoryDecision(category=category, action="omit", source_rows_key=_hex(36))
+        assert decision.category == category
+    # controls that must remain valid: omit with empty arrays + source,
+    # filter with a generated tag, generate without a source (null allowed).
+    omit_control = CategoryDecision(category="_struct_conf", action="omit", source_rows_key=_hex(37))
+    assert omit_control.source_rows_key == _hex(37)
+    filter_control = CategoryDecision(category="_cell", action="filter", preserved_tags=("length_a",), generated_tags=("entry_id",), source_rows_key=_hex(38))
+    assert filter_control.generated_tags == ("entry_id",)
+    generate_control = CategoryDecision(category="_entry", action="generate", generated_tags=("id",))
+    assert generate_control.source_rows_key is None
+
+
 # --- MINOR-4 (corrections 521500c): catalogue pinned in PlanBinding and
 # PolicyRecord; version/engine/decision sensitivity. ------------------------
 
@@ -1350,72 +1464,182 @@ def test_minor6_valid_codes_still_preserve_code_and_phase():
     assert config_error.code == "ENGINE_VERSION" and config_error.phase == "metadata"
 
 
-# --- MINOR-7 (corrections 521500c): independent, hand-computed golden
-# bytes for canonicalization and the hash envelopes - never the production
-# function used to produce its own expected value. -------------------------
+# --- MINOR-7 residual (corrections 521500c + residual reconciliation
+# 155661115851c2a5fb70f5d905425baeb4d23c9f): independent *literal* SHA-256
+# digests for all 13 documentary vectors named in
+# increments/021/24-checkpoint1-residual-reconciliation/evidence/
+# DOCUMENTARY_GOLDEN_VECTORS.json, copied inline here (no fixture file, no
+# governance read at test time, per the task's explicit instruction). Each
+# literal is asserted against hashlib(canonical bytes) as an internal
+# consistency check, and separately against the real production entry
+# point - never against a value computed by production itself. ------------
+
+_GOLDEN_CANONICAL_JSON_SHA256 = "14332640256b6a761e453eb0beba1ba7cb1c005ab6d7c01a8eb51dfbe0cc4994"
+_GOLDEN_LEGACY_INSPECTION_ID_SHA256 = "1c217d99e7b2b09d9c31a0c8f9daf056c48aa916bdf957cae83df449ad68e80c"
+_GOLDEN_SOURCE_CONTEXT_KEY_SHA256 = "783c1d30f99898be83fef40c069294d9219c25db45218474c1fabad7a14520df"
+_GOLDEN_OCCURRENCE_KEY_SHA256 = "022d3a1316ffa9b93217161e5e004eef03c3bf500184d06042134bd016269a4e"
+_GOLDEN_ATOM_IDS_KEY_SHA256 = "1696038f38afba311d8944dc19e698f2bcbeb2453bd3fb0c5a32b4ccd29445a8"
+_GOLDEN_EXCLUSIONS_KEY_SHA256 = "01c461514e8a9915d3fd9feadd2565d11ced78dafb04bc61ba9151d9aa2fe06d"
+_GOLDEN_OUTSIDE_KEY_SHA256 = "cafba614ae1dbc9c41f7e727926198d995d9ae3611e09664d7957b407c739e32"
+_GOLDEN_ATOM_DECISIONS_KEY_SHA256 = "cc0fb129f56d061a165e94774d323be510a46fa7f22a1cd816734bb0c5849850"
+_GOLDEN_CONNECTION_DECISIONS_KEY_SHA256 = "67c0c45369f339bdebbbf2fbc1ee26e20f699f9fe2b93f2edf88c68e3ed85889"
+_GOLDEN_CATEGORY_DECISIONS_KEY_SHA256 = "7fc88d1a1d5deec637359849766c989e04832753ce943bb7a9bdccdfd03661df"
+_GOLDEN_PLAN_KEY_SHA256 = "00b8734e5e21f85208f9578ef62ffb6e8cf077dc26b771443186bb049805e2da"
+_GOLDEN_POLICY_ID_SHA256 = "3bd864722608e2a83ecf71627cd0400380d0ad0828016bb8705c2cd62aae8d02"
+_GOLDEN_REQUEST_KEY_SHA256 = "5b1de4a13571f147a84520042b4830235e7b4a611ab7b6b1b972c60027510095"
+_GOLDEN_SOURCE_CONTEXT_KEY = _GOLDEN_SOURCE_CONTEXT_KEY_SHA256
+
+
+def _assert_hand_bytes_hash_to_literal(hand_written_bytes: bytes, literal: str) -> None:
+    import hashlib
+
+    assert hashlib.sha256(hand_written_bytes).hexdigest() == literal
 
 
 def test_minor7_golden_canonical_json_bytes_independent_of_production():
-    import hashlib
-
-    payload = {"version": "1.0", "kind": "k", "s": "éÅ", "l": [2, 1], "n": None, "b": True}
     hand_written_bytes = '{"b":true,"kind":"k","l":[2,1],"n":null,"s":"éÅ","version":"1.0"}'.encode("utf-8")
-    hand_sha256 = hashlib.sha256(hand_written_bytes).hexdigest()
-    assert hand_sha256 == compute_materialization_hash(payload)
+    _assert_hand_bytes_hash_to_literal(hand_written_bytes, _GOLDEN_CANONICAL_JSON_SHA256)
+    payload = {"version": "1.0", "kind": "k", "s": "éÅ", "l": [2, 1], "n": None, "b": True}
+    assert compute_materialization_hash(payload) == _GOLDEN_CANONICAL_JSON_SHA256
 
 
-def test_minor7_golden_atom_ids_key_preserves_given_order_independent_of_production():
-    import hashlib
+def test_minor7_golden_legacy_inspection_id_calls_the_new_helper_against_independent_literal():
+    """MINOR-7 residual: the superseded version of this test compared the
+    OLD 020 helper (`receptor_inspection.compute_inspection_id`) against a
+    module constant (`INSPECTION_ID`) also computed by calling that same
+    old helper - a tautology that never exercised the NEW pure helper
+    (`_compute_legacy_inspection_id`) at all. This version calls the new
+    helper directly with the documented vector inputs and compares it to
+    an independent literal computed with no production code; the old
+    helper is then compared only as an additional, optional control."""
 
-    from molecular.receptor_materialization import compute_atom_ids_key
-
-    atoms = (
-        _atom(ordinal=3, atom_id="Z"),
-        _atom(ordinal=1, atom_id="a"),
-    )
-    hand_written_bytes = (
-        b'{"atoms":[{"id":"Z","ordinal":3},{"id":"a","ordinal":1}],'
-        b'"kind":"receptor-materialization-atom-ids","version":"1.0"}'
-    )
-    assert hashlib.sha256(hand_written_bytes).hexdigest() == compute_atom_ids_key(atoms)
-
-
-def test_minor7_golden_occurrence_key_envelope_independent_of_production():
-    import hashlib
-
-    identity = OccurrenceIdentity(model=1, label_asym_id="A", entity_id="E", ccd="ALA", label_seq_id="1")
-    hand_written_bytes = (
-        b'{"identity":{"auth_asym_id":null,"auth_seq_id":null,"ccd":"ALA","entity_id":"E",'
-        b'"insertion_token":null,"label_asym_id":"A","label_seq_id":"1","model":1},'
-        b'"kind":"receptor-materialization-occurrence","version":"1.0"}'
-    )
-    assert hashlib.sha256(hand_written_bytes).hexdigest() == compute_occurrence_key(identity)
-
-
-def test_minor7_golden_empty_connection_decisions_key_envelope_independent_of_production():
-    import hashlib
-
-    from molecular.receptor_materialization import compute_connection_decisions_key
-
-    source_context_key = "0" * 64
-    hand_written_bytes = (
-        b'{"decisions":[],"kind":"receptor-materialization-connection-decisions",'
-        b'"source_context_key":"' + b"0" * 64 + b'","version":"1.0"}'
-    )
-    assert hashlib.sha256(hand_written_bytes).hexdigest() == compute_connection_decisions_key(
-        source_context_key=source_context_key
-    )
-
-
-def test_minor7_golden_legacy_inspection_id_matches_the_020_production_helper():
-    """Confirms the ARCH-01 pure reimplementation of the legacy seven-field
-    payload (`_compute_legacy_inspection_id`, exercised indirectly through
-    `build_source_context`) is byte-identical to `receptor_inspection.
-    compute_inspection_id` for the same inputs - the backend/algorithm was
-    never changed, only its import boundary."""
-
-    legacy = compute_inspection_id(
+    new_helper_result = _compute_legacy_inspection_id(
         parser_name="gemmi", parser_version="0.7.5", protein_input_id="protein-1",
         raw_checksum="a" * 64, raw_format="mmcif",
     )
-    assert legacy == INSPECTION_ID
+    assert new_helper_result == _GOLDEN_LEGACY_INSPECTION_ID_SHA256
+
+    old_helper_result = compute_inspection_id(
+        parser_name="gemmi", parser_version="0.7.5", protein_input_id="protein-1",
+        raw_checksum="a" * 64, raw_format="mmcif",
+    )
+    assert old_helper_result == _GOLDEN_LEGACY_INSPECTION_ID_SHA256
+
+
+def _golden_source_context() -> SourceContext:
+    return SourceContext(
+        protein_input_id="protein-1", selection_id="sel-1",
+        inspection_id="2b367d0134006b35c4f878984e6b0cc613f5a27db5e00bc20b42044381b1b3f6", model=1,
+        records=(
+            RecordSnapshot(kind="protein", id="protein-1", sha256="1bffa22ef057ae13d72de8812a363194cd35c0fa1b136bd24faa37b322a843b1", size_bytes=66, schema_version=None),
+            RecordSnapshot(kind="inspection", id="2b367d0134006b35c4f878984e6b0cc613f5a27db5e00bc20b42044381b1b3f6", sha256="64b982b230587eb5983408d68105abd62c45c879830f53754232694639230d83", size_bytes=124, schema_version="1.0"),
+            RecordSnapshot(kind="selection", id="sel-1", sha256="409ea1325548b16b3de5ef6312e43cf70d247a3a30565a5612e01fa2c08a3ba5", size_bytes=64, schema_version="1.0"),
+            RecordSnapshot(kind="resolution", id="sel-1", sha256="02fb0364edff743c45709d19f707afd25e242f569109b951992b16abbcbbcf3d", size_bytes=65, schema_version="1.0"),
+        ),
+        raw_sha256="d020364a30da702323fe02b6b5d10f1861dbb7c6817c61b34a2648037b3b5927", raw_size_bytes=61,
+        raw_format="mmcif", inspection_schema="1.0", inspection_profile="1.0",
+        parser=Engine(name="gemmi", version="0.7.5"),
+    )
+
+
+def test_minor7_golden_source_context_key_envelope():
+    assert compute_source_context_key(_golden_source_context()) == _GOLDEN_SOURCE_CONTEXT_KEY_SHA256
+
+
+def test_minor7_golden_occurrence_key_envelope_independent_of_production():
+    hand_written_bytes = (
+        b'{"identity":{"auth_asym_id":"W","auth_seq_id":"17","ccd":"HOH","entity_id":"EW",'
+        b'"insertion_token":null,"label_asym_id":"W","label_seq_id":null,"model":1},'
+        b'"kind":"receptor-materialization-occurrence","version":"1.0"}'
+    )
+    _assert_hand_bytes_hash_to_literal(hand_written_bytes, _GOLDEN_OCCURRENCE_KEY_SHA256)
+    identity = OccurrenceIdentity(model=1, label_asym_id="W", entity_id="EW", ccd="HOH", label_seq_id=None, auth_asym_id="W", auth_seq_id="17", insertion_token=None)
+    assert compute_occurrence_key(identity) == _GOLDEN_OCCURRENCE_KEY_SHA256
+
+
+def test_minor7_golden_atom_ids_key_preserves_given_order_independent_of_production():
+    hand_written_bytes = b'{"atoms":[{"id":"b1","ordinal":1}],"kind":"receptor-materialization-atom-ids","version":"1.0"}'
+    _assert_hand_bytes_hash_to_literal(hand_written_bytes, _GOLDEN_ATOM_IDS_KEY_SHA256)
+    atoms = (_atom(ordinal=1, atom_id="b1"),)
+    assert compute_atom_ids_key(atoms) == _GOLDEN_ATOM_IDS_KEY_SHA256
+
+
+def test_minor7_golden_exclusions_key_envelope():
+    xentry = XEntry(model=1, label_asym_id="B", entity_id="E2", atom_count=1, atom_ids_key=_GOLDEN_ATOM_IDS_KEY_SHA256)
+    assert compute_exclusions_key(source_context_key=_GOLDEN_SOURCE_CONTEXT_KEY, model=1, entries=(xentry,)) == _GOLDEN_EXCLUSIONS_KEY_SHA256
+
+
+def test_minor7_golden_outside_key_envelope():
+    identity = OccurrenceIdentity(model=1, label_asym_id="W", entity_id="EW", ccd="HOH", label_seq_id=None, auth_asym_id="W", auth_seq_id="17", insertion_token=None)
+    oentry = OutsideEntry(
+        identity=identity, occurrence_key=_GOLDEN_OCCURRENCE_KEY_SHA256, decision_source="unaddressed-preserve",
+        atom_count=1, atom_ids_key="8eeed5d55f10287690bf61adfaffbec360b1dd75af6cb380872e1c3c7fd1eb13",
+        author_id_coincidence="none",
+    )
+    assert compute_outside_key(source_context_key=_GOLDEN_SOURCE_CONTEXT_KEY, model=1, entries=(oentry,)) == _GOLDEN_OUTSIDE_KEY_SHA256
+
+
+def test_minor7_golden_atom_decisions_key_envelope():
+    decisions = (
+        AtomDecision(ordinal=0, atom_id="a1", occurrence_key="c7be110af90a4a6028070621a83de375e8fc75c67f16d67f7df84115e66e147d", retained=True, reason="selected-asym"),
+        AtomDecision(ordinal=1, atom_id="b1", occurrence_key="c130a69653371b5fd775a994dc3fde9e2f892a147478289054f8cc1b5367bd57", retained=False, reason="chain-complement"),
+        AtomDecision(ordinal=2, atom_id="w1", occurrence_key=_GOLDEN_OCCURRENCE_KEY_SHA256, retained=True, reason="unaddressed-preserve"),
+    )
+    assert compute_atom_decisions_key(source_context_key=_GOLDEN_SOURCE_CONTEXT_KEY, decisions=decisions) == _GOLDEN_ATOM_DECISIONS_KEY_SHA256
+
+
+def test_minor7_golden_empty_connection_decisions_key_envelope_independent_of_production():
+    hand_written_bytes = (
+        b'{"decisions":[],"kind":"receptor-materialization-connection-decisions",'
+        b'"source_context_key":"' + _GOLDEN_SOURCE_CONTEXT_KEY.encode() + b'","version":"1.0"}'
+    )
+    _assert_hand_bytes_hash_to_literal(hand_written_bytes, _GOLDEN_CONNECTION_DECISIONS_KEY_SHA256)
+    assert compute_connection_decisions_key(source_context_key=_GOLDEN_SOURCE_CONTEXT_KEY) == _GOLDEN_CONNECTION_DECISIONS_KEY_SHA256
+
+
+def test_minor7_golden_category_decisions_key_envelope():
+    decision = CategoryDecision(
+        category="_atom_site", action="filter", kept_row_ordinals=(0, 2), omitted_row_ordinals=(1,),
+        preserved_tags=("id",), omitted_tags=(), generated_tags=(),
+        source_rows_key="69d7a6a8fe0baba92f59dad6a6930ea5e9ad78ce6372833af7cfe1a4a073c2a6",
+    )
+    assert compute_category_decisions_key(source_context_key=_GOLDEN_SOURCE_CONTEXT_KEY, decisions=(decision,)) == _GOLDEN_CATEGORY_DECISIONS_KEY_SHA256
+
+
+def test_minor7_golden_plan_key_envelope():
+    xentry = XEntry(model=1, label_asym_id="B", entity_id="E2", atom_count=1, atom_ids_key=_GOLDEN_ATOM_IDS_KEY_SHA256)
+    identity = OccurrenceIdentity(model=1, label_asym_id="W", entity_id="EW", ccd="HOH", label_seq_id=None, auth_asym_id="W", auth_seq_id="17", insertion_token=None)
+    oentry = OutsideEntry(
+        identity=identity, occurrence_key=_GOLDEN_OCCURRENCE_KEY_SHA256, decision_source="unaddressed-preserve",
+        atom_count=1, atom_ids_key="8eeed5d55f10287690bf61adfaffbec360b1dd75af6cb380872e1c3c7fd1eb13",
+        author_id_coincidence="none",
+    )
+    plan = PlanBinding(
+        catalogue_sha256=CATALOGUE_SHA256, engine=Engine(name="gemmi", version="0.7.5"), sources=_golden_source_context(),
+        source_context_key=_GOLDEN_SOURCE_CONTEXT_KEY, selected_asym_ids=("A",), unaddressed_components="preserve",
+        exclusions=(xentry,), outside=(oentry,),
+        exclusions_key=_GOLDEN_EXCLUSIONS_KEY_SHA256, outside_key=_GOLDEN_OUTSIDE_KEY_SHA256,
+        atom_decisions_key=_GOLDEN_ATOM_DECISIONS_KEY_SHA256, connection_decisions_key=_GOLDEN_CONNECTION_DECISIONS_KEY_SHA256,
+        category_decisions_key=_GOLDEN_CATEGORY_DECISIONS_KEY_SHA256, unavailable_categories=(),
+        warnings=("outside-selected-asym-retained",),
+    )
+    assert compute_plan_key(plan) == _GOLDEN_PLAN_KEY_SHA256
+
+
+def test_minor7_golden_policy_id_envelope():
+    result = compute_policy_id(
+        plan_key=_GOLDEN_PLAN_KEY_SHA256, acknowledge_plan_key=_GOLDEN_PLAN_KEY_SHA256,
+        acknowledge_exclusions_key=_GOLDEN_EXCLUSIONS_KEY_SHA256, acknowledge_outside_key=_GOLDEN_OUTSIDE_KEY_SHA256,
+        declared_by="documentary scientist",
+    )
+    assert result == _GOLDEN_POLICY_ID_SHA256
+
+
+def test_minor7_golden_request_key_envelope():
+    result = compute_request_key(
+        policy_id=_GOLDEN_POLICY_ID_SHA256, policy_file_sha256="9111f3e2210af7359155992b55b689f67f77a195e29e6a979c28a55e679a1d63",
+        source_context_key=_GOLDEN_SOURCE_CONTEXT_KEY, plan_key=_GOLDEN_PLAN_KEY_SHA256,
+        profile="1.0", algorithm="1.0", catalogue_sha256=CATALOGUE_SHA256, engine=Engine(name="gemmi", version="0.7.5"),
+        application_version="0.0.0-documentary",
+    )
+    assert result == _GOLDEN_REQUEST_KEY_SHA256
