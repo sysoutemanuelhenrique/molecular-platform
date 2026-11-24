@@ -762,6 +762,13 @@ def test_declared_by_blank_or_control_chars_rejected_unicode_preserved():  # T02
         build_policy_record(materialization_plan=plan, acknowledge_plan_key=plan.plan_key, acknowledge_exclusions_key=None, acknowledge_outside_key=None, declared_by="   ", declared_at=TS)
     with pytest.raises(ValidationError):
         build_policy_record(materialization_plan=plan, acknowledge_plan_key=plan.plan_key, acknowledge_exclusions_key=None, acknowledge_outside_key=None, declared_by="bad\x00name", declared_at=TS)
+    # strict=True rejects bytes outright for declared_by - exercised directly
+    # at the DTO boundary (reviewer T021-029 note); build_policy_record's own
+    # compute_policy_id hashes declared_by before the DTO is constructed, so
+    # a raw TypeError from json.dumps - not ValidationError - is what a bytes
+    # value hitting that function first actually raises.
+    with pytest.raises(TypeError):
+        build_policy_record(materialization_plan=plan, acknowledge_plan_key=plan.plan_key, acknowledge_exclusions_key=None, acknowledge_outside_key=None, declared_by=b"bytes-name", declared_at=TS)
     record = build_policy_record(materialization_plan=plan, acknowledge_plan_key=plan.plan_key, acknowledge_exclusions_key=None, acknowledge_outside_key=None, declared_by="Cientista Ü", declared_at=TS)
     assert record.declared_by == "Cientista Ü"
 
@@ -1275,6 +1282,22 @@ def test_minor4_engine_and_profile_divergence_rejected_by_closed_literals():
         PlanBinding(**{**{field: getattr(plan, field) for field in PlanBinding.model_fields}, "profile": "2.0"})
     with pytest.raises(ValidationError):
         PlanBinding(**{**{field: getattr(plan, field) for field in PlanBinding.model_fields}, "algorithm": "2.0"})
+
+
+def test_minor4_request_key_envelope_is_sensitive_to_profile_algorithm_catalogue_and_engine():
+    # T021-035/160 (MINOR-4): request_key's own envelope must change when
+    # profile/algorithm/catalogue/engine change, not only policy_file_sha256
+    # and application_version.
+    base = dict(
+        policy_id=_hex(20), policy_file_sha256=_hex(21), source_context_key=_hex(22), plan_key=_hex(23),
+        profile="1.0", algorithm="1.0", catalogue_sha256=CATALOGUE_SHA256, engine=Engine(),
+        application_version="1.0.0",
+    )
+    baseline_key = compute_request_key(**base)
+    assert compute_request_key(**{**base, "profile": "9.9"}) != baseline_key
+    assert compute_request_key(**{**base, "algorithm": "9.9"}) != baseline_key
+    assert compute_request_key(**{**base, "catalogue_sha256": _hex(999)}) != baseline_key
+    assert compute_request_key(**{**base, "engine": Engine.model_construct(name="other", version="9.9")}) != baseline_key
 
 
 # --- MINOR-5 (corrections 521500c): a non-mmCIF inspection is a record
