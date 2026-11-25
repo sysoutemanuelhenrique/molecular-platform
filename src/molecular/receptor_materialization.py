@@ -3567,13 +3567,19 @@ def _validate_simple_references(
     *other* columns complete the composite key, never guessed
     generically from the expression text.
 
-    `_pdbx_struct_mod_residue.parent_comp_id` is excluded outright: real
-    depositions name the *standard, unmodeled* parent residue there (e.g.
-    `parent_comp_id="MET"` for an `MSE` selenomethionine actually present)
-    - `_chem_comp` legitimately never carries a row for a CCD that was
-    never physically instantiated. The reference still *enters the CCD
-    closure* for `_chem_comp` filtering purposes (Section 11) - a
-    documentary/descriptive reference, not a dangling-pointer defect."""
+    `_pdbx_struct_mod_residue.parent_comp_id` is excluded from this
+    blanket per-row check - but NOT exempted from referential integrity
+    outright (the governance guardrail addendum of 2026-11-24 corrected
+    an earlier, overly broad reading of this rule). A row whose context
+    is not retained never "enters the closure" at all (Section 11:
+    "Referências que não sobrevivem... não devem ser confundidas com
+    pais preservados") - checking it here, unconditionally for every
+    source row regardless of retention, would wrongly demand a
+    `_chem_comp` row for a parent that was never actually preserved.
+    The *retained* case is instead enforced by the dedicated
+    closure-completeness check below, after every closure contributor
+    (atoms, sequences, branches, AND preserved parent_comp_id) is known
+    - never silently accepted either way."""
 
     for column, target_reference in references.items():
         if (category, column) == ("_pdbx_struct_mod_residue", "parent_comp_id"):
@@ -4340,6 +4346,22 @@ def compute_category_decisions(
                 "INVALID_CIF", f"category '_chem_comp' is missing required tag(s) {missing_required!r}", phase="plan",
             )
         kept, omitted = _filter_rows_by_membership(table=table, column="id", retained_ids=closure)
+        # Section 11 (REFERENCED_CCD_CLOSURE, governance guardrail
+        # addendum of 2026-11-24): every closure member - CCDs of
+        # retained atoms, preserved sequences/branches, AND preserved
+        # parent_comp_id references alike - requires a real matching
+        # _chem_comp row; "sem nova busca CCD" means a missing one is
+        # never fabricated/looked up, only refused.
+        kept_chem_comp_ids = frozenset(table.value("id", row_index) for row_index in kept)
+        missing_closure_members = closure - kept_chem_comp_ids
+        if missing_closure_members:
+            raise MaterializationExecutionError(
+                "INVALID_CIF",
+                "the referenced-CCD closure (retained atoms/preserved sequences/branches/"
+                f"parent_comp_id) requires _chem_comp row(s) for {sorted(missing_closure_members)!r}, "
+                "which the source does not declare",
+                phase="plan",
+            )
         decisions["_chem_comp"] = CategoryDecision(
             category="_chem_comp", action="filter",
             kept_row_ordinals=kept, omitted_row_ordinals=omitted,

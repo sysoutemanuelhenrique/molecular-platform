@@ -32,10 +32,32 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Dict, FrozenSet, List, NamedTuple, Optional, Tuple
 
-import gemmi
+try:
+    import gemmi
+    _GEMMI_IMPORT_ERROR: Optional[ImportError] = None
+except ImportError as _gemmi_import_error:  # pragma: no cover - exercised via sys.modules sentinel in tests
+    gemmi = None  # type: ignore[assignment]
+    _GEMMI_IMPORT_ERROR = _gemmi_import_error
 
 from molecular.atomic import compute_sha256
 from molecular import receptor_materialization as rm
+
+
+def _require_engine_available() -> None:
+    """Section 3: an absent Gemmi engine must surface as a clean
+    `MaterializationConfigurationError(ENGINE_UNAVAILABLE)` from every
+    Checkpoint 2 entry point - never a raw `ImportError`/`AttributeError`
+    from calling into a `None` `gemmi`. The 020 reader (`parse_receptor_raw`
+    and its own helpers) is untouched by this guard - its historical
+    behavior/API when Gemmi *is* present (the only case it has ever had to
+    handle) is preserved exactly; this function is called only from the
+    021 adapter's own public entry points."""
+
+    if _GEMMI_IMPORT_ERROR is not None:
+        raise rm.MaterializationConfigurationError(
+            "ENGINE_UNAVAILABLE", f"Gemmi is not installed/importable: {_GEMMI_IMPORT_ERROR}",
+        )
+
 
 MAX_RAW_ARTIFACT_SIZE_BYTES = 1024**3  # 1 GiB (Section 32.2)
 
@@ -974,6 +996,7 @@ def parse_receptor_raw(raw_path: Path, *, expected_checksum: str) -> ParsedRecep
 # means; this function only captures bytes-to-tokens, once.
 # ===========================================================================
 
+MAX_CIF_RAW_ARTIFACT_SIZE_BYTES = 16 * 1024 * 1024  # 16 MiB (Section 4) - CP2's own ceiling, never the 020 reader's 1 GiB
 MAX_CIF_ATOM_SITE_ROWS = 100_000
 MAX_CIF_CONNECTION_ROWS = 50_000
 MAX_CIF_CATEGORIES = 256
@@ -1129,16 +1152,22 @@ def _reject_cell_too_large(category_name: str, column: str, token: str) -> None:
 
 def parse_receptor_cif_dom021(raw_bytes: bytes) -> ParsedCifDom021:
     """Increment 021 Checkpoint 2's single Gemmi entry point for the
-    materialization domain (Section 3/19). Captures bytes already
-    validated (checksum/size) by the 021 domain's own boundary; parses
-    them exactly once into a native Gemmi DOM at this function's own
-    late `import gemmi` reference (already a module-level import here,
-    since this file is the dedicated adapter module); extracts every
-    present category's raw tokens; enforces Section 4's structural limits;
-    and returns a plain, generic `ParsedCifDom021` - never a `gemmi.*`
-    object. Never reuses `parse_receptor_raw`/its DTOs; never reopens a
-    file by path."""
+    materialization domain (Section 3/19). `import gemmi` above is a
+    plain, eager module-level import - this file is the one dedicated
+    adapter module ARCH-01 permits to hold it - but Section 3's own
+    "late import, clean configuration error when the engine is absent"
+    requirement is satisfied here, not by that import statement:
+    `_require_engine_available()` is the explicit guard every 021 entry
+    point calls first, converting an absent/failed Gemmi import into
+    `MaterializationConfigurationError(ENGINE_UNAVAILABLE)` before this
+    function ever touches `gemmi.*`. Captures bytes already validated
+    (checksum/size) by the 021 domain's own boundary; parses them exactly
+    once into a native Gemmi DOM; extracts every present category's raw
+    tokens; enforces Section 4's structural limits; and returns a plain,
+    generic `ParsedCifDom021` - never a `gemmi.*` object. Never reuses
+    `parse_receptor_raw`/its DTOs; never reopens a file by path."""
 
+    _require_engine_available()
     text = _reject_invalid_cif_encoding(raw_bytes)
     _reject_save_frames(text)
 
@@ -1236,6 +1265,7 @@ def serialize_cif_document021(
     ordenadas"). Never reopens or reparses RAW; this is pure output
     construction from already-computed survivor tokens."""
 
+    _require_engine_available()
     document = gemmi.cif.Document()
     block = document.add_new_block(block_name)
     for category_name in category_order:
@@ -1563,11 +1593,13 @@ def materialize_receptor_cif021(
 
     `import gemmi` above is a plain, eager module-level import - this
     file (never `receptor_materialization.py`) is the one dedicated
-    adapter module ARCH-01 permits to hold it; nothing here is a "late"
-    import in the deferred sense, only the explicit version pin check
-    immediately below stands between the module already being loaded
-    and this function actually calling into it."""
+    adapter module ARCH-01 permits to hold it. Section 3's "late import,
+    clean configuration error when absent" requirement is satisfied by
+    `_require_engine_available()` below, called first, before the
+    version-pin check or anything else that would otherwise touch a
+    `None` `gemmi` with a raw `AttributeError`."""
 
+    _require_engine_available()
     if gemmi.__version__ != rm.ENGINE_VERSION:
         raise rm.MaterializationConfigurationError(
             "ENGINE_VERSION",
@@ -1580,9 +1612,10 @@ def materialize_receptor_cif021(
             f"does not match the pinned engine {rm.ENGINE_NAME}/{rm.ENGINE_VERSION}",
         )
     actual_size = len(raw_bytes)
-    if actual_size > MAX_RAW_ARTIFACT_SIZE_BYTES:
+    if actual_size > MAX_CIF_RAW_ARTIFACT_SIZE_BYTES:
         raise CifStructuralLimitExceededError(
-            f"RAW content is {actual_size} bytes, exceeding the {MAX_RAW_ARTIFACT_SIZE_BYTES} limit"
+            f"RAW content is {actual_size} bytes, exceeding the {MAX_CIF_RAW_ARTIFACT_SIZE_BYTES} "
+            "(16 MiB, Section 4) limit - never the 020 reader's 1 GiB ceiling"
         )
     if actual_size != source_context.raw_size_bytes:
         raise rm.MaterializationConfigurationError(

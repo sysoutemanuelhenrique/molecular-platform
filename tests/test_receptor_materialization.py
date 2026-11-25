@@ -2578,6 +2578,93 @@ def test_modified_residue_context_resolves_by_label_and_enters_ccd_closure():  #
     assert set(categories["_chem_comp"].columns["id"][i] for i in by_cat["_chem_comp"].kept_row_ordinals) == {"MSE", "MET"}
 
 
+def test_modified_residue_preserved_parent_without_ccd_row_rejects():  # T021-080 (governance addendum 2026-11-24 §3.1)
+    # Same shape as the test above, but _chem_comp never declares MET -
+    # exactly 5I55's real situation (see test_real_fixture_5i55_rejects_
+    # missing_parent_ccd_closure_row). A preserved parent_comp_id that
+    # enters the closure without a matching row must refuse, never pass
+    # silently just because MET was never physically instantiated.
+    atoms = (
+        _atom(ordinal=0, atom_id="a-mse", label_asym_id="A", ccd="MSE", label_seq_id="1", label_atom_id="SE"),
+    )
+    source_context = _source_context()
+    resolution = _resolution()
+    plan = build_materialization_plan(
+        source_context=source_context, resolved_selection=resolution, unaddressed_components="preserve", atoms=atoms,
+    )
+    atom_decisions_by_ordinal = {d.ordinal: d for d in plan.atom_decisions}
+    atoms_by_ordinal = {a.ordinal: a for a in atoms}
+    categories = {
+        "_atom_site": _full_atom_site_table(
+            ids=("a-mse",), type_symbols=("Se",), label_atom_ids=("SE",), comp_ids=("MSE",),
+            asym_ids=("A",), entity_ids=("E1",), seq_ids=("1",), auth_asym_ids=("A",), auth_seq_ids=("1",),
+        ),
+        "_entity": _category_table(id=("E1",), type=("polymer",)),
+        "_struct_asym": _category_table(id=("A",), entity_id=("E1",)),
+        "_chem_comp": _category_table(id=("MSE",), type=("x",)),  # MET deliberately absent
+        "_entity_poly": _category_table(entity_id=("E1",), type=("polypeptide(L)",)),
+        "_entity_poly_seq": _category_table(entity_id=("E1",), num=("1",), mon_id=("MSE",)),
+        "_pdbx_poly_seq_scheme": _category_table(asym_id=("A",), entity_id=("E1",), seq_id=("1",), mon_id=("MSE",)),
+        "_pdbx_struct_mod_residue": _category_table(
+            id=("1",), label_asym_id=("A",), label_comp_id=("MSE",), label_seq_id=("1",),
+            auth_asym_id=("A",), auth_comp_id=("MSE",), auth_seq_id=("1",), parent_comp_id=("MET",),
+        ),
+    }
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        compute_category_decisions(
+            source_context_key=plan.plan.source_context_key, categories=categories,
+            retained_entity_ids=frozenset({"E1"}), retained_asym_ids=frozenset({"A"}), resolved_model=1,
+            atoms_by_ordinal=atoms_by_ordinal, atom_decisions_by_ordinal=atom_decisions_by_ordinal,
+            connection_decisions=(),
+        )
+    assert excinfo.value.code == "INVALID_CIF"
+    assert "MET" in str(excinfo.value)
+
+
+def test_modified_residue_not_preserved_never_requires_parent_ccd_row():  # T021-080 (governance addendum 2026-11-24 §3.1)
+    # The mod_residue row's context (asym B) is NOT retained - it never
+    # enters the CCD closure, so a missing parent_comp_id='MET' row must
+    # NOT block materialization (never confuse a non-surviving reference
+    # with a preserved parent).
+    atoms = (
+        _atom(ordinal=0, atom_id="a-ala", label_asym_id="A", ccd="ALA", label_seq_id="1", label_atom_id="CA"),
+        _atom(ordinal=1, atom_id="b-mse", label_asym_id="B", ccd="MSE", label_seq_id="1", auth_asym_id="B", entity_id="E2", label_atom_id="SE"),
+    )
+    source_context = _source_context()
+    resolution = _resolution()  # only chain A selected
+    plan = build_materialization_plan(
+        source_context=source_context, resolved_selection=resolution, unaddressed_components="require-disposition", atoms=atoms,
+    )
+    atom_decisions_by_ordinal = {d.ordinal: d for d in plan.atom_decisions}
+    atoms_by_ordinal = {a.ordinal: a for a in atoms}
+    assert atom_decisions_by_ordinal[1].retained is False  # B/MSE excluded - chain-complement
+    categories = {
+        "_atom_site": _full_atom_site_table(
+            ids=("a-ala", "b-mse"), type_symbols=("C", "Se"), label_atom_ids=("CA", "SE"), comp_ids=("ALA", "MSE"),
+            asym_ids=("A", "B"), entity_ids=("E1", "E2"), seq_ids=("1", "1"), auth_asym_ids=("A", "B"), auth_seq_ids=("1", "1"),
+        ),
+        "_entity": _category_table(id=("E1", "E2"), type=("polymer", "polymer")),
+        "_struct_asym": _category_table(id=("A", "B"), entity_id=("E1", "E2")),
+        "_chem_comp": _category_table(id=("ALA", "MSE"), type=("x", "x")),  # MET absent - irrelevant here
+        "_entity_poly": _category_table(entity_id=("E1",), type=("polypeptide(L)",)),
+        "_entity_poly_seq": _category_table(entity_id=("E1",), num=("1",), mon_id=("ALA",)),
+        "_pdbx_poly_seq_scheme": _category_table(asym_id=("A",), entity_id=("E1",), seq_id=("1",), mon_id=("ALA",)),
+        "_pdbx_struct_mod_residue": _category_table(
+            id=("1",), label_asym_id=("B",), label_comp_id=("MSE",), label_seq_id=("1",),
+            auth_asym_id=("B",), auth_comp_id=("MSE",), auth_seq_id=("1",), parent_comp_id=("MET",),
+        ),
+    }
+    decisions = compute_category_decisions(
+        source_context_key=plan.plan.source_context_key, categories=categories,
+        retained_entity_ids=frozenset({"E1"}), retained_asym_ids=frozenset({"A"}), resolved_model=1,
+        atoms_by_ordinal=atoms_by_ordinal, atom_decisions_by_ordinal=atom_decisions_by_ordinal,
+        connection_decisions=(),
+    )
+    by_cat = {d.category: d for d in decisions}
+    assert by_cat["_pdbx_struct_mod_residue"].kept_row_ordinals == ()  # not preserved - context (B) excluded
+    assert by_cat["_chem_comp"].kept_row_ordinals == (0,)  # only ALA; MSE/MET never required
+
+
 def test_missing_residue_and_atom_context_resolve_by_label_asym_id():  # T021-081
     plan, atoms_by_ordinal, atom_decisions_by_ordinal, retained_entity_ids, retained_asym_ids = _minimal_catalogue_scenario()
     categories = {

@@ -7,6 +7,8 @@ fixture is a minimal literal written under `tmp_path`.
 """
 
 import gzip
+import subprocess
+import sys
 import unicodedata
 from pathlib import Path
 
@@ -554,12 +556,14 @@ from molecular.inputs import AcquisitionRecord, ProteinInput, RawArtifact
 from molecular.receptor_inspection import ModelDescriptor, ParserProvenance, ReceptorInspectionReport, compute_inspection_id
 from molecular.receptor_materialization import RecordSnapshot, build_source_context
 from molecular.receptor_materialization import CategoryDecision, MaterializationExecutionError
+from molecular.receptor_materialization import resolve_connection_decisions
 from molecular.receptor_resolution import ResolvedChainSelection, ResolvedComponentDisposition, ResolvedReceptorSelection
 from molecular.receptor_selection import ReceptorSelectionPolicy
 from molecular.receptor_parsing import (
     CifSaveFrameRejectedError,
     CifStructuralLimitExceededError,
     InvalidCifEncodingError,
+    MAX_CIF_RAW_ARTIFACT_SIZE_BYTES,
     MultipleDataBlocksError,
     materialize_receptor_cif021,
     parse_receptor_cif_dom021,
@@ -776,6 +780,31 @@ def test_parse_cif_dom021_rejects_save_frames():
         parse_receptor_cif_dom021(text.encode("utf-8"))
 
 
+def test_parse_cif_dom021_accepts_multiline_text_field_containing_save_substring():  # C-06, real Gemmi proof
+    # A multiline (semicolon-delimited) text field whose literal content
+    # happens to contain the substring "save_" is real CIF syntax for a
+    # text value, never a save frame - proven with real Gemmi 0.7.5: the
+    # category parses, and the raw value Gemmi returns still carries the
+    # literal "save_..." text (never stripped/misinterpreted as syntax).
+    text = "data_x\n_my_test.value\n;\nsave_literal_inside_text\n;\n"
+    dom = parse_receptor_cif_dom021(text.encode("utf-8"))
+    assert "my_test" in dom.categories
+    value = dom.categories["my_test"].get(0, "value")
+    assert value is not None and "save_literal_inside_text" in value
+
+
+def test_parse_cif_dom021_accepts_quoted_token_equal_to_save_prefix():  # C-06, real Gemmi proof
+    # A *quoted* string that is lexically "save_x" is a genuine token
+    # value (e.g. an unusual but valid free-text description), never
+    # save-frame syntax - the quote marks keep it out of column 0.
+    text = "data_x\n_my_test.value 'save_x'\n"
+    dom = parse_receptor_cif_dom021(text.encode("utf-8"))
+    assert "my_test" in dom.categories
+    value = dom.categories["my_test"].get(0, "value")
+    assert value == "'save_x'"  # raw=True access keeps the quote marks
+    assert gemmi.cif.as_string(value) == "save_x"
+
+
 def test_parse_cif_dom021_rejects_multiple_blocks():
     text = _MINIMAL_CIF + "\ndata_SECOND\n_entry.id SECOND\n"
     with pytest.raises(MultipleDataBlocksError):
@@ -943,26 +972,61 @@ def _remove_dispositions(pairs, classification):
     )
 
 
-def test_real_fixture_5i55_positive_materialization():  # T021-090/141/147, real X-ray deposition
+def test_real_fixture_5i55_rejects_missing_parent_ccd_closure_row():  # T021-147, real honest negative (governance addendum 2026-11-24 §3.1)
+    # 5I55 is a selenomethionine (MSE) phasing construct: _pdbx_struct_mod_residue
+    # names parent_comp_id='MET', but the real deposition's own _chem_comp
+    # never carries a MET row (MET is never physically instantiated - only
+    # MSE is). The frozen REFERENCED_CCD_CLOSURE rule requires a real
+    # _chem_comp row for every closure member, including a *preserved*
+    # parent_comp_id - "sem nova busca CCD" forbids fabricating one, so the
+    # only correct outcome is a declared rejection, never a silent pass.
     raw_bytes = _real_fixture_bytes("5i55", "5I55_trimmed.cif")
     assert hashlib.sha256(raw_bytes).hexdigest() == "eba9584da11b29537c0ec30f23fa01fd27ad5ccc96ce8649450eb457530b9567"
-    result = _real_fixture_materialize(
-        pdbid="5I55", raw_bytes=raw_bytes, resolved_model=1,
-        resolved_chains=(ResolvedChainSelection(label_asym_id="A", label_entity_id="1", model_number=1),),
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        _real_fixture_materialize(
+            pdbid="5I55", raw_bytes=raw_bytes, resolved_model=1,
+            resolved_chains=(ResolvedChainSelection(label_asym_id="A", label_entity_id="1", model_number=1),),
+        )
+    assert excinfo.value.code == "INVALID_CIF"
+    assert "MET" in str(excinfo.value)
+
+
+def test_real_fixture_5i55_covale_connection_identity_basis_from_real_data():  # T021-090/141, real connection resolution in isolation
+    # Proves the real covale1 connection's IdentityBasis/SymmetryClass
+    # independent of the (unrelated) chem_comp-closure rejection above -
+    # the connection resolver itself is exercised against real tokens.
+    raw_bytes = _real_fixture_bytes("5i55", "5I55_trimmed.cif")
+    dom = parse_receptor_cif_dom021(raw_bytes)
+    from molecular.receptor_parsing import (
+        _build_atom_observations, _build_connection_rows, _build_entity_type_lookup, _build_symmetry_operator_tables,
     )
-    assert len(result.plan.atom_decisions) == 218
-    assert all(d.retained for d in result.plan.atom_decisions)
-    conn_by_id = {d.id: d for d in result.plan.connection_decisions}
+    entity_type_by_id = _build_entity_type_lookup(dom)
+    atoms = _build_atom_observations(dom, entity_type_by_id)
+    atoms_in_model = tuple(a for a in atoms if a.model == 1)
+    tables = _build_symmetry_operator_tables(dom)
+    raw_connections = _build_connection_rows(dom)
+    # Every atom is retained (chain A is the structure's only polymer and
+    # the only chain selected) - a direct, real atom-decision vector.
+    from molecular.receptor_materialization import AtomDecision, compute_occurrence_key, _build_occurrence_identity
+    atom_decisions_by_ordinal = {
+        atom.ordinal: AtomDecision(
+            ordinal=atom.ordinal, atom_id=atom.atom_id,
+            occurrence_key=compute_occurrence_key(_build_occurrence_identity(atom)),
+            retained=True, reason="selected-asym",
+        )
+        for atom in atoms
+    }
+    decisions = resolve_connection_decisions(
+        source_context_key="a" * 64, atoms_in_model=atoms_in_model,
+        atom_decisions_by_ordinal=atom_decisions_by_ordinal, raw_connections=raw_connections, tables=tables,
+    )
+    conn_by_id = {d.id: d for d in decisions}
     assert conn_by_id["covale1"].action == "preserve"
     # T021-141: the real deposition declares ptnr1_symmetry=ptnr2_symmetry=
     # '1_555' with no _symmetry_equiv/_space_group_symop tables present -
     # the pdbx-1_555-convention recognized without fabricating an operator.
     assert conn_by_id["covale1"].identity_basis == ("pdbx-1_555-convention", "pdbx-1_555-convention")
     assert conn_by_id["covale1"].symmetry_class == "both-identity"
-    cat_by_name = {d.category: d for d in result.plan.category_decisions}
-    assert cat_by_name["_chem_comp"].kept_row_ordinals
-    reparsed_atom_site = result.reparsed.categories["atom_site"]
-    assert reparsed_atom_site.row_count == 218
 
 
 def test_real_fixture_1pfe_rejects_hydrog_nonidentity_symmetry_gate():  # T021-144/147, real negative gate
@@ -1130,3 +1194,65 @@ def test_real_fixture_provenance_manifests_match_actual_file_hashes():  # T021-1
             recorded = manifest["files"][filename]
             assert hashlib.sha256(real_bytes).hexdigest() == recorded["sha256"], (subdir, filename)
             assert len(real_bytes) == recorded["size_bytes"], (subdir, filename)
+
+
+def test_materialize_receptor_cif021_rejects_raw_over_16mib_before_gemmi_parses():  # Section 4: CP2's own 16 MiB ceiling
+    oversized = b"data_x\n#\n" + b"#" * (MAX_CIF_RAW_ARTIFACT_SIZE_BYTES + 1)
+    assert len(oversized) > MAX_CIF_RAW_ARTIFACT_SIZE_BYTES
+    with pytest.raises(CifStructuralLimitExceededError):
+        _real_fixture_materialize(
+            pdbid="OVERSIZED", raw_bytes=oversized, resolved_model=1,
+            resolved_chains=(ResolvedChainSelection(label_asym_id="A", label_entity_id="1", model_number=1),),
+        )
+
+
+def test_materialize_receptor_cif021_accepts_raw_at_exactly_16mib_size_gate():  # boundary: == limit passes the size gate itself
+    # Padding comment lines keep this syntactically valid-enough CIF to
+    # reach the real parser after the size gate - it is expected to fail
+    # later (malformed structure), proving only that the *size* check
+    # itself does not reject a file at exactly the limit.
+    header = b"data_x\n"
+    padding_len = MAX_CIF_RAW_ARTIFACT_SIZE_BYTES - len(header) - 1
+    at_limit = header + b"#" * padding_len + b"\n"
+    assert len(at_limit) == MAX_CIF_RAW_ARTIFACT_SIZE_BYTES
+    with pytest.raises(Exception) as excinfo:
+        _real_fixture_materialize(
+            pdbid="ATLIMIT", raw_bytes=at_limit, resolved_model=1,
+            resolved_chains=(ResolvedChainSelection(label_asym_id="A", label_entity_id="1", model_number=1),),
+        )
+    assert not isinstance(excinfo.value, CifStructuralLimitExceededError)  # never the size gate itself at exactly the limit
+
+
+def test_materialize_receptor_cif021_engine_absent_raises_clean_configuration_error():  # Section 3: C-04
+    # A fresh subprocess with gemmi genuinely blocked from import (never a
+    # module already successfully imported in this process) - proves the
+    # module itself tolerates import failure and raises a clean
+    # ENGINE_UNAVAILABLE, never a raw ImportError/AttributeError.
+    script = (
+        "import sys\n"
+        "sys.modules['gemmi'] = None\n"
+        "sys.path.insert(0, r'" + str(Path(__file__).resolve().parents[1] / "src") + "')\n"
+        "import molecular.receptor_parsing as rp\n"
+        "from molecular.receptor_materialization import MaterializationConfigurationError\n"
+        "try:\n"
+        "    rp.parse_receptor_cif_dom021(b'data_x')\n"
+        "except MaterializationConfigurationError as e:\n"
+        "    print('OK', e.code)\n"
+        "except Exception as e:\n"
+        "    print('WRONG', type(e).__name__, e)\n"
+        "else:\n"
+        "    print('NO_RAISE')\n"
+    )
+    result = subprocess.run([sys.executable, "-B", "-c", script], capture_output=True, text=True, timeout=30)
+    assert result.stdout.strip() == "OK ENGINE_UNAVAILABLE", (result.stdout, result.stderr)
+
+
+def test_materialize_receptor_cif021_engine_version_mismatch_raises(monkeypatch):  # Section 3: C-04
+    import molecular.receptor_parsing as rp
+    monkeypatch.setattr(rp.gemmi, "__version__", "9.9.9")
+    with pytest.raises(Exception) as excinfo:
+        _real_fixture_materialize(
+            pdbid="VERSIONMISMATCH", raw_bytes=_real_fixture_bytes("3dg1", "3DG1_trimmed.cif"), resolved_model=1,
+            resolved_chains=(ResolvedChainSelection(label_asym_id="A", label_entity_id="1", model_number=1),),
+        )
+    assert excinfo.value.code == "ENGINE_VERSION"

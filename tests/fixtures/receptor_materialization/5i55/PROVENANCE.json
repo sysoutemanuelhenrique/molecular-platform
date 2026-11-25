@@ -20,10 +20,11 @@
     }
   },
   "scenario_usage": {
-    "id": "T021-147 (catalog-three-real) / T021-090 (binding-real), positive case",
+    "id": "T021-147 (catalog-three-real) / T021-090/141 (binding-real), honest negative + isolated positive",
     "resolved_model": 1,
     "resolved_chains": [{"label_asym_id": "A", "label_entity_id": "1"}],
     "unaddressed_components": "preserve",
-    "expected_outcome": "successful end-to-end materialization: covale1 (an intramolecular modified-residue linkage, label_asym_id A on both ends) is preserved (both-retained, both-identity); _pdbx_struct_mod_residue carries one MSE->MET parent reference (parent_comp_id never required to have its own _chem_comp row - Section 11 documentary reference, not a dangling-pointer defect); _chem_comp closure keeps ACT/ALA/ASN/ASP/GLU/GLY/HOH/LEU/LYS/MPD/MSE/PHE/VAL as referenced by retained atoms."
+    "expected_outcome_full_pipeline": "materialize_receptor_cif021() correctly REJECTS with MaterializationExecutionError(code='INVALID_CIF'): this real deposition is a selenomethionine (MSE) phasing construct - _pdbx_struct_mod_residue names parent_comp_id='MET', which enters the REFERENCED_CCD_CLOSURE (Section 11), but the real deposition's own _chem_comp never carries a MET row (only MSE, the form actually instantiated, is listed). The frozen rule 'sem nova busca CCD' forbids fabricating the missing row, so the only correct outcome is a declared rejection - corrected 2026-11-25 per governance guardrail addendum CODEX_CP2_LOCAL_PROGRESS_RESUME_GUARDRAILS.md Section 3.1, after an earlier session mistakenly treated this as a positive case via an overly broad parent_comp_id exemption.",
+    "expected_outcome_connection_resolution_isolated": "resolve_connection_decisions(), exercised directly against the real atom_site/struct_conn/entity rows (bypassing the unrelated chem_comp-closure rejection above), proves covale1 (an intramolecular modified-residue linkage, label_asym_id A on both ends) is preserved: identity_basis=('pdbx-1_555-convention','pdbx-1_555-convention'), symmetry_class='both-identity' - T021-141's real-fixture requirement, independent of the closure finding."
   }
 }
