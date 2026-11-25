@@ -2096,6 +2096,74 @@ def test_catalogue_anisotrop_requires_complete_tensor_and_matching_atom_site_id(
     assert excinfo.value.code == "INVALID_CIF"
 
 
+def test_catalogue_anisotrop_rejects_informed_field_disagreement_and_undeclared_partial_tensor():  # R-CP2-02
+    plan, atoms_by_ordinal, atom_decisions_by_ordinal, retained_entity_ids, retained_asym_ids = _minimal_catalogue_scenario()
+    atom_site = _category_table(
+        id=("a-ca",), type_symbol=("C",), label_atom_id=("CA",), label_alt_id=(None,), label_comp_id=("ALA",),
+        label_asym_id=("A",), label_entity_id=("E1",), label_seq_id=("1",), auth_asym_id=("A",), auth_seq_id=("1",),
+        pdbx_pdb_ins_code=(None,), pdbx_pdb_model_num=("1",), cartn_x=("1.0",), cartn_y=("1.0",), cartn_z=("1.0",),
+        occupancy=("1.0",), b_iso_or_equiv=("10.0",),
+    )
+    base_categories = {
+        "_atom_site": atom_site, "_entity": _category_table(id=("E1",), type=("polymer",)),
+        "_struct_asym": _category_table(id=("A",), entity_id=("E1",)), "_chem_comp": _category_table(id=("ALA",), type=("x",)),
+        "_entity_poly": _category_table(entity_id=("E1",), type=("polypeptide(L)",)),
+        "_entity_poly_seq": _category_table(entity_id=("E1",), num=("1",), mon_id=("ALA",)),
+        "_pdbx_poly_seq_scheme": _category_table(asym_id=("A",), entity_id=("E1",), seq_id=("1",), mon_id=("ALA",)),
+    }
+    complete_u = {
+        "u[1][1]": ("0.1",), "u[1][2]": ("0.0",), "u[1][3]": ("0.0",),
+        "u[2][2]": ("0.1",), "u[2][3]": ("0.0",), "u[3][3]": ("0.1",),
+    }
+
+    def run(anisotrop_columns):
+        categories = dict(base_categories, _atom_site_anisotrop=_category_table(**anisotrop_columns))
+        return compute_category_decisions(
+            source_context_key=plan.plan.source_context_key, categories=categories,
+            retained_entity_ids=frozenset({"E1"}), retained_asym_ids=frozenset({"A"}), resolved_model=1,
+            atoms_by_ordinal={0: atoms_by_ordinal[0]}, atom_decisions_by_ordinal={0: atom_decisions_by_ordinal[0]},
+            connection_decisions=(),
+        )
+
+    # R-CP2-02: pdbx_label_seq_id=99 disagrees with the referenced real
+    # atom's label_seq_id=1 - the previous mapping only ever checked
+    # atom/asym/comp labels, never seq_id.
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        run({"id": ("a-ca",), "pdbx_label_seq_id": ("99",), **complete_u})
+    assert excinfo.value.code == "INVALID_CIF"
+
+    # R-CP2-02: type_symbol='O' disagrees with the referenced real atom's
+    # type_symbol='C' - type_symbol was never checked at all before.
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        run({"id": ("a-ca",), "type_symbol": ("O",), **complete_u})
+    assert excinfo.value.code == "INVALID_CIF"
+
+    # Genuinely informed, *agreeing* mirrored fields (seq_id, alt_id,
+    # auth_asym_id/auth_seq_id, type_symbol) must still pass - this is
+    # integrity checking, never inventing stricter-than-source agreement.
+    decisions = run({
+        "id": ("a-ca",), "type_symbol": ("C",), "pdbx_label_seq_id": ("1",), "pdbx_label_alt_id": (None,),
+        "pdbx_auth_asym_id": ("A",), "pdbx_auth_seq_id": ("1",), **complete_u,
+    })
+    by_cat = {d.category: d for d in decisions}
+    assert by_cat["_atom_site_anisotrop"].kept_row_ordinals == (0,)
+
+    # R-CP2-02: a row with a genuine numeric value in u[1][1], but whose
+    # category never declares the other five U columns at all (not merely
+    # null for this row), must still be "partial" and rejected even
+    # though a complete B tensor is also present - the previous
+    # `_tensor_family_state` returned "absent" for U whenever any of its
+    # six columns was undeclared, letting this slip through as if only B
+    # existed.
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        run({
+            "id": ("a-ca",), "u[1][1]": ("0.1",),
+            "b[1][1]": ("1.0",), "b[1][2]": ("0.0",), "b[1][3]": ("0.0",),
+            "b[2][2]": ("1.0",), "b[2][3]": ("0.0",), "b[3][3]": ("1.0",),
+        })
+    assert excinfo.value.code == "INVALID_CIF"
+
+
 def test_catalogue_struct_conn_used_types_and_elements_from_real_connection_decisions():  # T021-075/076/077
     plan, atoms_by_ordinal, atom_decisions_by_ordinal, retained_entity_ids, retained_asym_ids = _minimal_catalogue_scenario()
     tables = _no_tables()
@@ -2288,13 +2356,128 @@ def test_catalogue_special_position_guard_requires_unambiguous_context():  # T02
             connection_decisions=(),
         )
 
-    decisions = run({"id": ("1",), "label_asym_id": ("A",)})
+    decisions = run({"id": ("1",), "label_asym_id": ("A",), "label_seq_id": ("1",)})
     by_cat = {d.category: d for d in decisions}
     assert by_cat["_pdbx_struct_special_symmetry"].action == "guard_then_omit"
 
     with pytest.raises(MaterializationExecutionError) as excinfo:
-        run({"id": ("1",), "auth_asym_id": ("Z",)})
+        run({"id": ("1",), "auth_asym_id": ("Z",), "label_seq_id": ("1",)})
     assert excinfo.value.code == "INVALID_CIF"  # ambiguity/unresolvable context refuses, per T021-158
+
+    # R-CP2-01: a genuinely unknown label_asym_id must refuse, never pass
+    # silently just because the column itself is non-null - the previous
+    # guard returned immediately for *any* non-null label_asym_id.
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        run({"id": ("1",), "label_asym_id": ("NO_SUCH_ASYM",), "label_seq_id": ("1",)})
+    assert excinfo.value.code == "INVALID_CIF"
+
+    # R-CP2-01: a real asym with no seq identity at all (neither
+    # label_seq_id nor auth_seq_id) cannot be resolved to any residue.
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        run({"id": ("1",), "label_asym_id": ("A",)})
+    assert excinfo.value.code == "INVALID_CIF"
+
+    # R-CP2-01: a real asym with a seq_id that matches no real residue in
+    # any model (never merely "not in M") is an invalid reference, not a
+    # zero-overlap resolution.
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        run({"id": ("1",), "label_asym_id": ("A",), "label_seq_id": ("999",)})
+    assert excinfo.value.code == "INVALID_CIF"
+
+
+def test_compute_special_position_summary_counts_overlap_removed_and_other_model():  # R-CP2-01
+    # A richer scenario than _minimal_catalogue_scenario(): two altloc
+    # conformers of the same polymer residue (A/seq2), a second, identical
+    # model-1 atom in another model (model 2) to exercise "other model"
+    # without an error, a non-polymer water on its own asym resolved via
+    # auth_asym_id/auth_seq_id/insertion (never label_seq_id), and a
+    # non-selected polymer asym (B) whose annotation is real but never
+    # retained.
+    atoms = (
+        _atom(ordinal=0, atom_id="a1", label_asym_id="A", entity_id="E1", label_seq_id="1", auth_seq_id="1", ccd="ALA"),
+        _atom(ordinal=1, atom_id="a2", label_asym_id="A", entity_id="E1", label_seq_id="2", auth_seq_id="2", ccd="CYS", altloc="A"),
+        _atom(ordinal=2, atom_id="a3", label_asym_id="A", entity_id="E1", label_seq_id="2", auth_seq_id="2", ccd="CYS", altloc="B"),
+        _atom(ordinal=3, atom_id="b1", label_asym_id="B", entity_id="E2", label_seq_id="1", auth_seq_id="1", ccd="MET"),
+        _atom(ordinal=4, atom_id="a1-m2", model=2, label_asym_id="A", entity_id="E1", label_seq_id="1", auth_seq_id="1", ccd="ALA"),
+        _atom(
+            ordinal=5, atom_id="c1", label_asym_id="C", entity_id="E3", entity_type="water", label_seq_id=None,
+            auth_asym_id="C", auth_seq_id="50", insertion_token="A", ccd="HOH",
+        ),
+    )
+    source_context = _source_context()
+    resolution = _resolution()
+    plan = build_materialization_plan(
+        source_context=source_context, resolved_selection=resolution, unaddressed_components="preserve", atoms=atoms,
+    )
+    atom_decisions_by_ordinal = {d.ordinal: d for d in plan.atom_decisions}
+    atoms_by_ordinal = {a.ordinal: a for a in atoms}
+    # Sanity check on the fixture's own retention shape before trusting
+    # the counts below: A (selected) and the water (unaddressed-preserve)
+    # retained; B (unselected polymer) and the model-2 duplicate (model
+    # filter) not retained.
+    assert [atom_decisions_by_ordinal[o].retained for o in range(6)] == [
+        True, True, True, False, False, True,
+    ]
+
+    special_table = _category_table(
+        id=("1", "2", "3", "4", "5", "6", "7"),
+        label_asym_id=("A", "A", "A", "B", "A", "A", None),
+        label_seq_id=("1", "2", "1", "1", "1", "2", None),
+        auth_asym_id=(None, None, None, None, None, None, "C"),
+        auth_seq_id=(None, None, None, None, None, None, "50"),
+        pdb_ins_code=(None, None, None, None, None, None, "A"),
+        pdb_model_num=(None, None, None, None, "2", None, None),
+        label_alt_id=(None, None, None, None, None, "A", None),
+    )
+
+    from molecular.receptor_materialization import compute_special_position_summary
+
+    summary = compute_special_position_summary(
+        categories={"_pdbx_struct_special_symmetry": special_table},
+        atoms_by_ordinal=atoms_by_ordinal, atom_decisions_by_ordinal=atom_decisions_by_ordinal,
+    )
+    assert summary.source_annotation_count == 7
+    # Retained: row1 (ordinal0), row2 (ordinals1+2), row3 (ordinal0 again
+    # - overlap with row1, never double-counted as a *second* retained
+    # atom), row6 (ordinal1 only, altloc='A' narrows out ordinal2), row7
+    # (ordinal5, resolved via auth_asym_id/auth_seq_id/insertion). Never
+    # retained: row4 (asym B, real but unselected) and row5 (asym A/seq1,
+    # but scoped to model 2 by pdb_model_num - a real residue, simply not
+    # in M - never an error).
+    assert summary.retained_annotation_count == 5
+    assert summary.retained_unique_atom_count == 4  # {0, 1, 2, 5} - never 6 or 7
+
+    # SCHEMAS Section 8: zero counts when the category is absent.
+    empty_summary = compute_special_position_summary(
+        categories={}, atoms_by_ordinal=atoms_by_ordinal, atom_decisions_by_ordinal=atom_decisions_by_ordinal,
+    )
+    assert empty_summary.source_annotation_count == 0
+    assert empty_summary.retained_annotation_count == 0
+    assert empty_summary.retained_unique_atom_count == 0
+
+    # The plan-level warning now requires a real retained intersection -
+    # an all-removed/other-model-only category must never trigger it.
+    removed_only_table = _category_table(
+        id=("1",), label_asym_id=("B",), label_seq_id=("1",), auth_asym_id=(None,), auth_seq_id=(None,),
+        pdb_ins_code=(None,), pdb_model_num=(None,), label_alt_id=(None,),
+    )
+    removed_only_summary = compute_special_position_summary(
+        categories={"_pdbx_struct_special_symmetry": removed_only_table},
+        atoms_by_ordinal=atoms_by_ordinal, atom_decisions_by_ordinal=atom_decisions_by_ordinal,
+    )
+    assert removed_only_summary.retained_annotation_count == 0
+    plan_removed_only = build_materialization_plan(
+        source_context=source_context, resolved_selection=resolution, unaddressed_components="preserve", atoms=atoms,
+        special_positions=removed_only_summary,
+    )
+    assert "special-position-annotations-omitted" not in plan_removed_only.plan.warnings
+
+    plan_with_warning = build_materialization_plan(
+        source_context=source_context, resolved_selection=resolution, unaddressed_components="preserve", atoms=atoms,
+        special_positions=summary,
+    )
+    assert "special-position-annotations-omitted" in plan_with_warning.plan.warnings
+    assert plan_with_warning.special_positions is summary
 
 
 # --- Remaining C-07 scenarios: raw tokens, coordinates, insertion codes,

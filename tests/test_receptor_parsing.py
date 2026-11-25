@@ -1046,6 +1046,52 @@ def test_real_fixture_1pfe_rejects_hydrog_nonidentity_symmetry_gate():  # T021-1
     assert excinfo.value.code == "UNSUPPORTED_SYMMETRY"
 
 
+def test_real_fixture_1pfe_anisotrop_field_agreement_against_real_gemmi_tokens():  # R-CP2-02, native Gemmi proof
+    # 1PFE's real _atom_site_anisotrop declares pdbx_label_seq_id,
+    # pdbx_label_alt_id, pdbx_auth_seq_id/comp_id/asym_id/atom_id and
+    # type_symbol - exactly the fields the expanded
+    # _ANISOTROP_LABEL_AGREEMENT_COLUMNS mapping now checks, several of
+    # them (alt_id, auth_*) never exercised by the full pipeline (which
+    # rejects this fixture earlier, at the unrelated symmetry gate). This
+    # proves the new mapping against real Gemmi-decoded tokens directly.
+    raw_bytes = _real_fixture_bytes("1pfe", "1PFE_trimmed.cif")
+    dom = parse_receptor_cif_dom021(raw_bytes)
+    from molecular.receptor_parsing import _build_category_tables
+    from molecular.receptor_materialization import _validate_anisotrop_field_agreement, _validate_anisotrop_tensor_row
+
+    tables = _build_category_tables(dom)
+    atom_site_table = tables["_atom_site"]
+    anisotrop_table = tables["_atom_site_anisotrop"]
+    assert anisotrop_table.row_count > 0
+
+    atom_site_id_to_ordinal = {atom_site_table.value("id", i): i for i in range(atom_site_table.row_count)}
+    present_columns = frozenset(anisotrop_table.columns.keys())
+
+    # Every real row genuinely agrees with its own referenced real atom -
+    # the expanded mapping must never false-positive on self-consistent
+    # real deposition data.
+    for row_index in range(anisotrop_table.row_count):
+        _validate_anisotrop_tensor_row("_atom_site_anisotrop", anisotrop_table, row_index, present_columns)
+        atom_site_ordinal = atom_site_id_to_ordinal[anisotrop_table.value("id", row_index)]
+        _validate_anisotrop_field_agreement(
+            "_atom_site_anisotrop", anisotrop_table, row_index, atom_site_table, atom_site_ordinal, present_columns,
+        )
+
+    # Corrupting one real row's pdbx_label_seq_id against its own
+    # referenced real atom must now be caught - mutating the genuinely
+    # Gemmi-decoded columns dict directly, never a hand-typed DTO.
+    mutated_columns = dict(anisotrop_table.columns)
+    original_seq_ids = mutated_columns["pdbx_label_seq_id"]
+    mutated_columns["pdbx_label_seq_id"] = ("99999",) + original_seq_ids[1:]
+    mutated_table = anisotrop_table._replace(columns=mutated_columns)
+    atom_site_ordinal = atom_site_id_to_ordinal[mutated_table.value("id", 0)]
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        _validate_anisotrop_field_agreement(
+            "_atom_site_anisotrop", mutated_table, 0, atom_site_table, atom_site_ordinal, present_columns,
+        )
+    assert excinfo.value.code == "INVALID_CIF"
+
+
 def test_real_fixture_3dg1_positive_materialization_with_real_special_symmetry():  # T021-147/158
     raw_bytes = _real_fixture_bytes("3dg1", "3DG1_trimmed.cif")
     assert hashlib.sha256(raw_bytes).hexdigest() == "49926dfc5f524634bcc8e5c7b23aba352ce0ac32431f3621b02e022b267ebf58"
@@ -1058,6 +1104,13 @@ def test_real_fixture_3dg1_positive_materialization_with_real_special_symmetry()
     cat_by_name = {d.category: d for d in result.plan.category_decisions}
     assert cat_by_name["_pdbx_struct_special_symmetry"].action == "guard_then_omit"
     assert "special-position-annotations-omitted" in result.plan.plan.warnings
+    # R-CP2-01: the real deposition's one HOH special-position annotation
+    # (label_asym_id=B, auth_seq_id=7, no label_seq_id - a non-polymer
+    # water) resolves to exactly one real, retained atom (its single
+    # oxygen) - never a fabricated/approximate count.
+    assert result.plan.special_positions.source_annotation_count == 1
+    assert result.plan.special_positions.retained_annotation_count == 1
+    assert result.plan.special_positions.retained_unique_atom_count == 1
 
 
 def test_real_fixture_2jof_nmr_selects_exact_model_not_first():  # T021-149/162, real multi-model NMR
@@ -1234,6 +1287,51 @@ def test_output_verification_rejects_mutated_token_before_commit():  # T021-089
             category_decisions=(decision,), entry_id="tbmp_test", output_categories=output_categories, reparsed=mutated,
         )
     assert excinfo.value.code == "INVALID_OUTPUT"
+    assert excinfo.value.phase == "verify"  # R-CP2-03: never 'plan' - this is the post-serialize verify step
+
+
+def test_output_verification_rejects_entirely_unplanned_extra_category():  # R-CP2-03
+    # The previous verifier only ever reasoned about categories a
+    # CategoryDecision *named* - a category present in the reparsed
+    # output that no decision mentions at all (never decided upon,
+    # whether fabricated by the writer or leaked from elsewhere) slipped
+    # through entirely unnoticed. The closed expected universe ("entry"
+    # plus every category with a real decided, nonempty table) must
+    # reject any category outside it.
+    decision = CategoryDecision(
+        category="_atom_site", action="filter", kept_row_ordinals=(0,), omitted_row_ordinals=(),
+        preserved_tags=("id", "cartn_x"), source_rows_key="1" * 64,
+    )
+    output_categories = {"atom_site": {"id": ["REAL_ID"], "cartn_x": ["1.0"]}}
+    from molecular.receptor_parsing import ParsedCifDom021, RawCifCategory, _verify_output_reparse
+    reparsed_with_extra = ParsedCifDom021(
+        category_names=("atom_site", "unplanned_category"),
+        categories={
+            "atom_site": RawCifCategory(name="atom_site", row_count=1, columns={"id": ("REAL_ID",), "cartn_x": ("1.0",)}),
+            "unplanned_category": RawCifCategory(name="unplanned_category", row_count=1, columns={"x": ("1",)}),
+        },
+        parser_name="gemmi", parser_version="0.7.5",
+    )
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        _verify_output_reparse(
+            category_decisions=(decision,), entry_id="tbmp_test", output_categories=output_categories,
+            reparsed=reparsed_with_extra,
+        )
+    assert excinfo.value.code == "INVALID_OUTPUT"
+    assert excinfo.value.phase == "verify"
+    assert "unplanned_category" in str(excinfo.value)
+
+    # The exact same reparse, minus the unplanned category, must pass -
+    # proving the new check is additive, never stricter than necessary.
+    reparsed_without_extra = ParsedCifDom021(
+        category_names=("atom_site",),
+        categories={"atom_site": reparsed_with_extra.categories["atom_site"]},
+        parser_name="gemmi", parser_version="0.7.5",
+    )
+    _verify_output_reparse(
+        category_decisions=(decision,), entry_id="tbmp_test", output_categories=output_categories,
+        reparsed=reparsed_without_extra,
+    )
 
 
 def test_real_fixture_provenance_manifests_match_actual_file_hashes():  # T021-162
@@ -1289,10 +1387,15 @@ def test_real_fixture_originals_carry_removed_categories_outside_the_catalogue()
 
         assert set(original_dom.category_names) - set(trimmed_dom.category_names) == removed_canonical, subdir
         assert set(trimmed_dom.category_names) <= set(original_dom.category_names), subdir
+        # R-CP2-04 (architect completion receipt §4): a matching row count
+        # alone does not establish unchanged *content* - compare every
+        # unremoved category's actual raw tokens, column by column, row by
+        # row, against the real original bytes; only a whole-category
+        # removal is ever an authorized edit.
         for category in trimmed_dom.category_names:
             assert (
-                trimmed_dom.categories[category].row_count == original_dom.categories[category].row_count
-            ), (subdir, category, "an unremoved category's row count diverged between original and trimmed")
+                trimmed_dom.categories[category].columns == original_dom.categories[category].columns
+            ), (subdir, category, "an unremoved category's real token content diverged between original and trimmed")
 
 
 def test_materialize_receptor_cif021_rejects_raw_over_16mib_before_gemmi_parses():  # Section 4: CP2's own 16 MiB ceiling

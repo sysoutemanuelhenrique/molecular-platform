@@ -1532,12 +1532,37 @@ def _verify_output_reparse(
     serialized must reproduce exactly the *values* the plan decided to
     write (`output_categories`, the independently-derived expected token
     vector - never re-derived from the reparsed DOM itself) - cell by
-    cell, in source row order, with no extra surviving column - not
-    merely a matching row count and tag presence. Acceptance by the
-    writer/reader of the same library alone is never sufficient proof
-    (brief Section 4, point 5): a changed id, a corrupted coordinate, a
-    dropped/added column, or reordered rows must all raise
-    `INVALID_OUTPUT` here, even when the shape alone would look fine."""
+    cell, in source row order, with no extra surviving column, and no
+    extra surviving *category* either - the full expected universe, not
+    merely a matching row count and tag presence within categories
+    already known to the plan. Acceptance by the writer/reader of the
+    same library alone is never sufficient proof (brief Section 4, point
+    5): a changed id, a corrupted coordinate, a dropped/added column, an
+    entirely unplanned extra category, or reordered rows must all raise
+    `INVALID_OUTPUT(phase='verify')` here, even when the shape alone
+    would look fine."""
+
+    # R-CP2-03: the *closed* expected category universe - "entry" plus
+    # every category the plan actually decided to write a nonempty table
+    # for. A reparsed category outside this set was never decided upon at
+    # all (an entirely unplanned addition, e.g. a category the writer
+    # fabricated or leaked from elsewhere) - checked once, independently
+    # of the per-decision loop below, which only ever reasons about
+    # categories a decision *names*.
+    expected_category_names = {"entry"} | {
+        decision.category.lstrip("_") for decision in category_decisions
+        if decision.category != "_entry"
+        and decision.action not in ("omit", "guard_then_omit")
+        and decision.kept_row_ordinals
+    }
+    unplanned_categories = set(reparsed.category_names) - expected_category_names
+    if unplanned_categories:
+        raise rm.MaterializationExecutionError(
+            "INVALID_OUTPUT",
+            f"reparsed output carries entirely unplanned categor(y/ies) {sorted(unplanned_categories)!r}, "
+            "never decided upon by the plan",
+            phase="verify",
+        )
 
     for decision in category_decisions:
         canonical = decision.category.lstrip("_")
@@ -1545,7 +1570,7 @@ def _verify_output_reparse(
             reparsed_entry = reparsed.categories.get("entry")
             if reparsed_entry is None or reparsed_entry.row_count != 1 or reparsed_entry.get(0, "id") != entry_id:
                 raise rm.MaterializationExecutionError(
-                    "INVALID_OUTPUT", "reparsed _entry does not carry the expected generated id", phase="plan",
+                    "INVALID_OUTPUT", "reparsed _entry does not carry the expected generated id", phase="verify",
                 )
             continue
         if decision.action in ("omit", "guard_then_omit") or not decision.kept_row_ordinals:
@@ -1554,7 +1579,7 @@ def _verify_output_reparse(
                 raise rm.MaterializationExecutionError(
                     "INVALID_OUTPUT",
                     f"category {decision.category!r} was decided omitted/empty but survives in the reparsed output",
-                    phase="plan",
+                    phase="verify",
                 )
             continue
 
@@ -1566,7 +1591,7 @@ def _verify_output_reparse(
                 "INVALID_OUTPUT",
                 f"category {decision.category!r} expected {expected_rows} reparsed row(s), "
                 f"got {0 if reparsed_table is None else reparsed_table.row_count}",
-                phase="plan",
+                phase="verify",
             )
 
         unexpected_columns = set(reparsed_table.columns) - set(expected_columns)
@@ -1574,7 +1599,7 @@ def _verify_output_reparse(
             raise rm.MaterializationExecutionError(
                 "INVALID_OUTPUT",
                 f"category {decision.category!r} reparsed output carries unexpected tag(s) {sorted(unexpected_columns)!r}",
-                phase="plan",
+                phase="verify",
             )
 
         for column, expected_values in expected_columns.items():
@@ -1582,7 +1607,7 @@ def _verify_output_reparse(
                 raise rm.MaterializationExecutionError(
                     "INVALID_OUTPUT",
                     f"category {decision.category!r} preserved tag {column!r} is absent from the reparsed output",
-                    phase="plan",
+                    phase="verify",
                 )
             for row_index, expected_value in enumerate(expected_values):
                 actual_value = reparsed_table.get(row_index, column)
@@ -1591,7 +1616,7 @@ def _verify_output_reparse(
                         "INVALID_OUTPUT",
                         f"category {decision.category!r} row {row_index} tag {column!r} reparsed as "
                         f"{actual_value!r}, expected {expected_value!r}",
-                        phase="plan",
+                        phase="verify",
                     )
 
 
@@ -1699,11 +1724,16 @@ def materialize_receptor_cif021(
         atoms_by_ordinal=atoms_by_ordinal, atom_decisions_by_ordinal=atom_decisions_by_ordinal,
         connection_decisions=connection_decisions,
     )
+    special_positions = rm.compute_special_position_summary(
+        categories=category_tables, atoms_by_ordinal=atoms_by_ordinal,
+        atom_decisions_by_ordinal=atom_decisions_by_ordinal,
+    )
 
     plan = rm.build_materialization_plan(
         source_context=source_context, resolved_selection=resolved_selection,
         unaddressed_components=unaddressed_components, atoms=atoms,
         category_decisions=category_decisions, connection_decisions=connection_decisions,
+        special_positions=special_positions,
     )
 
     # Section 11: "nome do novo block como tbmp_<plan_key>" - both the

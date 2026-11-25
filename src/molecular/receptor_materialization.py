@@ -1094,6 +1094,29 @@ def compute_plan_key(plan: PlanBinding) -> str:
     return compute_materialization_hash(plan.model_dump(mode="json"))
 
 
+class SpecialPositionSummary(BaseModel):
+    """SpecialPositionSummary (SCHEMAS Section 8, AuditRecord field): the
+    three frozen `_pdbx_struct_special_symmetry` counts (Section 11
+    SPECIAL_POSITION_GUARD_THEN_OMIT, R-CP2-01) - source-annotation
+    matches, never a computed site multiplicity. Zero counts when the
+    category is absent. Deliberately not one of `PlanBinding`'s own
+    hashed fields (SCHEMAS lists it only on `AuditRecord`, never on
+    `PlanBinding` itself) - carried on `MaterializationPlan` as extra,
+    non-normative transported data, exactly like every other vector it
+    already carries without being part of `plan_key`."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+    source_annotation_count: int = Field(ge=0)
+    retained_annotation_count: int = Field(ge=0)
+    retained_unique_atom_count: int = Field(ge=0)
+
+
+_ZERO_SPECIAL_POSITION_SUMMARY = SpecialPositionSummary(
+    source_annotation_count=0, retained_annotation_count=0, retained_unique_atom_count=0,
+)
+
+
 class MaterializationPlan(BaseModel):
     """The internal, non-normative plan: `PlanBinding` plus the full
     decision vectors it was hashed from (Section 8). Never itself hashed
@@ -1106,6 +1129,7 @@ class MaterializationPlan(BaseModel):
     atom_decisions: Tuple[AtomDecision, ...]
     category_decisions: Tuple[CategoryDecision, ...]
     connection_decisions: Tuple["ConnectionDecision", ...] = ()
+    special_positions: SpecialPositionSummary = _ZERO_SPECIAL_POSITION_SUMMARY
 
     @field_validator("plan_key")
     @classmethod
@@ -1142,6 +1166,7 @@ def build_materialization_plan(
     atoms: Tuple[AtomObservation, ...],
     category_decisions: Tuple[CategoryDecision, ...] = (),
     connection_decisions: Tuple["ConnectionDecision", ...] = (),
+    special_positions: SpecialPositionSummary = _ZERO_SPECIAL_POSITION_SUMMARY,
 ) -> MaterializationPlan:
     """The pure planner (Section 7-8): derives S/D/U/X/O and every
     `AtomDecision` from `resolved_selection` (S and D) and `atoms` (the
@@ -1450,7 +1475,12 @@ def build_materialization_plan(
         warnings_set.add("source-symmetry-context-only")
     if "_struct_ncs_oper" in present_category_names:
         warnings_set.add("source-ncs-annotations-omitted")
-    if "_pdbx_struct_special_symmetry" in present_category_names:
+    # R-CP2-01: the warning requires a real retained-atom intersection
+    # (Section 11: "havendo interseção retida, emitir... categoria vazia
+    # ou somente ocorrências removidas não exige esse aviso") - never
+    # merely the category's presence, which a removed-only or empty
+    # category would satisfy just as wrongly as an absent one would not.
+    if special_positions.retained_annotation_count > 0:
         warnings_set.add("special-position-annotations-omitted")
     if category_decisions and "_struct_conn" not in present_category_names:
         warnings_set.add("declared-connections-unavailable")
@@ -1505,6 +1535,7 @@ def build_materialization_plan(
         atom_decisions=tuple(atom_decisions),
         category_decisions=category_decisions,
         connection_decisions=connection_decisions,
+        special_positions=special_positions,
     )
 
 
@@ -3654,9 +3685,24 @@ def _finite_numeric_token(token: Optional[str]) -> bool:
 _ANISOTROP_U_COLUMNS = ("u[1][1]", "u[1][2]", "u[1][3]", "u[2][2]", "u[2][3]", "u[3][3]")
 _ANISOTROP_B_COLUMNS = ("b[1][1]", "b[1][2]", "b[1][3]", "b[2][2]", "b[2][3]", "b[3][3]")
 _ANISOTROP_LABEL_AGREEMENT_COLUMNS = (
+    # R-CP2-02: every `_atom_site_anisotrop` column that mirrors a real,
+    # unambiguously-named `_atom_site` identity field - never a field
+    # `AtomObservation`/the atom_site catalogue entry doesn't actually
+    # carry (e.g. `pdbx_pdb_residue_name`/`pdbx_pdb_strand_id`, which have
+    # no literal atom_site counterpart - checking them would mean
+    # inventing a mapping, not reading an informed one).
+    ("type_symbol", "type_symbol"),
+    ("pdbx_pdb_ins_code", "pdbx_pdb_ins_code"),
+    ("pdbx_pdb_model_num", "pdbx_pdb_model_num"),
     ("pdbx_label_atom_id", "label_atom_id"),
     ("pdbx_label_asym_id", "label_asym_id"),
     ("pdbx_label_comp_id", "label_comp_id"),
+    ("pdbx_label_seq_id", "label_seq_id"),
+    ("pdbx_label_alt_id", "label_alt_id"),
+    ("pdbx_auth_asym_id", "auth_asym_id"),
+    ("pdbx_auth_seq_id", "auth_seq_id"),
+    ("pdbx_auth_atom_id", "auth_atom_id"),
+    ("pdbx_auth_comp_id", "auth_comp_id"),
 )
 _NCS_MATRIX_COLUMNS = (
     "matrix[1][1]", "matrix[1][2]", "matrix[1][3]",
@@ -3681,9 +3727,17 @@ _CCD_CLOSURE_SOURCE_COLUMN = {
 def _tensor_family_state(
     table: "RawCategoryTable", row_index: int, columns: Sequence[str], present_columns: FrozenSet[str],
 ) -> str:
-    if not all(column in present_columns for column in columns):
-        return "absent"
-    values = [table.value(column, row_index) for column in columns]
+    # R-CP2-02: a column entirely undeclared for the whole category is
+    # read as null for *this* row, exactly like a present-but-null one -
+    # never short-circuited to "absent" merely because the table doesn't
+    # declare every one of the six columns. A family with a genuine
+    # numeric value in even one component is "partial" (and therefore
+    # rejected below) regardless of whether its siblings are null because
+    # the row says so or because the category never declared them.
+    values = [
+        table.value(column, row_index) if column in present_columns else None
+        for column in columns
+    ]
     if all(value is None for value in values):
         return "absent"
     if all(value is not None and _finite_numeric_token(value) for value in values):
@@ -3818,30 +3872,89 @@ def _guard_ncs_row(category: str, table: "RawCategoryTable", row_index: int) -> 
         )
 
 
-def _guard_special_position_row(
+def _resolve_special_position_row_atoms(
     category: str, table: "RawCategoryTable", row_index: int,
     present_columns: FrozenSet[str], auth_to_label_asym: Dict[str, "set[str]"],
-) -> None:
-    # Section 11: "Posições especiais exigem contexto inequívoco."
+    atoms_by_ordinal: Mapping[int, AtomObservation], known_label_asym_ids: FrozenSet[str],
+) -> Tuple[int, ...]:
+    """Section 11 (SPECIAL_POSITION_GUARD_THEN_OMIT, R-CP2-01): resolves one
+    `_pdbx_struct_special_symmetry` row to the exact `_atom_site` ordinals
+    its annotation refers to - filtered to the row's own declared model
+    (`pdb_model_num`) and altloc (`label_alt_id`) "quando informado" when
+    present, every model/altloc otherwise - never atoms it merely shares
+    an asym with. "Posições especiais exigem contexto inequívoco": an
+    unknown `label_asym_id`, an `auth_asym_id` not resolving to exactly
+    one `label_asym_id`, no seq identity at all, or a residue identity
+    that matches no `_atom_site` row in *any* model is a genuinely
+    unresolvable/ambiguous context - `INVALID_CIF`, never a blind
+    omission. A real residue that simply belongs to a different model, a
+    different altloc, or is not retained is instead a *resolved* context
+    with zero (or partial) matches - never an error."""
+
     label_asym_id = table.value("label_asym_id", row_index) if "label_asym_id" in present_columns else None
     if label_asym_id is not None:
-        return
-    auth_asym_id = table.value("auth_asym_id", row_index) if "auth_asym_id" in present_columns else None
-    if auth_asym_id is None:
+        if label_asym_id not in known_label_asym_ids:
+            raise MaterializationExecutionError(
+                "INVALID_CIF",
+                f"category {category!r} row {row_index} label_asym_id={label_asym_id!r} does not "
+                "correspond to any _atom_site.label_asym_id",
+                phase="plan",
+            )
+    else:
+        auth_asym_id = table.value("auth_asym_id", row_index) if "auth_asym_id" in present_columns else None
+        if auth_asym_id is None:
+            raise MaterializationExecutionError(
+                "INVALID_CIF",
+                f"category {category!r} row {row_index} has neither label_asym_id nor auth_asym_id; "
+                "its context cannot be resolved unambiguously before omission",
+                phase="plan",
+            )
+        candidates = auth_to_label_asym.get(auth_asym_id, set())
+        if len(candidates) != 1:
+            raise MaterializationExecutionError(
+                "INVALID_CIF",
+                f"category {category!r} row {row_index} auth_asym_id={auth_asym_id!r} does not resolve to "
+                f"exactly one label_asym_id in M ({sorted(candidates)!r})",
+                phase="plan",
+            )
+        label_asym_id = next(iter(candidates))
+
+    label_seq_id = table.value("label_seq_id", row_index) if "label_seq_id" in present_columns else None
+    auth_seq_id = table.value("auth_seq_id", row_index) if "auth_seq_id" in present_columns else None
+    insertion_token = table.value("pdb_ins_code", row_index) if "pdb_ins_code" in present_columns else None
+    if label_seq_id is None and auth_seq_id is None:
         raise MaterializationExecutionError(
             "INVALID_CIF",
-            f"category {category!r} row {row_index} has neither label_asym_id nor auth_asym_id; "
-            "its context cannot be resolved unambiguously before omission",
+            f"category {category!r} row {row_index} has neither label_seq_id nor auth_seq_id; "
+            "its residue context cannot be resolved unambiguously",
             phase="plan",
         )
-    candidates = auth_to_label_asym.get(auth_asym_id, set())
-    if len(candidates) != 1:
+
+    def _same_residue(atom: AtomObservation) -> bool:
+        if atom.label_asym_id != label_asym_id:
+            return False
+        if label_seq_id is not None:
+            return atom.label_seq_id == label_seq_id
+        return atom.auth_seq_id == auth_seq_id and atom.insertion_token == insertion_token
+
+    if not any(_same_residue(atom) for atom in atoms_by_ordinal.values()):
         raise MaterializationExecutionError(
             "INVALID_CIF",
-            f"category {category!r} row {row_index} auth_asym_id={auth_asym_id!r} does not resolve to "
-            f"exactly one label_asym_id in M ({sorted(candidates)!r})",
+            f"category {category!r} row {row_index} residue context (label_asym_id={label_asym_id!r}, "
+            f"label_seq_id={label_seq_id!r}, auth_seq_id={auth_seq_id!r}, "
+            f"insertion_token={insertion_token!r}) does not correspond to any _atom_site row in any model",
             phase="plan",
         )
+
+    model_token = table.value("pdb_model_num", row_index) if "pdb_model_num" in present_columns else None
+    altloc = table.value("label_alt_id", row_index) if "label_alt_id" in present_columns else None
+
+    return tuple(
+        ordinal for ordinal, atom in atoms_by_ordinal.items()
+        if _same_residue(atom)
+        and (model_token is None or str(atom.model) == model_token)
+        and (altloc is None or atom.altloc == altloc)
+    )
 
 
 def compute_category_decisions(
@@ -3889,6 +4002,7 @@ def compute_category_decisions(
     auth_to_label_asym: Dict[str, "set[str]"] = {}
     for atom in atoms_by_ordinal.values():
         auth_to_label_asym.setdefault(atom.auth_asym_id, set()).add(atom.label_asym_id)
+    known_label_asym_ids = frozenset(atom.label_asym_id for atom in atoms_by_ordinal.values())
 
     cat_defs: Dict[str, Optional[Dict[str, object]]] = {name: _cat_def_for(name) for name in categories}
     unknown_present = sorted(name for name, cat_def in cat_defs.items() if cat_def is None)
@@ -4303,7 +4417,10 @@ def compute_category_decisions(
 
         if row_rule == "SPECIAL_POSITION_GUARD_THEN_OMIT":
             for row_index in range(table.row_count):
-                _guard_special_position_row(category, table, row_index, present_columns, auth_to_label_asym)
+                _resolve_special_position_row_atoms(
+                    category, table, row_index, present_columns, auth_to_label_asym,
+                    atoms_by_ordinal, known_label_asym_ids,
+                )
             decisions[category] = CategoryDecision(
                 category=category, action="guard_then_omit",
                 omitted_row_ordinals=tuple(range(table.row_count)),
@@ -4379,3 +4496,52 @@ def compute_category_decisions(
         )
 
     return tuple(decisions[name] for name in sorted(decisions))
+
+
+def compute_special_position_summary(
+    *,
+    categories: Mapping[str, "RawCategoryTable"],
+    atoms_by_ordinal: Mapping[int, AtomObservation],
+    atom_decisions_by_ordinal: Mapping[int, AtomDecision],
+) -> SpecialPositionSummary:
+    """Section 11/SCHEMAS Section 8 (R-CP2-01): the three frozen
+    `_pdbx_struct_special_symmetry` counts - source annotation rows, rows
+    with a real retained-atom intersection, and the unique retained atoms
+    that intersection covers (never double-counted across overlapping
+    annotations). Computed independently of `compute_category_decisions`'s
+    own per-row guard (which already raises on an unresolvable/ambiguous
+    context) using the same resolution rule, so a caller that only needs
+    the three counts - never the `CategoryDecision` vector itself - does
+    not have to re-derive them by hand. Zero counts when the category is
+    absent, per SCHEMAS Section 8."""
+
+    table = categories.get("_pdbx_struct_special_symmetry")
+    if table is None:
+        return _ZERO_SPECIAL_POSITION_SUMMARY
+
+    present_columns = frozenset(table.columns.keys())
+    kept_atom_ordinals = frozenset(
+        ordinal for ordinal, decision in atom_decisions_by_ordinal.items() if decision.retained
+    )
+    auth_to_label_asym: Dict[str, "set[str]"] = {}
+    for atom in atoms_by_ordinal.values():
+        auth_to_label_asym.setdefault(atom.auth_asym_id, set()).add(atom.label_asym_id)
+    known_label_asym_ids = frozenset(atom.label_asym_id for atom in atoms_by_ordinal.values())
+
+    retained_annotation_count = 0
+    retained_unique_atoms: "set[int]" = set()
+    for row_index in range(table.row_count):
+        matches = _resolve_special_position_row_atoms(
+            "_pdbx_struct_special_symmetry", table, row_index, present_columns,
+            auth_to_label_asym, atoms_by_ordinal, known_label_asym_ids,
+        )
+        retained_matches = tuple(ordinal for ordinal in matches if ordinal in kept_atom_ordinals)
+        if retained_matches:
+            retained_annotation_count += 1
+            retained_unique_atoms.update(retained_matches)
+
+    return SpecialPositionSummary(
+        source_annotation_count=table.row_count,
+        retained_annotation_count=retained_annotation_count,
+        retained_unique_atom_count=len(retained_unique_atoms),
+    )
