@@ -1,0 +1,29 @@
+{
+  "pdb_id": "5I55",
+  "title": "Psm alpha-3 (Staphylococcus aureus phenol-soluble modulin alpha 3 peptide toxin)",
+  "source_url": "https://files.rcsb.org/download/5I55.cif",
+  "retrieved_at_utc": "2026-11-24",
+  "retrieval_method": "curl (direct HTTPS download of the real RCSB deposition, no synthetic/mock content)",
+  "deposition_method": "X-RAY DIFFRACTION",
+  "files": {
+    "5I55.cif": {
+      "role": "original, byte-for-byte as downloaded, never modified",
+      "sha256": "07b3b7d82c8f8fb1cef0fafe88c25b9e3025194a32f085a14015e22bfac3d127",
+      "size_bytes": 77527
+    },
+    "5I55_trimmed.cif": {
+      "role": "documented derivative used by the CP2 test suite",
+      "sha256": "eba9584da11b29537c0ec30f23fa01fd27ad5ccc96ce8649450eb457530b9567",
+      "size_bytes": 74947,
+      "edit_rationale": "The frozen Increment 021 catalogue (CATALOGUE_SHA256 8561039fd15137811b60316336dff04539df3732710dca6ec4009f23150d6d03) is a fixed 94-category snapshot; this real 2026 deposition declares three administrative categories added to the PDB mmCIF dictionary after that snapshot was taken, which the catalogue was never extended to cover and which the frozen contract requires rejecting outright (UNSUPPORTED_CATEGORY) if present. Those three loops were removed verbatim (whole loop_ header+rows, nothing else touched) so the fixture exercises the catalogue/connection/symmetry engine itself rather than this unrelated, inherent scope gap. Removal was done by a line-based script (never a hand-rolled CIF value parser) and independently verified afterwards by reparsing both files with real Gemmi 0.7.5 and diffing their category_names sets: the removed set is exactly {_pdbx_audit_revision_category, _pdbx_audit_revision_item, _pdbx_modification_feature}, and no other category gained or lost rows.",
+      "categories_removed": ["_pdbx_audit_revision_category", "_pdbx_audit_revision_item", "_pdbx_modification_feature"]
+    }
+  },
+  "scenario_usage": {
+    "id": "T021-147 (catalog-three-real) / T021-090 (binding-real), positive case",
+    "resolved_model": 1,
+    "resolved_chains": [{"label_asym_id": "A", "label_entity_id": "1"}],
+    "unaddressed_components": "preserve",
+    "expected_outcome": "successful end-to-end materialization: covale1 (an intramolecular modified-residue linkage, label_asym_id A on both ends) is preserved (both-retained, both-identity); _pdbx_struct_mod_residue carries one MSE->MET parent reference (parent_comp_id never required to have its own _chem_comp row - Section 11 documentary reference, not a dangling-pointer defect); _chem_comp closure keeps ACT/ALA/ASN/ASP/GLU/GLY/HOH/LEU/LYS/MPD/MSE/PHE/VAL as referenced by retained atoms."
+  }
+}

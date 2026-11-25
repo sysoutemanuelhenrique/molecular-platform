@@ -24,6 +24,7 @@ below; every translated exception preserves the original via
 """
 
 import dataclasses
+import hashlib
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -1055,15 +1056,35 @@ class ParsedCifDom021:
 
 
 def raw_cif_null_to_optional_str(raw_token: Optional[str]) -> Optional[str]:
-    """A bare, unquoted `.`/`?` is a real CIF null; anything else
-    (including a quoted `'.'`/`'?'`/`"."`/`"?"` string, which this
-    function's caller must pass already de-quoted by Gemmi's cooked
-    category access, never the raw form, to tell apart) is a genuine
-    token. An absent column (`raw_token is None`) is also null."""
+    """A bare, unquoted `.`/`?` is a real CIF null; a *quoted*
+    `'.'`/`'?'`/`"."`/`"?"` string is a genuine token, not null - which is
+    exactly why this must run on the still-quoted RAW token (as
+    `get_mmcif_category(..., raw=True)` returns it), never on a value
+    already decoded by `gemmi.cif.as_string()` (decoding first would
+    strip the very quote marks that make the distinction possible,
+    collapsing both to the same bare "."/"?"). Callers that need a
+    *cooked* identifier for lookup/comparison - never for hashing, which
+    must keep the literal raw form - decode it with `_decoded_token`
+    below, strictly after this null check, never before. An absent
+    column (`raw_token is None`) is also null."""
 
     if raw_token is None or raw_token in (".", "?"):
         return None
     return raw_token
+
+
+def _decoded_token(raw_token: Optional[str]) -> Optional[str]:
+    """The null-checked AND cooked (quote-stripped) value of one raw CIF
+    token - for building identifiers used in lookup/comparison
+    (`AtomObservation.label_asym_id`, `_entity.id`, operator expressions,
+    ...), never for hashing (`compute_source_rows_key` reads
+    `RawCategoryTable.raw_columns` directly, keeping the true raw form -
+    the C-02 correction). A no-op for the overwhelmingly common case of
+    an already-unquoted token; only a token genuinely quoted in the
+    source is actually decoded here."""
+
+    value = raw_cif_null_to_optional_str(raw_token)
+    return value if value is None else gemmi.cif.as_string(value)
 
 
 def _reject_invalid_cif_encoding(raw_bytes: bytes) -> str:
@@ -1078,8 +1099,24 @@ def _reject_invalid_cif_encoding(raw_bytes: bytes) -> str:
 
 
 def _reject_save_frames(text: str) -> None:
-    if _SAVE_FRAME_PATTERN.search(text):
-        raise CifSaveFrameRejectedError("RAW content declares a CIF save frame")
+    """A real CIF save frame marker (`save_<name>`) is only syntax when it
+    starts a line *outside* a semicolon-delimited multi-line text field
+    (C-06): a value's literal text content may legitimately contain the
+    substring `save_literal_inside_text` on a line of its own without
+    that being save-frame syntax at all. A line is CIF text-field content
+    whenever it falls between two lines that each start with `;` (the
+    text-field delimiter) - never scanned for CIF tokens; only the lines
+    outside any such span are checked against `_SAVE_FRAME_PATTERN`."""
+
+    in_text_field = False
+    for line in text.split("\n"):
+        if line.startswith(";"):
+            in_text_field = not in_text_field
+            continue
+        if in_text_field:
+            continue
+        if _SAVE_FRAME_PATTERN.match(line):
+            raise CifSaveFrameRejectedError("RAW content declares a CIF save frame")
 
 
 def _reject_cell_too_large(category_name: str, column: str, token: str) -> None:
@@ -1257,8 +1294,8 @@ def _build_entity_type_lookup(dom: ParsedCifDom021) -> "Dict[str, str]":
         return {}
     lookup: "Dict[str, str]" = {}
     for row_index in range(entity_table.row_count):
-        entity_id = raw_cif_null_to_optional_str(entity_table.get(row_index, "id"))
-        entity_type_token = raw_cif_null_to_optional_str(entity_table.get(row_index, "type"))
+        entity_id = _decoded_token(entity_table.get(row_index, "id"))
+        entity_type_token = _decoded_token(entity_table.get(row_index, "type"))
         if entity_id is None or entity_type_token is None:
             continue
         lowered = entity_type_token.strip().lower()
@@ -1276,7 +1313,7 @@ def _build_atom_observations(
     atoms: List["rm.AtomObservation"] = []
     for row_index in range(table.row_count):
         def get(column: str) -> Optional[str]:
-            return raw_cif_null_to_optional_str(table.get(row_index, column))
+            return _decoded_token(table.get(row_index, column))
 
         atom_id = get("id")
         if atom_id is None:
@@ -1332,7 +1369,7 @@ def _build_connection_rows(dom: ParsedCifDom021) -> Tuple["rm.RawConnectionRow",
     rows: List["rm.RawConnectionRow"] = []
     for row_index in range(table.row_count):
         def get(column: str) -> Optional[str]:
-            return raw_cif_null_to_optional_str(table.get(row_index, column))
+            return _decoded_token(table.get(row_index, column))
 
         def endpoint(prefix: str) -> "rm.RawConnectionEndpointTokens":
             return rm.RawConnectionEndpointTokens(
@@ -1372,8 +1409,8 @@ def _build_symmetry_operator_tables(dom: ParsedCifDom021) -> "rm.SymmetryOperato
             return None
         result: "Dict[str, Optional[str]]" = {}
         for row_index in range(table.row_count):
-            operator_id = raw_cif_null_to_optional_str(table.get(row_index, "id"))
-            expression = raw_cif_null_to_optional_str(table.get(row_index, expression_column))
+            operator_id = _decoded_token(table.get(row_index, "id"))
+            expression = _decoded_token(table.get(row_index, expression_column))
             if operator_id is None:
                 continue
             result[operator_id] = None if operator_id in result else expression
@@ -1386,13 +1423,21 @@ def _build_symmetry_operator_tables(dom: ParsedCifDom021) -> "rm.SymmetryOperato
 
 
 def _build_category_tables(dom: ParsedCifDom021) -> "Dict[str, rm.RawCategoryTable]":
+    """Builds both views the C-02 correction requires: the *decoded* view
+    (`.`/`?` collapsed to `None`, used for every membership/lookup/
+    identity computation in the domain) and the *raw* view (the literal
+    token Gemmi returned, `.`/`?` kept apart from each other and from a
+    quoted `'.'`/`'?'` string - used for hashing/audit, so two real
+    tokens that both happen to mean "no value" never collapse into the
+    same `source_rows_key`)."""
+
     tables: "Dict[str, rm.RawCategoryTable]" = {}
     for name, category in dom.categories.items():
         columns = {
-            column: tuple(raw_cif_null_to_optional_str(value) for value in values)
+            column: tuple(_decoded_token(value) for value in values)
             for column, values in category.columns.items()
         }
-        tables[f"_{name}"] = rm.RawCategoryTable(columns=columns)
+        tables[f"_{name}"] = rm.RawCategoryTable(columns=columns, raw_columns=dict(category.columns))
     return tables
 
 
@@ -1422,12 +1467,22 @@ def _build_output_category_tokens(
 
 
 def _verify_output_reparse(
-    *, category_decisions: Tuple["rm.CategoryDecision", ...], entry_id: str, reparsed: ParsedCifDom021,
+    *,
+    category_decisions: Tuple["rm.CategoryDecision", ...],
+    entry_id: str,
+    output_categories: "Dict[str, Dict[str, List[str]]]",
+    reparsed: ParsedCifDom021,
 ) -> None:
-    """Section 18: an independent reparse of the bytes just serialized must
-    reproduce exactly the survivor shape the plan decided - acceptance by
-    the writer/reader of the same library alone is never sufficient proof
-    (brief Section 4, point 5)."""
+    """Section 18/C-03: an independent reparse of the bytes just
+    serialized must reproduce exactly the *values* the plan decided to
+    write (`output_categories`, the independently-derived expected token
+    vector - never re-derived from the reparsed DOM itself) - cell by
+    cell, in source row order, with no extra surviving column - not
+    merely a matching row count and tag presence. Acceptance by the
+    writer/reader of the same library alone is never sufficient proof
+    (brief Section 4, point 5): a changed id, a corrupted coordinate, a
+    dropped/added column, or reordered rows must all raise
+    `INVALID_OUTPUT` here, even when the shape alone would look fine."""
 
     for decision in category_decisions:
         canonical = decision.category.lstrip("_")
@@ -1447,6 +1502,8 @@ def _verify_output_reparse(
                     phase="plan",
                 )
             continue
+
+        expected_columns = output_categories.get(canonical, {})
         reparsed_table = reparsed.categories.get(canonical)
         expected_rows = len(decision.kept_row_ordinals)
         if reparsed_table is None or reparsed_table.row_count != expected_rows:
@@ -1456,13 +1513,31 @@ def _verify_output_reparse(
                 f"got {0 if reparsed_table is None else reparsed_table.row_count}",
                 phase="plan",
             )
-        for column in decision.preserved_tags:
+
+        unexpected_columns = set(reparsed_table.columns) - set(expected_columns)
+        if unexpected_columns:
+            raise rm.MaterializationExecutionError(
+                "INVALID_OUTPUT",
+                f"category {decision.category!r} reparsed output carries unexpected tag(s) {sorted(unexpected_columns)!r}",
+                phase="plan",
+            )
+
+        for column, expected_values in expected_columns.items():
             if column not in reparsed_table.columns:
                 raise rm.MaterializationExecutionError(
                     "INVALID_OUTPUT",
                     f"category {decision.category!r} preserved tag {column!r} is absent from the reparsed output",
                     phase="plan",
                 )
+            for row_index, expected_value in enumerate(expected_values):
+                actual_value = reparsed_table.get(row_index, column)
+                if actual_value != expected_value:
+                    raise rm.MaterializationExecutionError(
+                        "INVALID_OUTPUT",
+                        f"category {decision.category!r} row {row_index} tag {column!r} reparsed as "
+                        f"{actual_value!r}, expected {expected_value!r}",
+                        phase="plan",
+                    )
 
 
 def materialize_receptor_cif021(
@@ -1473,14 +1548,61 @@ def materialize_receptor_cif021(
     raw_bytes: bytes,
 ) -> MaterializationAdapterResult:
     """Increment 021 Checkpoint 2's whole adapter pipeline (brief Section
-    4): parse the RAW bytes into a DOM exactly once, build the pure
-    `rm.AtomObservation`/`rm.RawConnectionRow`/`rm.SymmetryOperatorTables`/
-    `rm.RawCategoryTable` inputs from real tokens, run the S/D/U/X/O
-    planner, the connection/symmetry resolver and the catalogue engine,
-    derive the `tbmp_<plan_key>` entry/block identity from the resulting
-    `plan_key`, serialize `receptor.cif` bytes, and independently reparse
-    them to verify the output. Never opens a file by path, never reparses
-    the *source* RAW a second time - only the newly serialized bytes."""
+    4): confirm the received `raw_bytes` are the exact bytes
+    `source_context` already describes (size/checksum) and that the
+    installed Gemmi is the pinned engine (C-04 - never skip this and
+    parse first), parse the RAW bytes into a DOM exactly once, build the
+    pure `rm.AtomObservation`/`rm.RawConnectionRow`/
+    `rm.SymmetryOperatorTables`/`rm.RawCategoryTable` inputs from real
+    tokens, run the S/D/U/X/O planner, the connection/symmetry resolver
+    and the catalogue engine, derive the `tbmp_<plan_key>` entry/block
+    identity from the resulting `plan_key`, serialize `receptor.cif`
+    bytes, and independently reparse them to verify the output. Never
+    opens a file by path, never reparses the *source* RAW a second time
+    - only the newly serialized bytes.
+
+    `import gemmi` above is a plain, eager module-level import - this
+    file (never `receptor_materialization.py`) is the one dedicated
+    adapter module ARCH-01 permits to hold it; nothing here is a "late"
+    import in the deferred sense, only the explicit version pin check
+    immediately below stands between the module already being loaded
+    and this function actually calling into it."""
+
+    if gemmi.__version__ != rm.ENGINE_VERSION:
+        raise rm.MaterializationConfigurationError(
+            "ENGINE_VERSION",
+            f"installed Gemmi is {gemmi.__version__!r}; this checkpoint is pinned to {rm.ENGINE_VERSION!r}",
+        )
+    if source_context.parser.name != rm.ENGINE_NAME or source_context.parser.version != rm.ENGINE_VERSION:
+        raise rm.MaterializationConfigurationError(
+            "ENGINE_UNAVAILABLE",
+            f"source_context.parser {source_context.parser.name}/{source_context.parser.version} "
+            f"does not match the pinned engine {rm.ENGINE_NAME}/{rm.ENGINE_VERSION}",
+        )
+    actual_size = len(raw_bytes)
+    if actual_size > MAX_RAW_ARTIFACT_SIZE_BYTES:
+        raise CifStructuralLimitExceededError(
+            f"RAW content is {actual_size} bytes, exceeding the {MAX_RAW_ARTIFACT_SIZE_BYTES} limit"
+        )
+    if actual_size != source_context.raw_size_bytes:
+        raise rm.MaterializationConfigurationError(
+            "SOURCE_CHANGED",
+            f"received {actual_size} RAW byte(s); source_context.raw_size_bytes declares "
+            f"{source_context.raw_size_bytes}",
+        )
+    actual_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+    if actual_sha256 != source_context.raw_sha256:
+        raise rm.MaterializationConfigurationError(
+            "CHECKSUM_MISMATCH",
+            f"received RAW SHA-256 {actual_sha256} does not match source_context.raw_sha256 "
+            f"{source_context.raw_sha256}",
+        )
+    for format_name, signature in _MAGIC_BYTES_BY_FORMAT:
+        if raw_bytes[: len(signature)] == signature:
+            raise CompressedRawContentError(
+                f"RAW content begins with the {format_name} magic bytes; "
+                "compressed content is never accepted, regardless of declared format"
+            )
 
     dom = parse_receptor_cif_dom021(raw_bytes)
     entity_type_by_id = _build_entity_type_lookup(dom)
@@ -1525,7 +1647,11 @@ def materialize_receptor_cif021(
         category_decisions=category_decisions, connection_decisions=connection_decisions,
     )
 
-    entry_id = f"TBMP_{plan.plan_key}"
+    # Section 11: "nome do novo block como tbmp_<plan_key>" - both the
+    # generated _entry.id and the block name share the same lowercase
+    # prefix (C-06: a prior "TBMP_" was a transcription slip, not a
+    # distinct identity scheme).
+    entry_id = f"tbmp_{plan.plan_key}"
     block_name = f"tbmp_{plan.plan_key}"
     output_categories = _build_output_category_tokens(
         dom=dom, category_decisions=category_decisions, entry_id=entry_id,
@@ -1536,6 +1662,9 @@ def materialize_receptor_cif021(
     )
 
     reparsed = reparse_and_extract_cif_dom021(output_bytes)
-    _verify_output_reparse(category_decisions=category_decisions, entry_id=entry_id, reparsed=reparsed)
+    _verify_output_reparse(
+        category_decisions=category_decisions, entry_id=entry_id,
+        output_categories=output_categories, reparsed=reparsed,
+    )
 
     return MaterializationAdapterResult(plan=plan, output_bytes=output_bytes, reparsed=reparsed)

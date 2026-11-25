@@ -41,10 +41,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import re
 import unicodedata
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Dict, FrozenSet, List, Literal, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -2309,6 +2309,20 @@ def resolve_connection_decisions(
 # surviving entity/asym (Section 11: "manter toda a sequência declarada...
 # não afirmar que sequência declarada equivale a átomos presentes"), not a
 # different membership test.
+#
+# C-05: the catalogue's top-level `required_categories`/`conditional_categories`
+# fields (never transcribed into `_FROZEN_CATALOGUE` above, which only
+# carries each category's own projection) - a retained polymer/branched
+# entity or a preserved `struct_conn` row makes its companion categories
+# mandatory, not merely "optional and absent", and the four categories
+# below are always required outright. Transcribed from the same pinned
+# `CATALOG_021.json` (`CATALOGUE_SHA256`).
+_CATALOGUE_REQUIRED_CATEGORIES: Tuple[str, ...] = ("_atom_site", "_struct_asym", "_entity", "_chem_comp")
+_CATALOGUE_CONDITIONAL_CATEGORIES: Dict[str, Tuple[str, ...]] = {
+    "retained_polymer_entity": ("_entity_poly", "_entity_poly_seq", "_pdbx_poly_seq_scheme"),
+    "retained_branched_entity": ("_pdbx_entity_branch", "_pdbx_entity_branch_list", "_pdbx_branch_scheme"),
+    "retained_struct_conn": ("_struct_conn_type",),
+}
 _FROZEN_CATALOGUE: Dict[str, Dict[str, object]] = {'_atom_site': {'action': 'filter',
                 'key': ('id',),
                 'required_tags': ('id',
@@ -3403,14 +3417,34 @@ _FROZEN_CATALOGUE: Dict[str, Dict[str, object]] = {'_atom_site': {'action': 'fil
 
 
 class RawCategoryTable(NamedTuple):
-    """A plain (gemmi-free) column-major view of one CIF category's rows:
-    `columns[tag]` is a tuple of raw tokens, one per row, already decoded
-    to `None`/`str` by the Checkpoint 2 adapter boundary
-    (`receptor_parsing.raw_cif_null_to_optional_str` - never imported here,
-    ARCH-01). Every column tuple has the same length; a category with no
-    declared columns has `row_count == 0`."""
+    """A plain (gemmi-free) column-major view of one CIF category's rows.
+
+    Two separate views, per the C-02 correction (two distinct real null
+    markers, `.`/`?`, must never collapse into the same hashed identity):
+
+    - `columns[tag]` is the *decoded* view (`None`/`str`, already
+      null-collapsed by the Checkpoint 2 adapter boundary via
+      `receptor_parsing.raw_cif_null_to_optional_str` - never imported
+      here, ARCH-01). Every lookup/membership/identity computation in
+      this module reads this view.
+    - `raw_columns[tag]`, when the adapter boundary supplies it, is the
+      *literal* undecoded token Gemmi returned (`.`/`?`/a quoted string/
+      any other token, always a real `str`, never collapsed to `None`).
+      `compute_source_rows_key` hashes *this* view - the audit trail must
+      distinguish "inapplicable" (`.`) from "unknown" (`?`) from an
+      actually-quoted `'.'`/`'?'` string, even though all of them may
+      decode to the same `None` for filtering purposes. When a caller
+      omits `raw_columns` (every pure-domain test that builds a
+      `RawCategoryTable` directly, never through the real adapter), the
+      decoded `columns` view is used for hashing too - a deliberate,
+      documented fallback, never a silent default that only happens to
+      look identical.
+
+    Every column tuple has the same length; a category with no declared
+    columns has `row_count == 0`."""
 
     columns: Dict[str, Tuple[Optional[str], ...]]
+    raw_columns: Optional[Dict[str, Tuple[str, ...]]] = None
 
     @property
     def row_count(self) -> int:
@@ -3421,24 +3455,43 @@ class RawCategoryTable(NamedTuple):
     def value(self, column: str, row_index: int) -> Optional[str]:
         return self.columns[column][row_index]
 
+    def raw_value(self, column: str, row_index: int) -> object:
+        source = self.raw_columns if self.raw_columns is not None else self.columns
+        return source[column][row_index]
+
 
 def compute_source_rows_key(*, source_context_key: str, category: str, table: "RawCategoryTable") -> str:
-    """Section 11: "fonte presente vazia também tem hash não nulo" - this
-    hash is always computed over the category's *own* declared columns
-    (sorted, for determinism), independent of which rows the catalogue
-    later keeps/omits."""
+    """SCHEMAS Section 4: `source_rows_key` is the *category* envelope
+    hashing the vector of already-hashed *row* envelopes - never a flat
+    column/row grid of its own invention:
+
+        row_key           = H({kind:'receptor-materialization-source-row',
+                                version:'1.0', source_context_key, category,
+                                ordinal, tokens:[{tag,token},...]})
+        source_rows_key   = H({kind:'receptor-materialization-source-category',
+                                version:'1.0', source_context_key, category,
+                                rows:[row_key, ...]})
+
+    `tokens` is built from the category's own columns in sorted (Section
+    11: "ordem alfabética de... tags") order, reading the *raw* (literal,
+    never null-collapsed) token via `table.raw_value` - Section 11:
+    "fonte presente vazia também tem hash não nulo", computed independent
+    of which rows the catalogue later keeps/omits."""
 
     columns_sorted = tuple(sorted(table.columns.keys()))
+    row_keys = [
+        compute_row_key(
+            source_context_key=source_context_key, category=category, ordinal=row_index,
+            tokens=tuple((column, table.raw_value(column, row_index)) for column in columns_sorted),
+        )
+        for row_index in range(table.row_count)
+    ]
     payload = {
-        "kind": "receptor-materialization-source-rows",
+        "kind": "receptor-materialization-source-category",
         "version": "1.0",
         "source_context_key": source_context_key,
         "category": category,
-        "columns": list(columns_sorted),
-        "rows": [
-            [table.columns[column][row_index] for column in columns_sorted]
-            for row_index in range(table.row_count)
-        ],
+        "rows": row_keys,
     }
     return compute_materialization_hash(payload)
 
@@ -3471,6 +3524,82 @@ def _filter_rows_by_membership(
     return tuple(kept), tuple(omitted)
 
 
+def _validate_key_integrity(category: str, table: "RawCategoryTable", key_columns: Tuple[str, ...]) -> None:
+    """C-05: every non-omitted catalogue category has `nonnull_key: true`
+    - a key column's value is never null, and a repeated key tuple is a
+    profile-identity-key violation ("IDs duplicados de chaves do perfil
+    recusam"), independent of whatever row_rule later filters the row."""
+
+    if not key_columns:
+        return
+    seen_keys: "set[Tuple[object, ...]]" = set()
+    for row_index in range(table.row_count):
+        key_values = tuple(table.value(column, row_index) for column in key_columns)
+        if any(value is None for value in key_values):
+            raise MaterializationExecutionError(
+                "INVALID_CIF",
+                f"category {category!r} row {row_index} has a null key column among {key_columns!r}",
+                phase="plan",
+            )
+        if key_values in seen_keys:
+            raise MaterializationExecutionError(
+                "INVALID_CIF",
+                f"category {category!r} declares a duplicate key {key_values!r} over columns {key_columns!r}",
+                phase="plan",
+            )
+        seen_keys.add(key_values)
+
+
+_SIMPLE_REFERENCE_PATTERN = re.compile(r"^_([a-z0-9_]+)\.([a-z0-9_]+)$")
+
+
+def _validate_simple_references(
+    category: str, table: "RawCategoryTable", references: Dict[str, str], categories: Mapping[str, "RawCategoryTable"],
+) -> None:
+    """C-05: "Validar coerência de asym↔entity↔seq/branch↔CCD... na
+    fonte". A simple single-column reference (`"_category.column"`)
+    must resolve to a real row in the target category, when that target
+    category is itself present (its *absence* is governed by the
+    required/conditional-category checks, never silently re-litigated
+    here). A compound reference (`"_category(col_a,col_b,...)"`, e.g.
+    branch/entity_poly_seq composite keys) is intentionally skipped here
+    - it is validated by bespoke logic that knows which of the row's
+    *other* columns complete the composite key, never guessed
+    generically from the expression text.
+
+    `_pdbx_struct_mod_residue.parent_comp_id` is excluded outright: real
+    depositions name the *standard, unmodeled* parent residue there (e.g.
+    `parent_comp_id="MET"` for an `MSE` selenomethionine actually present)
+    - `_chem_comp` legitimately never carries a row for a CCD that was
+    never physically instantiated. The reference still *enters the CCD
+    closure* for `_chem_comp` filtering purposes (Section 11) - a
+    documentary/descriptive reference, not a dangling-pointer defect."""
+
+    for column, target_reference in references.items():
+        if (category, column) == ("_pdbx_struct_mod_residue", "parent_comp_id"):
+            continue
+        match = _SIMPLE_REFERENCE_PATTERN.fullmatch(target_reference)
+        if match is None or column not in table.columns:
+            continue
+        target_category, target_column = f"_{match.group(1)}", match.group(2)
+        target_table = categories.get(target_category)
+        if target_table is None or target_column not in target_table.columns:
+            continue
+        target_values = frozenset(
+            value for row_index in range(target_table.row_count)
+            if (value := target_table.value(target_column, row_index)) is not None
+        )
+        for row_index in range(table.row_count):
+            value = table.value(column, row_index)
+            if value is not None and value not in target_values:
+                raise MaterializationExecutionError(
+                    "INVALID_CIF",
+                    f"category {category!r} row {row_index} {column}={value!r} does not reference any "
+                    f"{target_category}.{target_column}",
+                    phase="plan",
+                )
+
+
 def _cat_def_for(category: str) -> Optional[Dict[str, object]]:
     cat_def = _FROZEN_CATALOGUE.get(category)
     if cat_def is not None:
@@ -3483,13 +3612,37 @@ def _cat_def_for(category: str) -> Optional[Dict[str, object]]:
     return None
 
 
-def _finite_numeric_token(token: Optional[str]) -> bool:
-    if token is None:
-        return False
+_NUMERIC_TOKEN_PATTERN = re.compile(
+    r"^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?:\([0-9]+\))?$"
+)
+_TRAILING_SU_PATTERN = re.compile(r"\([0-9]+\)$")
+
+
+def _validate_numeric_token(token: Optional[str]) -> Optional[Decimal]:
+    """Section 6's closed numeric-token grammar: an su-exponent suffix is
+    only ever accepted *after* the exponent ("aceitar 1.2e3(4) e recusar
+    1.2(4)e3" - the regex's own `(?:[eE]...)?(?:\\(...\\))?` ordering
+    already enforces this; `1.2(4)e3` fails the full match because the
+    trailing `e3` sits after the su group, which the grammar never
+    permits). Never Python's own numeric literal syntax (`1_000` must be
+    refused, not silently accepted as 1000 the way a bare `float()` call
+    would). Returns the finite central `Decimal` with the su suffix
+    stripped only for *validation/comparison* - never to rewrite the
+    token that gets written back out - or `None` if the token is
+    absent/malformed/non-finite."""
+
+    if token is None or not _NUMERIC_TOKEN_PATTERN.fullmatch(token):
+        return None
+    core = _TRAILING_SU_PATTERN.sub("", token)
     try:
-        return math.isfinite(float(token))
-    except ValueError:
-        return False
+        value = Decimal(core)
+    except InvalidOperation:
+        return None
+    return value if value.is_finite() else None
+
+
+def _finite_numeric_token(token: Optional[str]) -> bool:
+    return _validate_numeric_token(token) is not None
 
 
 _ANISOTROP_U_COLUMNS = ("u[1][1]", "u[1][2]", "u[1][3]", "u[2][2]", "u[2][3]", "u[3][3]")
@@ -3505,8 +3658,11 @@ _NCS_MATRIX_COLUMNS = (
     "matrix[3][1]", "matrix[3][2]", "matrix[3][3]",
 )
 _NCS_VECTOR_COLUMNS = ("vector[1]", "vector[2]", "vector[3]")
-_NCS_IDENTITY_MATRIX = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
-_NCS_IDENTITY_TOLERANCE = 1e-6
+_NCS_IDENTITY_MATRIX_DECIMAL = (
+    Decimal(1), Decimal(0), Decimal(0),
+    Decimal(0), Decimal(1), Decimal(0),
+    Decimal(0), Decimal(0), Decimal(1),
+)
 _CCD_CLOSURE_SOURCE_COLUMN = {
     "_entity_poly_seq": "mon_id",
     "_pdbx_entity_branch_list": "comp_id",
@@ -3572,25 +3728,68 @@ def _validate_anisotrop_field_agreement(
             )
 
 
+_ATOM_SITE_COORDINATE_COLUMNS = ("cartn_x", "cartn_y", "cartn_z")
+
+
+def _validate_atom_site_numeric_row(
+    table: "RawCategoryTable", row_index: int, present_columns: FrozenSet[str],
+) -> None:
+    # Section 6: "Coordenadas presentes e finitas... Coordenadas não
+    # aceitam null." - applied to every source row, regardless of
+    # retention (malformed source data is a structural problem
+    # independent of which atoms the plan keeps).
+    for column in _ATOM_SITE_COORDINATE_COLUMNS:
+        token = table.value(column, row_index) if column in present_columns else None
+        if _validate_numeric_token(token) is None:
+            raise MaterializationExecutionError(
+                "INVALID_CIF",
+                f"_atom_site row {row_index} has a null/non-finite/malformed {column!r}",
+                phase="plan",
+            )
+    # "occupancy/B_iso aceitam null real, ou esse número finito
+    # (occupancy não negativa)."
+    occupancy_token = table.value("occupancy", row_index) if "occupancy" in present_columns else None
+    if occupancy_token is not None:
+        occupancy_value = _validate_numeric_token(occupancy_token)
+        if occupancy_value is None:
+            raise MaterializationExecutionError(
+                "INVALID_CIF", f"_atom_site row {row_index} has a non-finite/malformed occupancy", phase="plan",
+            )
+        if occupancy_value < 0:
+            raise MaterializationExecutionError(
+                "INVALID_CIF", f"_atom_site row {row_index} has a negative occupancy {occupancy_token!r}", phase="plan",
+            )
+    b_iso_token = table.value("b_iso_or_equiv", row_index) if "b_iso_or_equiv" in present_columns else None
+    if b_iso_token is not None and _validate_numeric_token(b_iso_token) is None:
+        raise MaterializationExecutionError(
+            "INVALID_CIF", f"_atom_site row {row_index} has a non-finite/malformed b_iso_or_equiv", phase="plan",
+        )
+
+
 def _guard_ncs_row(category: str, table: "RawCategoryTable", row_index: int) -> None:
     # Section 11: "NCS não identidade com generate/null recusa
     # UNSUPPORTED_NCS antes de omitir; given/identidade podem ser omitidos
     # auditados... Código/matriz incompletos inválidos recusam INVALID_CIF."
-    values: Dict[str, float] = {}
+    values: Dict[str, Decimal] = {}
     for column in _NCS_MATRIX_COLUMNS + _NCS_VECTOR_COLUMNS:
         token = table.value(column, row_index) if column in table.columns else None
-        if not _finite_numeric_token(token):
+        value = _validate_numeric_token(token)
+        if value is None:
             raise MaterializationExecutionError(
                 "INVALID_CIF",
                 f"category {category!r} row {row_index} has a missing/non-finite NCS operator component {column!r}",
                 phase="plan",
             )
-        values[column] = float(token)
+        values[column] = value
 
+    # Exact Decimal identity - never a float tolerance (a nonzero
+    # translation like 0.0000001 is never "close enough" to identity;
+    # Decimal equality compares value, not representation, so "1.0" still
+    # equals Decimal(1)).
     is_identity = all(
-        abs(values[column] - expected) <= _NCS_IDENTITY_TOLERANCE
-        for column, expected in zip(_NCS_MATRIX_COLUMNS, _NCS_IDENTITY_MATRIX)
-    ) and all(abs(values[column]) <= _NCS_IDENTITY_TOLERANCE for column in _NCS_VECTOR_COLUMNS)
+        values[column] == expected
+        for column, expected in zip(_NCS_MATRIX_COLUMNS, _NCS_IDENTITY_MATRIX_DECIMAL)
+    ) and all(values[column] == 0 for column in _NCS_VECTOR_COLUMNS)
 
     code = table.value("code", row_index) if "code" in table.columns else None
     code_normalized = code.strip().lower() if isinstance(code, str) else None
@@ -3695,6 +3894,85 @@ def compute_category_decisions(
             phase="plan",
         )
 
+    # C-05: always-required categories, independent of anything retained.
+    missing_required = [name for name in _CATALOGUE_REQUIRED_CATEGORIES if name not in categories]
+    if missing_required:
+        raise MaterializationExecutionError(
+            "INVALID_CIF",
+            f"source CIF is missing always-required categor(y/ies) {missing_required!r}",
+            phase="plan",
+        )
+
+    # C-05: a retained polymer/branched entity, or a preserved
+    # struct_conn row, makes its companion categories conditionally
+    # mandatory (Section 11: "Se categoria condicional do catálogo for
+    # necessária a entidade/ligação retida e estiver ausente, recusar.") -
+    # never merely tracked as an absent-optional category.
+    entity_table = categories["_entity"]
+    entity_type_by_id: Dict[str, str] = {}
+    for row_index in range(entity_table.row_count):
+        entity_id = entity_table.value("id", row_index)
+        entity_type = entity_table.value("type", row_index)
+        if entity_id is not None and entity_type is not None:
+            entity_type_by_id[entity_id] = entity_type
+
+    retained_polymer_entities = frozenset(
+        entity_id for entity_id in retained_entity_ids if entity_type_by_id.get(entity_id) == "polymer"
+    )
+    retained_branched_entities = frozenset(
+        entity_id for entity_id in retained_entity_ids if entity_type_by_id.get(entity_id) == "branched"
+    )
+    any_struct_conn_preserved = any(decision.action == "preserve" for decision in connection_decisions)
+
+    missing_conditional: "set[str]" = set()
+    if retained_polymer_entities:
+        missing_conditional.update(
+            name for name in _CATALOGUE_CONDITIONAL_CATEGORIES["retained_polymer_entity"] if name not in categories
+        )
+    if retained_branched_entities:
+        missing_conditional.update(
+            name for name in _CATALOGUE_CONDITIONAL_CATEGORIES["retained_branched_entity"] if name not in categories
+        )
+    if any_struct_conn_preserved:
+        missing_conditional.update(
+            name for name in _CATALOGUE_CONDITIONAL_CATEGORIES["retained_struct_conn"] if name not in categories
+        )
+    if missing_conditional:
+        raise MaterializationExecutionError(
+            "INVALID_CIF",
+            f"a retained polymer/branched entity or preserved connection requires conditional "
+            f"categor(y/ies) {sorted(missing_conditional)!r}, which the source does not declare",
+            phase="plan",
+        )
+
+    # C-05/global_rules: "Para cada átomo polimérico retido,
+    # (label_entity_id,label_seq_id,label_comp_id) deve encontrar
+    # (entity_id,num,mon_id) em entity_poly_seq" - a compound key the
+    # generic single-column reference check below cannot express.
+    if retained_polymer_entities:
+        entity_poly_seq_table = categories["_entity_poly_seq"]
+        valid_polymer_triples = frozenset(
+            (
+                entity_poly_seq_table.value("entity_id", row_index),
+                entity_poly_seq_table.value("num", row_index),
+                entity_poly_seq_table.value("mon_id", row_index),
+            )
+            for row_index in range(entity_poly_seq_table.row_count)
+        )
+        for ordinal in sorted(kept_atom_ordinals):
+            atom = atoms_by_ordinal[ordinal]
+            if atom.entity_type != "polymer":
+                continue
+            triple = (atom.entity_id, atom.label_seq_id, atom.ccd)
+            if triple not in valid_polymer_triples:
+                raise MaterializationExecutionError(
+                    "INVALID_CIF",
+                    f"retained polymer atom ordinal={ordinal} (entity_id={atom.entity_id!r}, "
+                    f"label_seq_id={atom.label_seq_id!r}, ccd={atom.ccd!r}) has no matching "
+                    "_entity_poly_seq(entity_id,num,mon_id) row",
+                    phase="plan",
+                )
+
     decisions: Dict[str, CategoryDecision] = {}
     ccd_closure_extra: "set[str]" = set()
 
@@ -3734,6 +4012,25 @@ def compute_category_decisions(
                 f"category {category!r} is missing required tag(s) {missing_required!r}",
                 phase="plan",
             )
+
+        # C-05: key/relationship columns are never null, and a repeated
+        # key tuple is a profile-identity-key violation ("IDs duplicados
+        # de chaves do perfil recusam") - every non-omitted category in
+        # the pinned catalogue has `nonnull_key: true`.
+        # A key column that is itself a *generated* tag (e.g. _cell/
+        # _symmetry's `entry_id`, synthesized fresh from `plan_key` and
+        # trivially unique by construction) never appears as a real
+        # source column - nothing to validate non-null/duplicate against.
+        _validate_key_integrity(
+            category, table, tuple(column for column in cat_def["key"] if column in present_columns),
+        )
+        # C-05: a simple single-column reference ("_category.column")
+        # must resolve to a real row in the target category when the
+        # target category is present; a compound reference
+        # ("_category(col_a,col_b,...)") is handled by bespoke logic
+        # elsewhere (the polymer-atom/entity_poly_seq compound key above,
+        # branch references), never by this generic single-column check.
+        _validate_simple_references(category, table, cat_def["references"], categories)
 
         if row_rule in ("RETAINED_ENTITY", "RETAINED_ENTITY_ALL_SEQUENCE", "RETAINED_ENTITY_ALL_BRANCH"):
             column = _reference_filter_column(cat_def, "_entity.id")
@@ -3783,6 +4080,8 @@ def compute_category_decisions(
                     f"{len(atoms_by_ordinal)} AtomObservation(s) handed to the planner",
                     phase="plan",
                 )
+            for row_index in range(table.row_count):
+                _validate_atom_site_numeric_row(table, row_index, present_columns)
             kept = tuple(sorted(kept_atom_ordinals))
             omitted = tuple(sorted(set(range(table.row_count)) - kept_atom_ordinals))
             decisions[category] = CategoryDecision(

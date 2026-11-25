@@ -1,0 +1,27 @@
+{
+  "pdb_id": "1A2P",
+  "title": "Barnase (three independent copies in the asymmetric unit, with real _struct_ncs_oper operators)",
+  "source_url": "https://files.rcsb.org/download/1A2P.cif",
+  "retrieved_at_utc": "2026-11-24",
+  "retrieval_method": "curl (direct HTTPS download of the real RCSB deposition, no synthetic/mock content)",
+  "deposition_method": "X-RAY DIFFRACTION",
+  "files": {
+    "1A2P.cif": {
+      "role": "original, byte-for-byte as downloaded, never modified",
+      "sha256": "50b78c9c7e95c699e81610db9b140855762bbfb70a7dd821a0acef179d9e54d7",
+      "size_bytes": 618844
+    },
+    "1A2P_trimmed.cif": {
+      "role": "documented derivative used by the CP2 test suite",
+      "sha256": "7a6f3d3e0f958d6be34a4b28fe869d024b3cdadf409d821b70dcde6a68b53431",
+      "size_bytes": 614058,
+      "edit_rationale": "Same rationale as 5i55/PROVENANCE.json. Verified by real-Gemmi reparse diff of category_names before/after.",
+      "categories_removed": ["_pdbx_audit_revision_category", "_pdbx_audit_revision_item", "_pdbx_struct_sheet_hbond"]
+    }
+  },
+  "scenario_usage": {
+    "id": "T021-150-154 (ncs-*) - real _struct_ncs_oper rows, extracted and run directly through the pure NCS guard",
+    "note_honest_limitation": "Full end-to-end materialize_receptor_cif021() of this deposition, selecting chain A only (dispositioning the three ZN ions and nine water asyms to 'remove'), does NOT reach a successful plan: a separate, unrelated real struct_conn row (metalc2, A-D, ptnr1_symmetry='3_675') requires resolving a true crystallographic symmetry operator this profile has no _symmetry_equiv/_space_group_symop table to prove, and correctly raises UNSUPPORTED_SYMMETRY - this is itself a genuine, honestly-reported finding about this specific real deposition's crystallography (a real metal coordination to a symmetry-related copy), not a defect in the NCS handling and not worked around. The two real _struct_ncs_oper rows (id 1/2, both code='given', confirmed non-identity-irrelevant per the frozen rule 'given' never requires an identity check) are therefore exercised directly: extracted verbatim from the real deposition and run through compute_category_decisions()/the pure NCS guard in isolation, proving the guard against genuine deposited operator values rather than a hand-written matrix.",
+    "expected_outcome_ncs_guard": "_struct_ncs_oper category decision action='guard_then_omit', both real rows omitted-audited, no UNSUPPORTED_NCS/INVALID_CIF raised for either (both code='given', values taken verbatim from the deposition)."
+  }
+}

@@ -1708,7 +1708,7 @@ def _endpoint(*, asym="A", ccd="ALA", seq="1", atom_id_label="CA", auth_seq="1",
 
 def _connection_scenario(
     *, retained1, retained2, symmetry1, symmetry2, conn_type="disulf",
-    tables=None, asym1="A", asym2="B", reason1=None, reason2=None,
+    tables=None, asym1="A", asym2="B", reason1=None, reason2=None, source_context_key=None,
 ):
     tables = tables if tables is not None else _no_tables()
     a1 = _atom(ordinal=0, atom_id="a1", label_asym_id=asym1, auth_asym_id=asym1, label_atom_id="CA")
@@ -1729,8 +1729,8 @@ def _connection_scenario(
         ptnr3_present=False, source_tokens=(("id", "c1"),),
     )
     return resolve_connection_decisions(
-        source_context_key=_hex(9), atoms_in_model=atoms_in_model, atom_decisions_by_ordinal=atom_decisions_by_ordinal,
-        raw_connections=(row,), tables=tables,
+        source_context_key=source_context_key or _hex(9), atoms_in_model=atoms_in_model,
+        atom_decisions_by_ordinal=atom_decisions_by_ordinal, raw_connections=(row,), tables=tables,
     )
 
 
@@ -1905,18 +1905,39 @@ _WITH_OPERATOR_2 = SymmetryOperatorTables(symmetry_equiv={"2": "-x,-y,z"}, space
     ],
 )
 def test_identity_basis_pairs_k0_reachable_pairs(symmetry1, symmetry2, tables, expected_basis, scenario_id):  # T021-164/166/168-172
-    decisions = _connection_scenario(
-        retained1=False, retained2=False, symmetry1=symmetry1, symmetry2=symmetry2, tables=tables,
+    # C-07: a *real* plan_key, derived from a real SourceContext/
+    # ResolvedReceptorSelection/atom vector through build_materialization_plan
+    # end to end - never just the same already-built ConnectionDecision
+    # object hashed twice (a tautology that proves nothing about the real
+    # hash chain). Two independently-built plans from identical inputs must
+    # still agree, and partner order (ptnr1-then-ptnr2) is preserved, never
+    # silently normalized/sorted.
+    atoms = (
+        _atom(ordinal=0, atom_id="a1", label_asym_id="A", label_atom_id="CA"),
+        _atom(ordinal=1, atom_id="a2", label_asym_id="B", entity_id="E2", label_atom_id="CA"),
     )
-    assert decisions[0].action == "omit", scenario_id
-    assert decisions[0].identity_basis == expected_basis, scenario_id
-    # Section 13: connection_decisions_key/plan_key are pure functions of the
-    # same bytes/DTOs - hashing an identical decision vector twice must
-    # reproduce the identical digest, and partner order is preserved
-    # (ptnr1-then-ptnr2), never silently normalized/sorted.
-    key_a = compute_connection_decisions_key(source_context_key=_hex(9), decisions=decisions)
-    key_b = compute_connection_decisions_key(source_context_key=_hex(9), decisions=decisions)
-    assert key_a == key_b, scenario_id
+
+    def build_plan():
+        source_context = _source_context()
+        source_context_key = compute_source_context_key(source_context)
+        decisions = _connection_scenario(
+            retained1=False, retained2=False, symmetry1=symmetry1, symmetry2=symmetry2, tables=tables,
+            source_context_key=source_context_key,
+        )
+        assert decisions[0].action == "omit", scenario_id
+        assert decisions[0].identity_basis == expected_basis, scenario_id
+        plan = build_materialization_plan(
+            source_context=source_context, resolved_selection=_resolution(), unaddressed_components="preserve",
+            atoms=atoms, connection_decisions=decisions,
+        )
+        return plan, decisions
+
+    plan_a, decisions_a = build_plan()
+    plan_b, decisions_b = build_plan()
+    assert plan_a.plan_key == plan_b.plan_key, scenario_id
+    assert plan_a.plan.connection_decisions_key == plan_b.plan.connection_decisions_key, scenario_id
+    assert plan_a.connection_decisions == decisions_a == decisions_b, scenario_id
+    assert plan_a.connection_decisions[0].identity_basis == expected_basis, scenario_id
 
 
 @pytest.mark.parametrize(
@@ -1992,6 +2013,21 @@ def _minimal_catalogue_scenario():
     return plan, atoms_by_ordinal, atom_decisions_by_ordinal, retained_entity_ids, retained_asym_ids
 
 
+def _polymer_conditional_categories():
+    """C-05: E1/chain A is a retained polymer entity in every
+    `_minimal_catalogue_scenario()` fixture below - its three
+    conditionally-mandatory companion categories, with rows matching the
+    atoms' own (entity_id, label_seq_id, ccd) triples exactly."""
+
+    return {
+        "_entity_poly": _category_table(entity_id=("E1",), type=("polypeptide(L)",)),
+        "_entity_poly_seq": _category_table(entity_id=("E1", "E1"), num=("1", "2"), mon_id=("ALA", "CYS")),
+        "_pdbx_poly_seq_scheme": _category_table(
+            asym_id=("A", "A"), entity_id=("E1", "E1"), seq_id=("1", "2"), mon_id=("ALA", "CYS"),
+        ),
+    }
+
+
 def test_catalogue_atom_mask_filters_by_real_atom_decisions():  # T021-061
     plan, atoms_by_ordinal, atom_decisions_by_ordinal, retained_entity_ids, retained_asym_ids = _minimal_catalogue_scenario()
     categories = {
@@ -2006,6 +2042,7 @@ def test_catalogue_atom_mask_filters_by_real_atom_decisions():  # T021-061
         "_entity": _category_table(id=("E1", "E2"), type=("polymer", "polymer")),
         "_struct_asym": _category_table(id=("A", "B"), entity_id=("E1", "E2")),
         "_chem_comp": _category_table(id=("ALA", "CYS", "MET"), type=("L-peptide linking",) * 3),
+        **_polymer_conditional_categories(),
     }
     decisions = compute_category_decisions(
         source_context_key=plan.plan.source_context_key, categories=categories,
@@ -2032,6 +2069,9 @@ def test_catalogue_anisotrop_requires_complete_tensor_and_matching_atom_site_id(
     base_categories = {
         "_atom_site": atom_site, "_entity": _category_table(id=("E1",), type=("polymer",)),
         "_struct_asym": _category_table(id=("A",), entity_id=("E1",)), "_chem_comp": _category_table(id=("ALA",), type=("x",)),
+        "_entity_poly": _category_table(entity_id=("E1",), type=("polypeptide(L)",)),
+        "_entity_poly_seq": _category_table(entity_id=("E1",), num=("1",), mon_id=("ALA",)),
+        "_pdbx_poly_seq_scheme": _category_table(asym_id=("A",), entity_id=("E1",), seq_id=("1",), mon_id=("ALA",)),
     }
 
     def run(anisotrop_columns):
@@ -2087,6 +2127,7 @@ def test_catalogue_struct_conn_used_types_and_elements_from_real_connection_deci
         ),
         "_struct_conn_type": _category_table(id=("disulf", "metalc")),
         "_atom_type": _category_table(symbol=("C", "N", "S")),
+        **_polymer_conditional_categories(),
     }
     decisions = compute_category_decisions(
         source_context_key=plan.plan.source_context_key, categories=categories,
@@ -2114,6 +2155,7 @@ def test_catalogue_cell_symmetry_singleton_and_operator_tables_preserved_verbati
         "_cell": _category_table(length_a=("10.0",), length_b=("10.0",), length_c=("10.0",)),
         "_symmetry": _category_table(**{"space_group_name_h-m": ("'P 1'",)}),
         "_symmetry_equiv": _category_table(id=("1", "2"), pos_as_xyz=("x,y,z", "-x,-y,z")),
+        **_polymer_conditional_categories(),
     }
     decisions = compute_category_decisions(
         source_context_key=plan.plan.source_context_key, categories=categories,
@@ -2139,6 +2181,7 @@ def test_catalogue_omitted_family_and_unknown_category_and_tag():  # T021-083/08
         "_entity": _category_table(id=("E1", "E2"), type=("polymer", "polymer")),
         "_struct_asym": _category_table(id=("A", "B"), entity_id=("E1", "E2")),
         "_chem_comp": _category_table(id=("ALA", "CYS", "MET"), type=("x",) * 3),
+        **_polymer_conditional_categories(),
     }
 
     def run(categories):
@@ -2173,6 +2216,7 @@ def test_catalogue_ncs_scenarios():  # T021-150/151/152/153/154
         "_entity": _category_table(id=("E1", "E2"), type=("polymer", "polymer")),
         "_struct_asym": _category_table(id=("A", "B"), entity_id=("E1", "E2")),
         "_chem_comp": _category_table(id=("ALA", "CYS", "MET"), type=("x",) * 3),
+        **_polymer_conditional_categories(),
     }
     identity_matrix = dict(
         **{f"matrix[{i}][{j}]": ("1.0" if i == j else "0.0",) for i in (1, 2, 3) for j in (1, 2, 3)},
@@ -2232,6 +2276,7 @@ def test_catalogue_special_position_guard_requires_unambiguous_context():  # T02
         "_entity": _category_table(id=("E1", "E2"), type=("polymer", "polymer")),
         "_struct_asym": _category_table(id=("A", "B"), entity_id=("E1", "E2")),
         "_chem_comp": _category_table(id=("ALA", "CYS", "MET"), type=("x",) * 3),
+        **_polymer_conditional_categories(),
     }
 
     def run(special_columns):
@@ -2250,3 +2295,406 @@ def test_catalogue_special_position_guard_requires_unambiguous_context():  # T02
     with pytest.raises(MaterializationExecutionError) as excinfo:
         run({"id": ("1",), "auth_asym_id": ("Z",)})
     assert excinfo.value.code == "INVALID_CIF"  # ambiguity/unresolvable context refuses, per T021-158
+
+
+# --- Remaining C-07 scenarios: raw tokens, coordinates, insertion codes,
+# the individual RETAINED_* categories, context categories, audit
+# completeness, numeric grammar, and altloc endpoint sets. -----------------
+
+
+def test_atom_site_coordinates_and_occupancy_zero_preserved_without_repair():  # T021-042
+    plan, atoms_by_ordinal, atom_decisions_by_ordinal, retained_entity_ids, retained_asym_ids = _minimal_catalogue_scenario()
+    categories = {
+        "_atom_site": _category_table(
+            id=("a-ca", "a-sg", "b-sd"), type_symbol=("C", "S", "S"), label_atom_id=("CA", "SG", "SD"),
+            label_alt_id=(None, None, None), label_comp_id=("ALA", "CYS", "MET"), label_asym_id=("A", "A", "B"),
+            label_entity_id=("E1", "E1", "E2"), label_seq_id=("1", "2", "1"), auth_asym_id=("A", "A", "B"),
+            auth_seq_id=("1", "2", "1"), pdbx_pdb_ins_code=(None, None, None), pdbx_pdb_model_num=("1", "1", "1"),
+            cartn_x=("1.0", "2.0", "3.0"), cartn_y=("1.0", "2.0", "3.0"), cartn_z=("1.0", "2.0", "3.0"),
+            occupancy=("0.0", "0.5", "1.0"), b_iso_or_equiv=(None, "11.0", "10.0"),
+        ),
+        "_entity": _category_table(id=("E1", "E2"), type=("polymer", "polymer")),
+        "_struct_asym": _category_table(id=("A", "B"), entity_id=("E1", "E2")),
+        "_chem_comp": _category_table(id=("ALA", "CYS", "MET"), type=("x",) * 3),
+        **_polymer_conditional_categories(),
+    }
+    decisions = compute_category_decisions(
+        source_context_key=plan.plan.source_context_key, categories=categories,
+        retained_entity_ids=retained_entity_ids, retained_asym_ids=retained_asym_ids, resolved_model=1,
+        atoms_by_ordinal=atoms_by_ordinal, atom_decisions_by_ordinal=atom_decisions_by_ordinal,
+        connection_decisions=(),
+    )
+    by_cat = {d.category: d for d in decisions}
+    # occupancy=0.0 and a null B-factor are both legitimate, never repaired
+    # into a default - the row still survives ATOM_MASK filtering untouched.
+    assert by_cat["_atom_site"].kept_row_ordinals == (0, 1)
+
+
+def test_atom_site_null_coordinate_rejects():  # T021-042 (negative half)
+    plan, atoms_by_ordinal, atom_decisions_by_ordinal, retained_entity_ids, retained_asym_ids = _minimal_catalogue_scenario()
+    categories = {
+        "_atom_site": _category_table(
+            id=("a-ca", "a-sg", "b-sd"), type_symbol=("C", "S", "S"), label_atom_id=("CA", "SG", "SD"),
+            label_alt_id=(None, None, None), label_comp_id=("ALA", "CYS", "MET"), label_asym_id=("A", "A", "B"),
+            label_entity_id=("E1", "E1", "E2"), label_seq_id=("1", "2", "1"), auth_asym_id=("A", "A", "B"),
+            auth_seq_id=("1", "2", "1"), pdbx_pdb_ins_code=(None, None, None), pdbx_pdb_model_num=("1", "1", "1"),
+            cartn_x=(None, "2.0", "3.0"), cartn_y=("1.0", "2.0", "3.0"), cartn_z=("1.0", "2.0", "3.0"),
+            occupancy=("1.0", "1.0", "1.0"), b_iso_or_equiv=("10.0", "10.0", "10.0"),
+        ),
+        "_entity": _category_table(id=("E1", "E2"), type=("polymer", "polymer")),
+        "_struct_asym": _category_table(id=("A", "B"), entity_id=("E1", "E2")),
+        "_chem_comp": _category_table(id=("ALA", "CYS", "MET"), type=("x",) * 3),
+        **_polymer_conditional_categories(),
+    }
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        compute_category_decisions(
+            source_context_key=plan.plan.source_context_key, categories=categories,
+            retained_entity_ids=retained_entity_ids, retained_asym_ids=retained_asym_ids, resolved_model=1,
+            atoms_by_ordinal=atoms_by_ordinal, atom_decisions_by_ordinal=atom_decisions_by_ordinal,
+            connection_decisions=(),
+        )
+    assert excinfo.value.code == "INVALID_CIF"
+
+
+def test_struct_conn_endpoint_insertion_code_distinguishes_residues():  # T021-043
+    # Residues 52 and 52A (same auth_seq_id, different insertion code) must
+    # resolve to distinct occurrences when label_seq_id is null - never
+    # collapsed via legacy PDB-style concatenated residue identifiers.
+    a52 = _atom(ordinal=0, atom_id="a52", label_asym_id="A", label_seq_id=None, auth_seq_id="52", label_atom_id="CA", ccd="ALA")
+    a52a = AtomObservation(
+        ordinal=1, atom_id="a52a", model=1, label_asym_id="A", entity_id="E1", entity_type="polymer", ccd="ALA",
+        label_seq_id=None, auth_asym_id="A", auth_seq_id="52", insertion_token="A", label_atom_id="CA",
+    )
+    endpoint_52 = RawConnectionEndpointTokens(
+        label_asym_id="A", label_comp_id="ALA", label_seq_id=None, label_atom_id="CA",
+        auth_seq_id="52", insertion_token=None, altloc_aliases=(None, None, None), symmetry_token="1_555",
+    )
+    endpoint_52a = RawConnectionEndpointTokens(
+        label_asym_id="A", label_comp_id="ALA", label_seq_id=None, label_atom_id="CA",
+        auth_seq_id="52", insertion_token="A", altloc_aliases=(None, None, None), symmetry_token="1_555",
+    )
+    from molecular.receptor_materialization import _resolve_endpoint_atoms
+    resolved_52 = _resolve_endpoint_atoms(endpoint_52, (a52, a52a))
+    resolved_52a = _resolve_endpoint_atoms(endpoint_52a, (a52, a52a))
+    assert resolved_52 == (a52,)
+    assert resolved_52a == (a52a,)
+
+
+def test_remaining_retained_categories_individually():  # T021-065/066/068/069/070/071/072/073/074
+    atoms = (
+        _atom(ordinal=0, atom_id="a-ca", label_asym_id="A", ccd="ALA", label_seq_id="1", label_atom_id="CA"),
+        _atom(
+            ordinal=1, atom_id="l-lig", label_asym_id="L", ccd="HEM", label_seq_id=None, auth_asym_id="L",
+            entity_id="E2", entity_type="non-polymer", label_atom_id="FE",
+        ),
+        _atom(
+            ordinal=2, atom_id="b-man", label_asym_id="BR", ccd="MAN", label_seq_id="1", auth_asym_id="BR",
+            entity_id="E3", entity_type="branched", label_atom_id="C1",
+        ),
+    )
+    source_context = _source_context()
+    resolution = _resolution(
+        resolved_chains=(
+            ResolvedChainSelection(label_asym_id="A", label_entity_id="E1", model_number=1),
+            ResolvedChainSelection(label_asym_id="BR", label_entity_id="E3", model_number=1),
+        ),
+    )
+    plan = build_materialization_plan(
+        source_context=source_context, resolved_selection=resolution, unaddressed_components="preserve", atoms=atoms,
+    )
+    atom_decisions_by_ordinal = {d.ordinal: d for d in plan.atom_decisions}
+    atoms_by_ordinal = {a.ordinal: a for a in atoms}
+    retained_entity_ids = frozenset(
+        atoms_by_ordinal[o].entity_id for o, d in atom_decisions_by_ordinal.items() if d.retained
+    )
+    retained_asym_ids = frozenset(
+        atoms_by_ordinal[o].label_asym_id for o, d in atom_decisions_by_ordinal.items() if d.retained
+    )
+    assert atom_decisions_by_ordinal[1].retained is True  # L/HEM unaddressed non-polymer, U=preserve policy
+    assert atom_decisions_by_ordinal[1].reason == "unaddressed-preserve"
+
+    categories = {
+        "_atom_site": _full_atom_site_table(
+            ids=("a-ca", "l-lig", "b-man"), type_symbols=("C", "FE", "C"), label_atom_ids=("CA", "FE", "C1"),
+            comp_ids=("ALA", "HEM", "MAN"), asym_ids=("A", "L", "BR"), entity_ids=("E1", "E2", "E3"),
+            seq_ids=("1", "1", "1"), auth_asym_ids=("A", "L", "BR"), auth_seq_ids=("1", "1", "1"),
+        ),
+        "_entity": _category_table(id=("E1", "E2", "E3"), type=("polymer", "non-polymer", "branched")),
+        "_struct_asym": _category_table(id=("A", "L", "BR"), entity_id=("E1", "E2", "E3")),
+        "_chem_comp": _category_table(id=("ALA", "HEM", "MAN"), type=("x",) * 3),
+        "_entity_poly": _category_table(entity_id=("E1",), type=("polypeptide(L)",)),  # T021-065
+        "_entity_poly_seq": _category_table(entity_id=("E1",), num=("1",), mon_id=("ALA",)),  # T021-066
+        "_pdbx_poly_seq_scheme": _category_table(asym_id=("A",), entity_id=("E1",), seq_id=("1",), mon_id=("ALA",)),  # T021-069
+        "_pdbx_entity_nonpoly": _category_table(entity_id=("E2",), comp_id=("HEM",)),  # T021-068
+        "_pdbx_nonpoly_scheme": _category_table(asym_id=("L",), entity_id=("E2",), mon_id=("HEM",), ndb_seq_num=("1",)),  # T021-070
+        "_pdbx_entity_branch": _category_table(entity_id=("E3",), type=("oligosaccharide",)),  # T021-071
+        "_pdbx_entity_branch_list": _category_table(entity_id=("E3",), num=("1",), comp_id=("MAN",)),  # T021-072
+        "_pdbx_entity_branch_link": _category_table(
+            link_id=("1",), entity_id=("E3",), entity_branch_list_num_1=("1",), comp_id_1=("MAN",), atom_id_1=("C1",),
+            entity_branch_list_num_2=("1",), comp_id_2=("MAN",), atom_id_2=("C2",),
+        ),  # T021-073 (presence only; no required_tags enforce link endpoints match num_1 != num_2 here)
+        "_pdbx_branch_scheme": _category_table(asym_id=("BR",), entity_id=("E3",), mon_id=("MAN",), num=("1",)),  # T021-074
+    }
+    decisions = compute_category_decisions(
+        source_context_key=plan.plan.source_context_key, categories=categories,
+        retained_entity_ids=retained_entity_ids, retained_asym_ids=retained_asym_ids, resolved_model=1,
+        atoms_by_ordinal=atoms_by_ordinal, atom_decisions_by_ordinal=atom_decisions_by_ordinal,
+        connection_decisions=(),
+    )
+    by_cat = {d.category: d for d in decisions}
+    assert by_cat["_entity_poly"].kept_row_ordinals == (0,)  # T021-065
+    assert by_cat["_entity_poly_seq"].kept_row_ordinals == (0,)  # T021-066
+    assert by_cat["_pdbx_poly_seq_scheme"].kept_row_ordinals == (0,)  # T021-069
+    assert by_cat["_pdbx_entity_nonpoly"].kept_row_ordinals == (0,)  # T021-068 (E2 is unaddressed-preserved)
+    assert by_cat["_pdbx_nonpoly_scheme"].kept_row_ordinals == (0,)  # T021-070
+    assert by_cat["_pdbx_entity_branch"].kept_row_ordinals == (0,)  # T021-071
+    assert by_cat["_pdbx_entity_branch_list"].kept_row_ordinals == (0,)  # T021-072
+    assert by_cat["_pdbx_entity_branch_link"].kept_row_ordinals == (0,)  # T021-073
+    assert by_cat["_pdbx_branch_scheme"].kept_row_ordinals == (0,)  # T021-074
+
+
+def test_missing_conditional_branched_categories_rejects():  # T021-086
+    atoms = (
+        _atom(
+            ordinal=0, atom_id="b-man", label_asym_id="BR", ccd="MAN", label_seq_id="1", auth_asym_id="BR",
+            entity_id="E3", entity_type="branched", label_atom_id="C1",
+        ),
+    )
+    source_context = _source_context()
+    resolution = _resolution(
+        resolved_chains=(ResolvedChainSelection(label_asym_id="BR", label_entity_id="E3", model_number=1),),
+    )
+    plan = build_materialization_plan(
+        source_context=source_context, resolved_selection=resolution, unaddressed_components="preserve", atoms=atoms,
+    )
+    atom_decisions_by_ordinal = {d.ordinal: d for d in plan.atom_decisions}
+    atoms_by_ordinal = {a.ordinal: a for a in atoms}
+    categories = {
+        "_atom_site": _full_atom_site_table(
+            ids=("b-man",), type_symbols=("C",), label_atom_ids=("C1",), comp_ids=("MAN",), asym_ids=("BR",),
+            entity_ids=("E3",), seq_ids=("1",), auth_asym_ids=("BR",), auth_seq_ids=("1",),
+        ),
+        "_entity": _category_table(id=("E3",), type=("branched",)),
+        "_struct_asym": _category_table(id=("BR",), entity_id=("E3",)),
+        "_chem_comp": _category_table(id=("MAN",), type=("x",)),
+        # _pdbx_entity_branch/_pdbx_entity_branch_list/_pdbx_branch_scheme deliberately absent
+    }
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        compute_category_decisions(
+            source_context_key=plan.plan.source_context_key, categories=categories,
+            retained_entity_ids=frozenset({"E3"}), retained_asym_ids=frozenset({"BR"}), resolved_model=1,
+            atoms_by_ordinal=atoms_by_ordinal, atom_decisions_by_ordinal=atom_decisions_by_ordinal,
+            connection_decisions=(),
+        )
+    assert excinfo.value.code == "INVALID_CIF"
+
+
+def test_numeric_token_grammar_su_exponent():  # T021-155
+    from molecular.receptor_materialization import _validate_numeric_token
+    from decimal import Decimal
+    assert _validate_numeric_token("1.2e3(4)") == Decimal("1.2e3")
+    assert _validate_numeric_token("1.2(4)e3") is None
+    assert _validate_numeric_token("1_000") is None
+    assert _validate_numeric_token("1.0") == Decimal("1.0")
+    assert _validate_numeric_token("NaN") is None
+    assert _validate_numeric_token(None) is None
+
+
+def test_altloc_endpoint_without_alias_returns_full_altloc_set():  # T021-156
+    a_alt = AtomObservation(
+        ordinal=0, atom_id="a-alt", model=1, label_asym_id="A", entity_id="E1", entity_type="polymer", ccd="CYS",
+        label_seq_id="1", auth_asym_id="A", auth_seq_id="1", label_atom_id="SG", altloc="A",
+    )
+    b_alt = AtomObservation(
+        ordinal=1, atom_id="b-alt", model=1, label_asym_id="A", entity_id="E1", entity_type="polymer", ccd="CYS",
+        label_seq_id="1", auth_asym_id="A", auth_seq_id="1", label_atom_id="SG", altloc="B",
+    )
+    tokens = RawConnectionEndpointTokens(
+        label_asym_id="A", label_comp_id="CYS", label_seq_id="1", label_atom_id="SG",
+        auth_seq_id="1", insertion_token=None, altloc_aliases=(None, None, None), symmetry_token="1_555",
+    )
+    from molecular.receptor_materialization import _resolve_endpoint_atoms
+    resolved = _resolve_endpoint_atoms(tokens, (a_alt, b_alt))
+    assert set(resolved) == {a_alt, b_alt}  # one endpoint, both altloc variants as a single set
+
+
+def test_altloc_endpoint_missing_variant_rejects():  # T021-157 (reachable half: declared altloc absent from occurrence)
+    a_alt = AtomObservation(
+        ordinal=0, atom_id="a-alt", model=1, label_asym_id="A", entity_id="E1", entity_type="polymer", ccd="CYS",
+        label_seq_id="1", auth_asym_id="A", auth_seq_id="1", label_atom_id="SG", altloc="A",
+    )
+    tokens = RawConnectionEndpointTokens(
+        label_asym_id="A", label_comp_id="CYS", label_seq_id="1", label_atom_id="SG",
+        auth_seq_id="1", insertion_token=None, altloc_aliases=("B", None, None), symmetry_token="1_555",
+    )
+    from molecular.receptor_materialization import _resolve_endpoint_atoms
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        _resolve_endpoint_atoms(tokens, (a_alt,))
+    assert excinfo.value.code == "AMBIGUOUS_ENDPOINT"
+
+
+def test_modified_residue_context_resolves_by_label_and_enters_ccd_closure():  # T021-080
+    atoms = (
+        _atom(ordinal=0, atom_id="a-mse", label_asym_id="A", ccd="MSE", label_seq_id="1", label_atom_id="SE"),
+        _atom(ordinal=1, atom_id="b-ala", label_asym_id="B", ccd="ALA", label_seq_id="1", auth_asym_id="B", entity_id="E2", label_atom_id="CA"),
+    )
+    source_context = _source_context()
+    resolution = _resolution()
+    plan = build_materialization_plan(
+        source_context=source_context, resolved_selection=resolution, unaddressed_components="preserve", atoms=atoms,
+    )
+    atom_decisions_by_ordinal = {d.ordinal: d for d in plan.atom_decisions}
+    atoms_by_ordinal = {a.ordinal: a for a in atoms}
+    retained_entity_ids = frozenset(atoms_by_ordinal[o].entity_id for o, d in atom_decisions_by_ordinal.items() if d.retained)
+    retained_asym_ids = frozenset(atoms_by_ordinal[o].label_asym_id for o, d in atom_decisions_by_ordinal.items() if d.retained)
+    categories = {
+        "_atom_site": _full_atom_site_table(
+            ids=("a-mse", "b-ala"), type_symbols=("Se", "C"), label_atom_ids=("SE", "CA"), comp_ids=("MSE", "ALA"),
+            asym_ids=("A", "B"), entity_ids=("E1", "E2"), seq_ids=("1", "1"), auth_asym_ids=("A", "B"), auth_seq_ids=("1", "1"),
+        ),
+        "_entity": _category_table(id=("E1", "E2"), type=("polymer", "polymer")),
+        "_struct_asym": _category_table(id=("A", "B"), entity_id=("E1", "E2")),
+        "_chem_comp": _category_table(id=("MSE", "ALA", "MET"), type=("x",) * 3),
+        "_entity_poly": _category_table(entity_id=("E1",), type=("polypeptide(L)",)),
+        "_entity_poly_seq": _category_table(entity_id=("E1",), num=("1",), mon_id=("MSE",)),
+        "_pdbx_poly_seq_scheme": _category_table(asym_id=("A",), entity_id=("E1",), seq_id=("1",), mon_id=("MSE",)),
+        "_pdbx_struct_mod_residue": _category_table(
+            id=("1",), label_asym_id=("A",), label_comp_id=("MSE",), label_seq_id=("1",),
+            auth_asym_id=("A",), auth_comp_id=("MSE",), auth_seq_id=("1",), parent_comp_id=("MET",),
+        ),
+    }
+    decisions = compute_category_decisions(
+        source_context_key=plan.plan.source_context_key, categories=categories,
+        retained_entity_ids=retained_entity_ids, retained_asym_ids=retained_asym_ids, resolved_model=1,
+        atoms_by_ordinal=atoms_by_ordinal, atom_decisions_by_ordinal=atom_decisions_by_ordinal,
+        connection_decisions=(),
+    )
+    by_cat = {d.category: d for d in decisions}
+    assert by_cat["_pdbx_struct_mod_residue"].kept_row_ordinals == (0,)  # resolved by label_asym_id in retained set
+    # parent_comp_id='MET' enters the CCD closure even though MET is never
+    # itself instantiated as an atom - chem_comp still only keeps real CCDs
+    # actually present (MSE) plus the documentary parent (MET); ALA is
+    # excluded (chain B not retained).
+    assert set(categories["_chem_comp"].columns["id"][i] for i in by_cat["_chem_comp"].kept_row_ordinals) == {"MSE", "MET"}
+
+
+def test_missing_residue_and_atom_context_resolve_by_label_asym_id():  # T021-081
+    plan, atoms_by_ordinal, atom_decisions_by_ordinal, retained_entity_ids, retained_asym_ids = _minimal_catalogue_scenario()
+    categories = {
+        "_atom_site": _full_atom_site_table(
+            ids=("a-ca", "a-sg", "b-sd"), type_symbols=("C", "S", "S"), label_atom_ids=("CA", "SG", "SD"),
+            comp_ids=("ALA", "CYS", "MET"), asym_ids=("A", "A", "B"), entity_ids=("E1", "E1", "E2"),
+            seq_ids=("1", "2", "1"), auth_asym_ids=("A", "A", "B"), auth_seq_ids=("1", "2", "1"),
+        ),
+        "_entity": _category_table(id=("E1", "E2"), type=("polymer", "polymer")),
+        "_struct_asym": _category_table(id=("A", "B"), entity_id=("E1", "E2")),
+        "_chem_comp": _category_table(id=("ALA", "CYS", "MET"), type=("x",) * 3),
+        **_polymer_conditional_categories(),
+        "_pdbx_unobs_or_zero_occ_residues": _category_table(
+            id=("1", "2"), label_asym_id=("A", "B"), auth_asym_id=("A", "B"), auth_seq_id=("3", "2"),
+        ),
+        "_pdbx_unobs_or_zero_occ_atoms": _category_table(
+            id=("1", "2"), label_asym_id=("A", "B"), label_atom_id=("OXT", "OXT"), auth_asym_id=("A", "B"), auth_seq_id=("1", "1"),
+        ),
+    }
+    decisions = compute_category_decisions(
+        source_context_key=plan.plan.source_context_key, categories=categories,
+        retained_entity_ids=retained_entity_ids, retained_asym_ids=retained_asym_ids, resolved_model=1,
+        atoms_by_ordinal=atoms_by_ordinal, atom_decisions_by_ordinal=atom_decisions_by_ordinal,
+        connection_decisions=(),
+    )
+    by_cat = {d.category: d for d in decisions}
+    # Absence of coordinates is itself the annotation - it never requires
+    # a matching real atom_site row to survive; only the chain (A) context
+    # must resolve/be retained.
+    assert by_cat["_pdbx_unobs_or_zero_occ_residues"].kept_row_ordinals == (0,)  # A kept, B (excluded chain) omitted
+    assert by_cat["_pdbx_unobs_or_zero_occ_atoms"].kept_row_ordinals == (0,)
+
+
+def test_catalogue_cell_preserves_esd_reciprocal_and_volume_fields():  # T021-145
+    plan, atoms_by_ordinal, atom_decisions_by_ordinal, retained_entity_ids, retained_asym_ids = _minimal_catalogue_scenario()
+    categories = {
+        "_atom_site": _full_atom_site_table(
+            ids=("a-ca", "a-sg", "b-sd"), type_symbols=("C", "S", "S"), label_atom_ids=("CA", "SG", "SD"),
+            comp_ids=("ALA", "CYS", "MET"), asym_ids=("A", "A", "B"), entity_ids=("E1", "E1", "E2"),
+            seq_ids=("1", "2", "1"), auth_asym_ids=("A", "A", "B"), auth_seq_ids=("1", "2", "1"),
+        ),
+        "_entity": _category_table(id=("E1", "E2"), type=("polymer", "polymer")),
+        "_struct_asym": _category_table(id=("A", "B"), entity_id=("E1", "E2")),
+        "_chem_comp": _category_table(id=("ALA", "CYS", "MET"), type=("x",) * 3),
+        **_polymer_conditional_categories(),
+        "_cell": _category_table(
+            length_a=("10.0",), length_b=("10.0",), length_c=("10.0",), length_a_esd=("0.01",),
+            volume=("1000.0",), volume_esd=("1.0",), reciprocal_length_a=("0.1",),
+        ),
+    }
+    decisions = compute_category_decisions(
+        source_context_key=plan.plan.source_context_key, categories=categories,
+        retained_entity_ids=retained_entity_ids, retained_asym_ids=retained_asym_ids, resolved_model=1,
+        atoms_by_ordinal=atoms_by_ordinal, atom_decisions_by_ordinal=atom_decisions_by_ordinal,
+        connection_decisions=(),
+    )
+    by_cat = {d.category: d for d in decisions}
+    assert by_cat["_cell"].kept_row_ordinals == (0,)
+    assert set(by_cat["_cell"].preserved_tags) >= {"length_a_esd", "volume", "volume_esd", "reciprocal_length_a"}
+
+
+def test_unobs_atoms_label_alt_id_recognized_and_preserved():  # T021-146
+    plan, atoms_by_ordinal, atom_decisions_by_ordinal, retained_entity_ids, retained_asym_ids = _minimal_catalogue_scenario()
+    categories = {
+        "_atom_site": _full_atom_site_table(
+            ids=("a-ca", "a-sg", "b-sd"), type_symbols=("C", "S", "S"), label_atom_ids=("CA", "SG", "SD"),
+            comp_ids=("ALA", "CYS", "MET"), asym_ids=("A", "A", "B"), entity_ids=("E1", "E1", "E2"),
+            seq_ids=("1", "2", "1"), auth_asym_ids=("A", "A", "B"), auth_seq_ids=("1", "2", "1"),
+        ),
+        "_entity": _category_table(id=("E1", "E2"), type=("polymer", "polymer")),
+        "_struct_asym": _category_table(id=("A", "B"), entity_id=("E1", "E2")),
+        "_chem_comp": _category_table(id=("ALA", "CYS", "MET"), type=("x",) * 3),
+        **_polymer_conditional_categories(),
+        "_pdbx_unobs_or_zero_occ_atoms": _category_table(
+            id=("1",), label_asym_id=("A",), label_atom_id=("OXT",), label_alt_id=("B",), auth_asym_id=("A",), auth_seq_id=("1",),
+        ),
+    }
+    decisions = compute_category_decisions(
+        source_context_key=plan.plan.source_context_key, categories=categories,
+        retained_entity_ids=retained_entity_ids, retained_asym_ids=retained_asym_ids, resolved_model=1,
+        atoms_by_ordinal=atoms_by_ordinal, atom_decisions_by_ordinal=atom_decisions_by_ordinal,
+        connection_decisions=(),
+    )
+    by_cat = {d.category: d for d in decisions}
+    assert by_cat["_pdbx_unobs_or_zero_occ_atoms"].kept_row_ordinals == (0,)
+    assert "label_alt_id" in by_cat["_pdbx_unobs_or_zero_occ_atoms"].preserved_tags
+
+
+def test_catalogue_additional_observed_categories_omitted_with_full_audit():  # T021-148
+    plan, atoms_by_ordinal, atom_decisions_by_ordinal, retained_entity_ids, retained_asym_ids = _minimal_catalogue_scenario()
+    extra_omit_categories = [
+        "_citation", "_citation_author", "_software", "_struct", "_struct_keywords", "_exptl", "_exptl_crystal",
+        "_diffrn", "_diffrn_detector", "_diffrn_radiation", "_reflns", "_refine", "_refine_hist",
+        "_database_2", "_audit_author", "_struct_biol",
+    ]
+    categories = {
+        "_atom_site": _full_atom_site_table(
+            ids=("a-ca", "a-sg", "b-sd"), type_symbols=("C", "S", "S"), label_atom_ids=("CA", "SG", "SD"),
+            comp_ids=("ALA", "CYS", "MET"), asym_ids=("A", "A", "B"), entity_ids=("E1", "E1", "E2"),
+            seq_ids=("1", "2", "1"), auth_asym_ids=("A", "A", "B"), auth_seq_ids=("1", "2", "1"),
+        ),
+        "_entity": _category_table(id=("E1", "E2"), type=("polymer", "polymer")),
+        "_struct_asym": _category_table(id=("A", "B"), entity_id=("E1", "E2")),
+        "_chem_comp": _category_table(id=("ALA", "CYS", "MET"), type=("x",) * 3),
+        **_polymer_conditional_categories(),
+    }
+    for name in extra_omit_categories:
+        categories[name] = _category_table(dummy_tag=("x",))
+    decisions = compute_category_decisions(
+        source_context_key=plan.plan.source_context_key, categories=categories,
+        retained_entity_ids=retained_entity_ids, retained_asym_ids=retained_asym_ids, resolved_model=1,
+        atoms_by_ordinal=atoms_by_ordinal, atom_decisions_by_ordinal=atom_decisions_by_ordinal,
+        connection_decisions=(),
+    )
+    by_cat = {d.category: d for d in decisions}
+    assert len(extra_omit_categories) == 16
+    for name in extra_omit_categories:
+        assert by_cat[name].action == "omit", name
+        assert by_cat[name].omitted_row_ordinals == (0,), name
+        assert by_cat[name].source_rows_key is not None, name  # fully audited, never a fictional "all" sentinel

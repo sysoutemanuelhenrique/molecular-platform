@@ -545,6 +545,7 @@ ATOM 1 N N . ALA A 1 1 ? 1.0 1.0 1.0 1.00 10.0 1 A 1
 # library. Scenario ids are the CP2 subset of CP2_SCENARIO_SCOPE.csv.
 # ==========================================================================
 
+import hashlib
 from datetime import datetime, timezone
 
 import gemmi
@@ -552,7 +553,8 @@ import gemmi
 from molecular.inputs import AcquisitionRecord, ProteinInput, RawArtifact
 from molecular.receptor_inspection import ModelDescriptor, ParserProvenance, ReceptorInspectionReport, compute_inspection_id
 from molecular.receptor_materialization import RecordSnapshot, build_source_context
-from molecular.receptor_resolution import ResolvedChainSelection, ResolvedReceptorSelection
+from molecular.receptor_materialization import CategoryDecision, MaterializationExecutionError
+from molecular.receptor_resolution import ResolvedChainSelection, ResolvedComponentDisposition, ResolvedReceptorSelection
 from molecular.receptor_selection import ReceptorSelectionPolicy
 from molecular.receptor_parsing import (
     CifSaveFrameRejectedError,
@@ -568,7 +570,13 @@ from molecular.receptor_parsing import (
 
 _CP2_PROTEIN_ID = "protein-cp2"
 _CP2_SELECTION_ID = "sel-cp2"
-_CP2_RAW_SHA = "a" * 64
+# C-04: a real SHA-256/size of the actual fixture bytes below - never a
+# fictitious constant - since `materialize_receptor_cif021` now checks
+# the received RAW bytes against exactly these SourceContext fields
+# before parsing. Computed once `_MINIMAL_CIF` is defined (Python module
+# execution is top-to-bottom, so by the time any test calls
+# `_cp2_source_context()` this is already the real digest/size, even
+# though a few helper *definitions* above reference the name first).
 
 
 def _cp2_inspection_id() -> str:
@@ -610,7 +618,7 @@ def _cp2_source_context():
     )
     return build_source_context(
         protein_input=protein_input, inspection_report=report, policy=policy,
-        resolved_selection=resolution, raw_size_bytes=10, records=records,
+        resolved_selection=resolution, raw_size_bytes=_CP2_RAW_SIZE, records=records,
     )
 
 
@@ -641,6 +649,26 @@ _struct_asym.id
 _struct_asym.entity_id
 A E1
 B E2
+#
+loop_
+_entity_poly.entity_id
+_entity_poly.type
+E1 polypeptide(L)
+#
+loop_
+_entity_poly_seq.entity_id
+_entity_poly_seq.num
+_entity_poly_seq.mon_id
+E1 1 ALA
+E1 2 CYS
+#
+loop_
+_pdbx_poly_seq_scheme.asym_id
+_pdbx_poly_seq_scheme.entity_id
+_pdbx_poly_seq_scheme.seq_id
+_pdbx_poly_seq_scheme.mon_id
+A E1 1 ALA
+A E1 2 CYS
 #
 loop_
 _chem_comp.id
@@ -717,6 +745,10 @@ _audit_author.name
 'Doe, J.'
 #
 """
+
+_CP2_RAW_BYTES = _MINIMAL_CIF.encode("utf-8")
+_CP2_RAW_SHA = hashlib.sha256(_CP2_RAW_BYTES).hexdigest()
+_CP2_RAW_SIZE = len(_CP2_RAW_BYTES)
 
 
 def test_real_gemmi_version_pinned():
@@ -812,7 +844,7 @@ def test_materialize_receptor_cif021_real_gemmi_end_to_end():  # T021-090 (bindi
     reparsed_atom_site = result.reparsed.categories["atom_site"]
     assert reparsed_atom_site.row_count == 4
     reparsed_entry = result.reparsed.categories["entry"]
-    assert reparsed_entry.get(0, "id") == f"TBMP_{plan.plan_key}"
+    assert reparsed_entry.get(0, "id") == f"tbmp_{plan.plan_key}"  # C-06: lowercase tbmp_ prefix
     assert result.output_bytes.startswith(f"data_tbmp_{plan.plan_key}".encode("utf-8"))
 
 
@@ -828,3 +860,273 @@ def test_materialize_receptor_cif021_is_deterministic_across_runs():  # Section 
     )
     assert result_a.plan.plan_key == result_b.plan.plan_key
     assert result_a.output_bytes == result_b.output_bytes
+
+
+# ==========================================================================
+# C-07 / real fixtures (Section 23): six real, publicly deposited PDB
+# entries (never a hand-authored synthetic file), downloaded verbatim and
+# documented in tests/fixtures/receptor_materialization/*/PROVENANCE.json
+# - origin URL, retrieval date, SHA-256 of the untouched original, and
+# (where applicable) the exact, listed edit producing the `_trimmed.cif`
+# derivative actually fed to Gemmi. Every checksum/size below is the real
+# digest/length of those bytes, never a placeholder.
+# ==========================================================================
+
+_FIXTURES_ROOT = Path(__file__).parent / "fixtures" / "receptor_materialization"
+
+
+def _real_fixture_bytes(subdir: str, filename: str) -> bytes:
+    return (_FIXTURES_ROOT / subdir / filename).read_bytes()
+
+
+def _real_fixture_materialize(
+    *, pdbid: str, raw_bytes: bytes, resolved_model: int, resolved_chains,
+    model_basis: str = "only-model-present", unaddressed: str = "preserve", dispositions=(),
+):
+    protein_id = f"protein-{pdbid.lower()}"
+    selection_id = f"sel-{pdbid.lower()}"
+    raw_sha = hashlib.sha256(raw_bytes).hexdigest()
+    inspection_id = compute_inspection_id(
+        parser_name="gemmi", parser_version="0.7.5", protein_input_id=protein_id,
+        raw_checksum=raw_sha, raw_format="mmcif",
+    )
+    protein_input = ProteinInput(
+        id=protein_id, name=pdbid,
+        acquisition=AcquisitionRecord(
+            method="uploaded", acquired_at=datetime.now(timezone.utc),
+            raw_artifact=RawArtifact(path=pdbid, format="mmcif", checksum=raw_sha),
+        ),
+    )
+    report = ReceptorInspectionReport(
+        inspection_id=inspection_id, inspection_schema_version="1.0", inspection_profile_version="1.0",
+        protein_input_id=protein_id, raw_checksum=raw_sha, raw_format_declared="mmcif",
+        structure_format="mmcif", parser=ParserProvenance(name="gemmi", version="0.7.5"),
+        selection_capability="full", models=(ModelDescriptor(model_number=resolved_model),), assemblies=(),
+        entities=(), chains=(), altloc_observations=(), occupancy_observations=(), missing_residues=(),
+        missing_atoms=(), disulfide_bonds=(), covalent_connections=(), metal_coordinations=(),
+        non_polymer_components=(), explicit_hydrogens_present=False, explicit_hydrogen_count=0,
+        unavailable_categories=(), warnings=(),
+    )
+    policy = ReceptorSelectionPolicy(
+        schema_version="1.0", selection_id=selection_id, protein_input_id=protein_id,
+        inspection_id=inspection_id, raw_checksum_observed=raw_sha, declared_by="s",
+        declared_at=datetime.now(timezone.utc),
+    )
+    resolution = ResolvedReceptorSelection(
+        schema_version="1.0", resolved_selection_id=selection_id, policy_selection_id=selection_id,
+        protein_input_id=protein_id, inspection_id=inspection_id, raw_checksum=raw_sha,
+        structure_format="mmcif", parser=ParserProvenance(name="gemmi", version="0.7.5"),
+        resolved_model=resolved_model, model_resolution_basis=model_basis, resolved_assembly=None,
+        resolved_chains=resolved_chains, resolved_component_dispositions=dispositions,
+        resolved_at=datetime.now(timezone.utc),
+    )
+    records = (
+        RecordSnapshot(kind="protein", id=protein_id, sha256="1" * 64, size_bytes=1, schema_version=None),
+        RecordSnapshot(kind="inspection", id=inspection_id, sha256="2" * 64, size_bytes=1, schema_version="1.0"),
+        RecordSnapshot(kind="selection", id=selection_id, sha256="3" * 64, size_bytes=1, schema_version="1.0"),
+        RecordSnapshot(kind="resolution", id=selection_id, sha256="4" * 64, size_bytes=1, schema_version="1.0"),
+    )
+    source_context = build_source_context(
+        protein_input=protein_input, inspection_report=report, policy=policy,
+        resolved_selection=resolution, raw_size_bytes=len(raw_bytes), records=records,
+    )
+    return materialize_receptor_cif021(
+        source_context=source_context, resolved_selection=resolution,
+        unaddressed_components=unaddressed, raw_bytes=raw_bytes,
+    )
+
+
+def _remove_dispositions(pairs, classification):
+    return tuple(
+        ResolvedComponentDisposition(label_asym_id=asym, ccd_code=ccd, classification=classification, disposition="remove")
+        for asym, ccd in pairs
+    )
+
+
+def test_real_fixture_5i55_positive_materialization():  # T021-090/141/147, real X-ray deposition
+    raw_bytes = _real_fixture_bytes("5i55", "5I55_trimmed.cif")
+    assert hashlib.sha256(raw_bytes).hexdigest() == "eba9584da11b29537c0ec30f23fa01fd27ad5ccc96ce8649450eb457530b9567"
+    result = _real_fixture_materialize(
+        pdbid="5I55", raw_bytes=raw_bytes, resolved_model=1,
+        resolved_chains=(ResolvedChainSelection(label_asym_id="A", label_entity_id="1", model_number=1),),
+    )
+    assert len(result.plan.atom_decisions) == 218
+    assert all(d.retained for d in result.plan.atom_decisions)
+    conn_by_id = {d.id: d for d in result.plan.connection_decisions}
+    assert conn_by_id["covale1"].action == "preserve"
+    # T021-141: the real deposition declares ptnr1_symmetry=ptnr2_symmetry=
+    # '1_555' with no _symmetry_equiv/_space_group_symop tables present -
+    # the pdbx-1_555-convention recognized without fabricating an operator.
+    assert conn_by_id["covale1"].identity_basis == ("pdbx-1_555-convention", "pdbx-1_555-convention")
+    assert conn_by_id["covale1"].symmetry_class == "both-identity"
+    cat_by_name = {d.category: d for d in result.plan.category_decisions}
+    assert cat_by_name["_chem_comp"].kept_row_ordinals
+    reparsed_atom_site = result.reparsed.categories["atom_site"]
+    assert reparsed_atom_site.row_count == 218
+
+
+def test_real_fixture_1pfe_rejects_hydrog_nonidentity_symmetry_gate():  # T021-144/147, real negative gate
+    raw_bytes = _real_fixture_bytes("1pfe", "1PFE_trimmed.cif")
+    assert hashlib.sha256(raw_bytes).hexdigest() == "e0653ce8e25e4ef8cc5e37b08d6a4f6cab19eb6928e18e462a3a91f83139dc73"
+    dispositions = (
+        _remove_dispositions([("C", "CL")], "other-non-polymer")
+        + _remove_dispositions([("D", "QUI"), ("E", "QUI")], "other-non-polymer")
+        + _remove_dispositions([("F", "HOH"), ("G", "HOH")], "water")
+    )
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        _real_fixture_materialize(
+            pdbid="1PFE", raw_bytes=raw_bytes, resolved_model=1,
+            resolved_chains=(ResolvedChainSelection(label_asym_id="A", label_entity_id="1", model_number=1),),
+            dispositions=dispositions,
+        )
+    assert excinfo.value.code == "UNSUPPORTED_SYMMETRY"
+
+
+def test_real_fixture_3dg1_positive_materialization_with_real_special_symmetry():  # T021-147/158
+    raw_bytes = _real_fixture_bytes("3dg1", "3DG1_trimmed.cif")
+    assert hashlib.sha256(raw_bytes).hexdigest() == "49926dfc5f524634bcc8e5c7b23aba352ce0ac32431f3621b02e022b267ebf58"
+    result = _real_fixture_materialize(
+        pdbid="3DG1", raw_bytes=raw_bytes, resolved_model=1,
+        resolved_chains=(ResolvedChainSelection(label_asym_id="A", label_entity_id="1", model_number=1),),
+    )
+    assert len(result.plan.atom_decisions) == 41
+    assert all(d.retained for d in result.plan.atom_decisions)
+    cat_by_name = {d.category: d for d in result.plan.category_decisions}
+    assert cat_by_name["_pdbx_struct_special_symmetry"].action == "guard_then_omit"
+    assert "special-position-annotations-omitted" in result.plan.plan.warnings
+
+
+def test_real_fixture_2jof_nmr_selects_exact_model_not_first():  # T021-149/162, real multi-model NMR
+    raw_bytes = _real_fixture_bytes("nmr_2jof", "2JOF_trimmed.cif")
+    assert hashlib.sha256(raw_bytes).hexdigest() == "837023fd1b0fc1bf5676a24fcc56f97c50346e6d5871ea65f1c6d76d98144c9b"
+    result = _real_fixture_materialize(
+        pdbid="2JOF", raw_bytes=raw_bytes, resolved_model=3,
+        resolved_chains=(ResolvedChainSelection(label_asym_id="A", label_entity_id="1", model_number=3),),
+        model_basis="explicitly-selected",
+    )
+    assert len(result.plan.atom_decisions) == 7952  # every real atom_site row, across all 28 models
+    assert "other-models-excluded" in result.plan.plan.warnings
+    # None of the 27 other real conformers' atoms are retained.
+    retained_count = sum(1 for d in result.plan.atom_decisions if d.retained)
+    assert retained_count == 284
+
+
+def test_real_fixture_7dwu_em_positive_materialization():  # T021-149, real cryo-EM deposition
+    raw_bytes = _real_fixture_bytes("em_7dwu", "7DWU_trimmed.cif")
+    assert hashlib.sha256(raw_bytes).hexdigest() == "3da1fed528cee1e0c4db53b47f0155aceaf012bd9a334d0f8219929eefa22e8e"
+    result = _real_fixture_materialize(
+        pdbid="7DWU", raw_bytes=raw_bytes, resolved_model=1,
+        resolved_chains=(
+            ResolvedChainSelection(label_asym_id="A", label_entity_id="1", model_number=1),
+            ResolvedChainSelection(label_asym_id="D", label_entity_id="2", model_number=1),
+            ResolvedChainSelection(label_asym_id="E", label_entity_id="3", model_number=1),
+        ),
+    )
+    retained_count = sum(1 for decision in result.plan.atom_decisions if decision.retained)
+    assert retained_count > 0
+    cat_by_name = {d.category: d for d in result.plan.category_decisions}
+    assert "_pdbx_unobs_or_zero_occ_residues" in cat_by_name
+
+
+def test_real_fixture_1a2p_ncs_given_rows_resolved_from_real_deposition():  # T021-150-154, real NCS operator values
+    raw_bytes = _real_fixture_bytes("ncs_1a2p", "1A2P_trimmed.cif")
+    assert hashlib.sha256(raw_bytes).hexdigest() == "7a6f3d3e0f958d6be34a4b28fe869d024b3cdadf409d821b70dcde6a68b53431"
+    dom = parse_receptor_cif_dom021(raw_bytes)
+    ncs = dom.categories["struct_ncs_oper"]
+    assert ncs.row_count == 2
+    assert [raw_cif_null_to_optional_str(ncs.get(i, "code")) for i in range(2)] == ["given", "given"]
+
+    from molecular.receptor_materialization import RawCategoryTable, _guard_ncs_row  # pure-domain guard, real tokens
+
+    columns = {column: tuple(ncs.get(i, column) for i in range(ncs.row_count)) for column in ncs.columns}
+    table = RawCategoryTable(columns=columns)
+    for row_index in range(2):
+        _guard_ncs_row("_struct_ncs_oper", table, row_index)  # must not raise for either real row
+
+
+def test_real_fixture_1a2p_full_pipeline_blocked_by_unrelated_real_symmetry_operator():  # honest limitation, documented in PROVENANCE.json
+    raw_bytes = _real_fixture_bytes("ncs_1a2p", "1A2P_trimmed.cif")
+    dispositions = (
+        _remove_dispositions([("D", "ZN"), ("E", "ZN"), ("F", "ZN")], "metal-ion")
+        + _remove_dispositions([("G", "HOH"), ("H", "HOH"), ("I", "HOH")], "water")
+    )
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        _real_fixture_materialize(
+            pdbid="1A2P", raw_bytes=raw_bytes, resolved_model=1,
+            resolved_chains=(ResolvedChainSelection(label_asym_id="A", label_entity_id="1", model_number=1),),
+            dispositions=dispositions,
+        )
+    assert excinfo.value.code == "UNSUPPORTED_SYMMETRY"  # metalc2 (A-D, ptnr1_symmetry=3_675), not NCS-related
+
+
+def test_raw_vs_quoted_null_marker_distinction_is_preserved():  # T021-041
+    # A bare, unquoted '.'/'?' is a real CIF null; Gemmi's own raw=True
+    # category access never de-quotes a value, so a *quoted* '.'/'?'
+    # string (gemmi.cif.as_string() strips the quote marks but leaves the
+    # content) remains the literal text "." / "?" after cooking - the
+    # caller must tell these apart by whether the token was quoted in the
+    # source, not merely by comparing the decoded string to '.'/'?' again.
+    text = "data_x\nloop_\n_x.a\n_x.b\n. '.'\n"
+    doc = gemmi.cif.read_string(text)
+    block = doc.sole_block()
+    raw = block.get_mmcif_category("_x.", raw=True)
+    assert raw["a"][0] == "."  # unquoted null marker, raw token is the bare dot
+    assert raw["b"][0] == "'.'"  # quoted literal string, raw token keeps its quotes
+    # The null check must run on the *raw* (still-quoted) token, never on an
+    # already as_string()-decoded one - decoding a quoted "'.'" first would
+    # strip the very quote marks that distinguish it from a real null,
+    # collapsing both to the same bare "." and losing the distinction.
+    assert raw_cif_null_to_optional_str(raw["a"][0]) is None
+    non_null = raw_cif_null_to_optional_str(raw["b"][0])
+    assert non_null == "'.'"  # still quoted - correctly not treated as null
+    assert gemmi.cif.as_string(non_null) == "."  # decode only after the null check confirms a real token
+
+
+def test_loss_audit_raw_bytes_unchanged_and_every_omission_hashed():  # T021-088
+    raw_bytes = _MINIMAL_CIF.encode("utf-8")
+    raw_bytes_copy = bytes(raw_bytes)
+    result = materialize_receptor_cif021(
+        source_context=_cp2_source_context(), resolved_selection=_cp2_resolution(),
+        unaddressed_components="preserve", raw_bytes=raw_bytes,
+    )
+    assert raw_bytes == raw_bytes_copy  # the adapter never mutates the RAW bytes it was handed
+    for decision in result.plan.category_decisions:
+        if decision.action in ("omit", "guard_then_omit", "filter"):
+            assert decision.source_rows_key is not None  # every real/omitted category's rows are hashed, never a null audit
+
+
+def test_output_verification_rejects_mutated_token_before_commit():  # T021-089
+    decision = CategoryDecision(
+        category="_atom_site", action="filter", kept_row_ordinals=(0,), omitted_row_ordinals=(),
+        preserved_tags=("id", "cartn_x"), source_rows_key="1" * 64,
+    )
+    output_categories = {"atom_site": {"id": ["REAL_ID"], "cartn_x": ["1.0"]}}
+    from molecular.receptor_parsing import ParsedCifDom021, RawCifCategory, _verify_output_reparse
+    mutated = ParsedCifDom021(
+        category_names=("atom_site",),
+        categories={"atom_site": RawCifCategory(name="atom_site", row_count=1, columns={"id": ("CHANGED_ID",), "cartn_x": ("NaN",)})},
+        parser_name="gemmi", parser_version="0.7.5",
+    )
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        _verify_output_reparse(
+            category_decisions=(decision,), entry_id="tbmp_test", output_categories=output_categories, reparsed=mutated,
+        )
+    assert excinfo.value.code == "INVALID_OUTPUT"
+
+
+def test_real_fixture_provenance_manifests_match_actual_file_hashes():  # T021-162
+    import json
+    for subdir, filenames in [
+        ("5i55", ["5I55.cif", "5I55_trimmed.cif"]),
+        ("1pfe", ["1PFE.cif", "1PFE_trimmed.cif"]),
+        ("3dg1", ["3DG1.cif", "3DG1_trimmed.cif"]),
+        ("nmr_2jof", ["2JOF.cif", "2JOF_trimmed.cif"]),
+        ("em_7dwu", ["7DWU.cif", "7DWU_trimmed.cif"]),
+        ("ncs_1a2p", ["1A2P.cif", "1A2P_trimmed.cif"]),
+    ]:
+        manifest = json.loads((_FIXTURES_ROOT / subdir / "PROVENANCE.json").read_text(encoding="utf-8"))
+        for filename in filenames:
+            real_bytes = (_FIXTURES_ROOT / subdir / filename).read_bytes()
+            recorded = manifest["files"][filename]
+            assert hashlib.sha256(real_bytes).hexdigest() == recorded["sha256"], (subdir, filename)
+            assert len(real_bytes) == recorded["size_bytes"], (subdir, filename)

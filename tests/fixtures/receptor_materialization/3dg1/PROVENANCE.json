@@ -1,0 +1,32 @@
+{
+  "pdb_id": "3DG1",
+  "title": "SSTNVG peptide fragment of Islet Amyloid Polypeptide (IAPP/amylin)",
+  "source_url": "https://files.rcsb.org/download/3DG1.cif",
+  "retrieved_at_utc": "2026-11-24",
+  "retrieval_method": "curl (direct HTTPS download of the real RCSB deposition, no synthetic/mock content)",
+  "deposition_method": "X-RAY DIFFRACTION",
+  "files": {
+    "3DG1.cif": {
+      "role": "original, byte-for-byte as downloaded, never modified",
+      "sha256": "a624586501d72b6ff82976f8e2f882e3c39a6d4ca58eebe632cd358ffd90c6c9",
+      "size_bytes": 33774
+    },
+    "3DG1_trimmed.cif": {
+      "role": "documented derivative used by the CP2 test suite",
+      "sha256": "49926dfc5f524634bcc8e5c7b23aba352ce0ac32431f3621b02e022b267ebf58",
+      "size_bytes": 31732,
+      "edit_rationale": "Same rationale as 5i55/PROVENANCE.json. Verified by real-Gemmi reparse diff of category_names before/after.",
+      "categories_removed": [
+        "_pdbx_audit_revision_category", "_pdbx_audit_revision_item", "_pdbx_initial_refinement_model",
+        "_pdbx_phasing_mr", "_phasing"
+      ]
+    }
+  },
+  "scenario_usage": {
+    "id": "T021-147 (catalog-three-real), positive case; _pdbx_struct_special_symmetry real row (T021-158)",
+    "resolved_model": 1,
+    "resolved_chains": [{"label_asym_id": "A", "label_entity_id": "1"}],
+    "unaddressed_components": "preserve",
+    "expected_outcome": "successful end-to-end materialization of a minimal real X-ray deposition with no struct_conn rows at all; the real _pdbx_struct_special_symmetry row (1 entry) is guard-then-omitted after its context resolves unambiguously, without being converted into a fabricated positive annotation."
+  }
+}

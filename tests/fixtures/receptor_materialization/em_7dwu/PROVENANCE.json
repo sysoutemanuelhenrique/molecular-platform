@@ -1,0 +1,36 @@
+{
+  "pdb_id": "7DWU",
+  "title": "Dengue virus envelope protein in complex with human monoclonal antibody 1C19 Fab",
+  "source_url": "https://files.rcsb.org/download/7DWU.cif",
+  "retrieved_at_utc": "2026-11-24",
+  "retrieval_method": "curl (direct HTTPS download of the real RCSB deposition, no synthetic/mock content)",
+  "deposition_method": "ELECTRON MICROSCOPY",
+  "files": {
+    "7DWU.cif": {
+      "role": "original, byte-for-byte as downloaded, never modified",
+      "sha256": "85961fa6dda237fb93f9e134a9c07b6f1ec4bf37f482f5b5f669d5a56755c390",
+      "size_bytes": 263873
+    },
+    "7DWU_trimmed.cif": {
+      "role": "documented derivative used by the CP2 test suite",
+      "sha256": "3da1fed528cee1e0c4db53b47f0155aceaf012bd9a334d0f8219929eefa22e8e",
+      "size_bytes": 260777,
+      "edit_rationale": "Same rationale as 5i55/PROVENANCE.json. Verified by real-Gemmi reparse diff of category_names before/after.",
+      "categories_removed": [
+        "_pdbx_audit_revision_category", "_pdbx_audit_revision_item", "_pdbx_coordinate_model",
+        "_pdbx_initial_refinement_model", "_pdbx_point_symmetry", "_pdbx_struct_assembly_auth_evidence"
+      ]
+    }
+  },
+  "scenario_usage": {
+    "id": "T021-149 (catalog-nmr-em) real EM fixture",
+    "resolved_model": 1,
+    "resolved_chains": [
+      {"label_asym_id": "A", "label_entity_id": "1"},
+      {"label_asym_id": "D", "label_entity_id": "2"},
+      {"label_asym_id": "E", "label_entity_id": "3"}
+    ],
+    "unaddressed_components": "preserve",
+    "expected_outcome": "successful end-to-end materialization of a real single-particle cryo-EM deposition (no _exptl diffraction data, no crystallographic symmetry context) selecting the envelope-protein monomer A plus the Fab heavy/light chains D/E, excluding the two other envelope-protein NCS-related copies (B, C) as chain-complement; the 303 real _pdbx_unobs_or_zero_occ_residues rows are audited by label_asym_id-resolved context, never inferring a coordinate for a genuinely unmodeled residue."
+  }
+}

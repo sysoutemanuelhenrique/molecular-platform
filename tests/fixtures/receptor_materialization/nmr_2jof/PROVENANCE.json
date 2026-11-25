@@ -1,0 +1,30 @@
+{
+  "pdb_id": "2JOF",
+  "title": "Trp-cage miniprotein construct TC5b",
+  "source_url": "https://files.rcsb.org/download/2JOF.cif",
+  "retrieved_at_utc": "2026-11-24",
+  "retrieval_method": "curl (direct HTTPS download of the real RCSB deposition, no synthetic/mock content)",
+  "deposition_method": "SOLUTION NMR",
+  "files": {
+    "2JOF.cif": {
+      "role": "original, byte-for-byte as downloaded, never modified",
+      "sha256": "9148fe7cc4eddc849a35e2069e01e2e74350b5c80c4e316c8c4fd4b04e9a3d7d",
+      "size_bytes": 702738
+    },
+    "2JOF_trimmed.cif": {
+      "role": "documented derivative used by the CP2 test suite",
+      "sha256": "837023fd1b0fc1bf5676a24fcc56f97c50346e6d5871ea65f1c6d76d98144c9b",
+      "size_bytes": 701226,
+      "edit_rationale": "Same rationale as 5i55/PROVENANCE.json. Verified by real-Gemmi reparse diff of category_names before/after.",
+      "categories_removed": ["_pdbx_audit_revision_category", "_pdbx_audit_revision_item"]
+    }
+  },
+  "scenario_usage": {
+    "id": "T021-149 (catalog-nmr-em) real NMR multi-model fixture",
+    "resolved_model": 3,
+    "model_resolution_basis": "explicitly-selected",
+    "resolved_chains": [{"label_asym_id": "A", "label_entity_id": "1"}],
+    "unaddressed_components": "preserve",
+    "expected_outcome": "successful end-to-end materialization that selects model 3 of 28 real NMR conformers exactly - never the first model, never an implicit default; the resolved plan's warnings carry 'other-models-excluded', auditing (never certifying as a 'representative conformer') the 27 discarded models' atoms; retained atom count (284 of 7952 total atom_site rows) matches exactly model 3's own row count."
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "pdb_id": "1PFE",
+  "title": "Echinomycin-d(GCGTACGC) complex (DNA/echinomycin bis-intercalation complex)",
+  "source_url": "https://files.rcsb.org/download/1PFE.cif",
+  "retrieved_at_utc": "2026-11-24",
+  "retrieval_method": "curl (direct HTTPS download of the real RCSB deposition, no synthetic/mock content)",
+  "deposition_method": "X-RAY DIFFRACTION",
+  "files": {
+    "1PFE.cif": {
+      "role": "original, byte-for-byte as downloaded, never modified",
+      "sha256": "1a548463a4ef08bf33be030b5ad8a0a6179d2623f41c9ac0a711cd2a02429315",
+      "size_bytes": 127057
+    },
+    "1PFE_trimmed.cif": {
+      "role": "documented derivative used by the CP2 test suite",
+      "sha256": "e0653ce8e25e4ef8cc5e37b08d6a4f6cab19eb6928e18e462a3a91f83139dc73",
+      "size_bytes": 124615,
+      "edit_rationale": "Same rationale as 5i55/PROVENANCE.json: three categories added to the PDB mmCIF dictionary after the frozen catalogue snapshot were removed verbatim so the fixture exercises the intended gate rather than an unrelated scope gap. Verified by real-Gemmi reparse diff of category_names before/after.",
+      "categories_removed": ["_pdbx_audit_revision_category", "_pdbx_audit_revision_item", "_pdbx_initial_refinement_model"]
+    }
+  },
+  "scenario_usage": {
+    "id": "T021-144 (different-image-reason) / T021-147 (catalog-three-real), negative case",
+    "resolved_model": 1,
+    "resolved_chains": [{"label_asym_id": "A", "label_entity_id": "1"}],
+    "unaddressed_components": "preserve",
+    "resolved_component_dispositions_remove": [
+      ["C", "CL", "other-non-polymer"], ["D", "QUI", "other-non-polymer"], ["E", "QUI", "other-non-polymer"],
+      ["F", "HOH", "water"], ["G", "HOH", "water"]
+    ],
+    "expected_outcome": "MaterializationExecutionError(code='UNSUPPORTED_SYMMETRY') - the deposition's own 18 hydrog (Hoogsteen/Watson-Crick base-pair) struct_conn rows all declare ptnr1_symmetry='1_555', ptnr2_symmetry='9_555' entirely within retained chain A (confirmed by direct inspection of the real file), with no _symmetry_equiv/_space_group_symop tables present; '9_555' without tables can never be proven identity by the pdbx-1_555-convention (which only ever applies to the literal code 1_555), so this real deposition genuinely hits the frozen profile's non-identity-projection limit - never converted into a positive case, exactly as the implementation brief requires ('1pfe passa cobertura de categorias/tags, mas deve recusar no gate 1_555/9_555')."
+  }
+}
