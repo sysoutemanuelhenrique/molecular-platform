@@ -2384,6 +2384,28 @@ def test_catalogue_special_position_guard_requires_unambiguous_context():  # T02
         run({"id": ("1",), "label_asym_id": ("A",), "label_seq_id": ("999",)})
     assert excinfo.value.code == "INVALID_CIF"
 
+    # R-CP2-01 residual (architect focal receipt 377534786c3ad390d08641c137
+    # d0d54681911fb8): a real asym/seq that nonetheless names a
+    # *contradicting* component must refuse, never match on asym+seq
+    # alone - a-ca is real A/seq1/ALA, not GLY.
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        run({"id": ("1",), "label_asym_id": ("A",), "label_seq_id": ("1",), "label_comp_id": ("GLY",)})
+    assert excinfo.value.code == "INVALID_CIF"
+
+    # The exact same row with the genuinely agreeing component passes -
+    # this is contradiction detection, never a stricter-than-source
+    # requirement on an informed, correct field.
+    decisions = run({"id": ("1",), "label_asym_id": ("A",), "label_seq_id": ("1",), "label_comp_id": ("ALA",)})
+    by_cat = {d.category: d for d in decisions}
+    assert by_cat["_pdbx_struct_special_symmetry"].action == "guard_then_omit"
+
+    # R-CP2-01 residual: label_seq_id is the primary key once present,
+    # but a genuinely informed, contradicting auth_seq_id must still
+    # refuse - never silently ignored just because label_seq_id resolved.
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        run({"id": ("1",), "label_asym_id": ("A",), "label_seq_id": ("1",), "auth_seq_id": ("999",)})
+    assert excinfo.value.code == "INVALID_CIF"
+
 
 def test_compute_special_position_summary_counts_overlap_removed_and_other_model():  # R-CP2-01
     # A richer scenario than _minimal_catalogue_scenario(): two altloc
@@ -2446,6 +2468,21 @@ def test_compute_special_position_summary_counts_overlap_removed_and_other_model
     # in M - never an error).
     assert summary.retained_annotation_count == 5
     assert summary.retained_unique_atom_count == 4  # {0, 1, 2, 5} - never 6 or 7
+
+    # R-CP2-01 residual: the exact bug the architect's focal receipt
+    # named directly against this production function - ordinal0 is real
+    # A/seq1/ALA; an annotation naming A/seq1/GLY must never be counted
+    # as affecting it (previously accepted and counted 1/1/1).
+    contradicting_table = _category_table(
+        id=("1",), label_asym_id=("A",), label_seq_id=("1",), auth_asym_id=(None,), auth_seq_id=(None,),
+        pdb_ins_code=(None,), pdb_model_num=(None,), label_alt_id=(None,), label_comp_id=("GLY",),
+    )
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        compute_special_position_summary(
+            categories={"_pdbx_struct_special_symmetry": contradicting_table},
+            atoms_by_ordinal=atoms_by_ordinal, atom_decisions_by_ordinal=atom_decisions_by_ordinal,
+        )
+    assert excinfo.value.code == "INVALID_CIF"
 
     # SCHEMAS Section 8: zero counts when the category is absent.
     empty_summary = compute_special_position_summary(

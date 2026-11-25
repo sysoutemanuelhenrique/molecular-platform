@@ -1101,6 +1101,11 @@ class ParsedCifDom021:
     categories: "dict[str, RawCifCategory]"
     parser_name: str
     parser_version: str
+    # R-CP2-03 residual: the real data block's own name (never a `data_`
+    # prefix - Gemmi's `block.name` already strips it), so a reparse of
+    # freshly-serialized output can verify the generated block identity
+    # (`tbmp_<plan_key>`) independently, not merely the `_entry.id` cell.
+    block_name: str = ""
 
 
 def raw_cif_null_to_optional_str(raw_token: Optional[str]) -> Optional[str]:
@@ -1275,6 +1280,7 @@ def parse_receptor_cif_dom021(raw_bytes: bytes) -> ParsedCifDom021:
         categories=categories,
         parser_name="gemmi",
         parser_version=gemmi.__version__,
+        block_name=block.name,
     )
 
 
@@ -1525,6 +1531,7 @@ def _verify_output_reparse(
     *,
     category_decisions: Tuple["rm.CategoryDecision", ...],
     entry_id: str,
+    block_name: str,
     output_categories: "Dict[str, Dict[str, List[str]]]",
     reparsed: ParsedCifDom021,
 ) -> None:
@@ -1538,9 +1545,22 @@ def _verify_output_reparse(
     already known to the plan. Acceptance by the writer/reader of the
     same library alone is never sufficient proof (brief Section 4, point
     5): a changed id, a corrupted coordinate, a dropped/added column, an
-    entirely unplanned extra category, or reordered rows must all raise
+    entirely unplanned extra category/`_entry` tag, a wrong generated
+    block name, or reordered rows must all raise
     `INVALID_OUTPUT(phase='verify')` here, even when the shape alone
     would look fine."""
+
+    # R-CP2-03 residual: the generated block identity (Section 11:
+    # "nome do novo block como tbmp_<plan_key>") is independently
+    # verified against the real, reparsed block name - never only
+    # `_entry.id`, which could theoretically agree while the block itself
+    # was corrupted/renamed.
+    if reparsed.block_name != block_name:
+        raise rm.MaterializationExecutionError(
+            "INVALID_OUTPUT",
+            f"reparsed output's data block is named {reparsed.block_name!r}, expected {block_name!r}",
+            phase="verify",
+        )
 
     # R-CP2-03: the *closed* expected category universe - "entry" plus
     # every category the plan actually decided to write a nonempty table
@@ -1568,7 +1588,23 @@ def _verify_output_reparse(
         canonical = decision.category.lstrip("_")
         if decision.category == "_entry":
             reparsed_entry = reparsed.categories.get("entry")
-            if reparsed_entry is None or reparsed_entry.row_count != 1 or reparsed_entry.get(0, "id") != entry_id:
+            if reparsed_entry is None or reparsed_entry.row_count != 1:
+                raise rm.MaterializationExecutionError(
+                    "INVALID_OUTPUT", "reparsed _entry does not carry exactly one row", phase="verify",
+                )
+            # R-CP2-03 residual: the same closed-tag-universe check every
+            # other category already gets - an extra `_entry` column
+            # (never decided upon) previously passed unnoticed alongside
+            # a correct id.
+            expected_entry_columns = output_categories.get("entry", {"id": [entry_id]})
+            unexpected_entry_columns = set(reparsed_entry.columns) - set(expected_entry_columns)
+            if unexpected_entry_columns:
+                raise rm.MaterializationExecutionError(
+                    "INVALID_OUTPUT",
+                    f"reparsed _entry carries unexpected tag(s) {sorted(unexpected_entry_columns)!r}",
+                    phase="verify",
+                )
+            if reparsed_entry.get(0, "id") != entry_id:
                 raise rm.MaterializationExecutionError(
                     "INVALID_OUTPUT", "reparsed _entry does not carry the expected generated id", phase="verify",
                 )
@@ -1752,7 +1788,7 @@ def materialize_receptor_cif021(
 
     reparsed = reparse_and_extract_cif_dom021(output_bytes)
     _verify_output_reparse(
-        category_decisions=category_decisions, entry_id=entry_id,
+        category_decisions=category_decisions, entry_id=entry_id, block_name=block_name,
         output_categories=output_categories, reparsed=reparsed,
     )
 

@@ -3887,9 +3887,15 @@ def _resolve_special_position_row_atoms(
     one `label_asym_id`, no seq identity at all, or a residue identity
     that matches no `_atom_site` row in *any* model is a genuinely
     unresolvable/ambiguous context - `INVALID_CIF`, never a blind
-    omission. A real residue that simply belongs to a different model, a
-    different altloc, or is not retained is instead a *resolved* context
-    with zero (or partial) matches - never an error."""
+    omission. Every *other* informed field (`label_comp_id`/
+    `auth_comp_id`, and `auth_seq_id`/`pdb_ins_code` even when
+    `label_seq_id` is the primary key) must also agree with the matched
+    atom - a row that names a real asym/seq but a contradicting
+    component or auth identity/insertion is just as unresolvable as an
+    unknown asym, never silently matched on asym+seq alone. A real
+    residue that simply belongs to a different model, a different
+    altloc, or is not retained is instead a *resolved* context with zero
+    (or partial) matches - never an error."""
 
     label_asym_id = table.value("label_asym_id", row_index) if "label_asym_id" in present_columns else None
     if label_asym_id is not None:
@@ -3929,20 +3935,44 @@ def _resolve_special_position_row_atoms(
             "its residue context cannot be resolved unambiguously",
             phase="plan",
         )
+    label_comp_id = table.value("label_comp_id", row_index) if "label_comp_id" in present_columns else None
+    auth_comp_id = table.value("auth_comp_id", row_index) if "auth_comp_id" in present_columns else None
 
     def _same_residue(atom: AtomObservation) -> bool:
         if atom.label_asym_id != label_asym_id:
             return False
         if label_seq_id is not None:
-            return atom.label_seq_id == label_seq_id
-        return atom.auth_seq_id == auth_seq_id and atom.insertion_token == insertion_token
+            if atom.label_seq_id != label_seq_id:
+                return False
+            # R-CP2-01 residual: label_seq_id is the primary key once
+            # present, but a genuinely informed auth_seq_id/insertion
+            # alongside it must still agree - never silently ignored,
+            # which would let a contradicting auth identity slip through
+            # as if label_seq_id alone were sufficient proof.
+            if auth_seq_id is not None and atom.auth_seq_id != auth_seq_id:
+                return False
+            if insertion_token is not None and atom.insertion_token != insertion_token:
+                return False
+        elif atom.auth_seq_id != auth_seq_id or atom.insertion_token != insertion_token:
+            return False
+        # R-CP2-01 residual: an informed label_comp_id/auth_comp_id must
+        # agree with the matched atom's own ccd - chain+sequence alone is
+        # never sufficient proof when the annotation itself names a
+        # component that contradicts the real residue at that position.
+        if label_comp_id is not None and atom.ccd != label_comp_id:
+            return False
+        if auth_comp_id is not None and atom.ccd != auth_comp_id:
+            return False
+        return True
 
     if not any(_same_residue(atom) for atom in atoms_by_ordinal.values()):
         raise MaterializationExecutionError(
             "INVALID_CIF",
             f"category {category!r} row {row_index} residue context (label_asym_id={label_asym_id!r}, "
             f"label_seq_id={label_seq_id!r}, auth_seq_id={auth_seq_id!r}, "
-            f"insertion_token={insertion_token!r}) does not correspond to any _atom_site row in any model",
+            f"insertion_token={insertion_token!r}, label_comp_id={label_comp_id!r}, "
+            f"auth_comp_id={auth_comp_id!r}) does not correspond to any _atom_site row in any model - "
+            "either genuinely absent or contradicting an informed field",
             phase="plan",
         )
 

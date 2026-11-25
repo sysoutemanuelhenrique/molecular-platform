@@ -1113,6 +1113,55 @@ def test_real_fixture_3dg1_positive_materialization_with_real_special_symmetry()
     assert result.plan.special_positions.retained_unique_atom_count == 1
 
 
+def test_real_fixture_3dg1_special_position_rejects_contradicting_real_component():  # R-CP2-01 residual, native Gemmi proof
+    # The real 3DG1 special-position row names auth_comp_id='HOH' for the
+    # same real residue (label_asym_id=B, auth_seq_id=7) the positive test
+    # above resolves against. Mutating that one genuinely Gemmi-decoded
+    # value to a contradicting component must now refuse - proving the
+    # fix against real tokens, not only a hand-built DTO.
+    raw_bytes = _real_fixture_bytes("3dg1", "3DG1_trimmed.cif")
+    dom = parse_receptor_cif_dom021(raw_bytes)
+    from molecular.receptor_parsing import _build_atom_observations, _build_category_tables, _build_entity_type_lookup
+    from molecular.receptor_materialization import (
+        build_materialization_plan, compute_special_position_summary, MaterializationExecutionError,
+    )
+
+    entity_type_by_id = _build_entity_type_lookup(dom)
+    atoms = _build_atom_observations(dom, entity_type_by_id)
+    atoms_by_ordinal = {a.ordinal: a for a in atoms}
+    resolution = _cp2_resolution().model_copy(update={
+        "resolved_chains": (ResolvedChainSelection(label_asym_id="A", label_entity_id="1", model_number=1),),
+    })
+    plan = build_materialization_plan(
+        source_context=_cp2_source_context(), resolved_selection=resolution,
+        unaddressed_components="preserve", atoms=atoms,
+    )
+    atom_decisions_by_ordinal = {d.ordinal: d for d in plan.atom_decisions}
+    tables = _build_category_tables(dom)
+
+    # Positive control: the real, unmutated row resolves exactly as the
+    # full-pipeline test above already proves (1/1/1).
+    real_summary = compute_special_position_summary(
+        categories=tables, atoms_by_ordinal=atoms_by_ordinal, atom_decisions_by_ordinal=atom_decisions_by_ordinal,
+    )
+    assert (
+        real_summary.source_annotation_count, real_summary.retained_annotation_count,
+        real_summary.retained_unique_atom_count,
+    ) == (1, 1, 1)
+
+    special_table = tables["_pdbx_struct_special_symmetry"]
+    mutated_columns = dict(special_table.columns)
+    mutated_columns["auth_comp_id"] = ("XXX",)
+    mutated_table = special_table._replace(columns=mutated_columns)
+    mutated_tables = dict(tables, _pdbx_struct_special_symmetry=mutated_table)
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        compute_special_position_summary(
+            categories=mutated_tables, atoms_by_ordinal=atoms_by_ordinal,
+            atom_decisions_by_ordinal=atom_decisions_by_ordinal,
+        )
+    assert excinfo.value.code == "INVALID_CIF"
+
+
 def test_real_fixture_2jof_nmr_selects_exact_model_not_first():  # T021-149/162, real multi-model NMR
     raw_bytes = _real_fixture_bytes("nmr_2jof", "2JOF_trimmed.cif")
     assert hashlib.sha256(raw_bytes).hexdigest() == "837023fd1b0fc1bf5676a24fcc56f97c50346e6d5871ea65f1c6d76d98144c9b"
@@ -1280,11 +1329,12 @@ def test_output_verification_rejects_mutated_token_before_commit():  # T021-089
     mutated = ParsedCifDom021(
         category_names=("atom_site",),
         categories={"atom_site": RawCifCategory(name="atom_site", row_count=1, columns={"id": ("CHANGED_ID",), "cartn_x": ("NaN",)})},
-        parser_name="gemmi", parser_version="0.7.5",
+        parser_name="gemmi", parser_version="0.7.5", block_name="tbmp_test",
     )
     with pytest.raises(MaterializationExecutionError) as excinfo:
         _verify_output_reparse(
-            category_decisions=(decision,), entry_id="tbmp_test", output_categories=output_categories, reparsed=mutated,
+            category_decisions=(decision,), entry_id="tbmp_test", block_name="tbmp_test",
+            output_categories=output_categories, reparsed=mutated,
         )
     assert excinfo.value.code == "INVALID_OUTPUT"
     assert excinfo.value.phase == "verify"  # R-CP2-03: never 'plan' - this is the post-serialize verify step
@@ -1310,12 +1360,12 @@ def test_output_verification_rejects_entirely_unplanned_extra_category():  # R-C
             "atom_site": RawCifCategory(name="atom_site", row_count=1, columns={"id": ("REAL_ID",), "cartn_x": ("1.0",)}),
             "unplanned_category": RawCifCategory(name="unplanned_category", row_count=1, columns={"x": ("1",)}),
         },
-        parser_name="gemmi", parser_version="0.7.5",
+        parser_name="gemmi", parser_version="0.7.5", block_name="tbmp_test",
     )
     with pytest.raises(MaterializationExecutionError) as excinfo:
         _verify_output_reparse(
-            category_decisions=(decision,), entry_id="tbmp_test", output_categories=output_categories,
-            reparsed=reparsed_with_extra,
+            category_decisions=(decision,), entry_id="tbmp_test", block_name="tbmp_test",
+            output_categories=output_categories, reparsed=reparsed_with_extra,
         )
     assert excinfo.value.code == "INVALID_OUTPUT"
     assert excinfo.value.phase == "verify"
@@ -1326,12 +1376,64 @@ def test_output_verification_rejects_entirely_unplanned_extra_category():  # R-C
     reparsed_without_extra = ParsedCifDom021(
         category_names=("atom_site",),
         categories={"atom_site": reparsed_with_extra.categories["atom_site"]},
-        parser_name="gemmi", parser_version="0.7.5",
+        parser_name="gemmi", parser_version="0.7.5", block_name="tbmp_test",
     )
     _verify_output_reparse(
-        category_decisions=(decision,), entry_id="tbmp_test", output_categories=output_categories,
-        reparsed=reparsed_without_extra,
+        category_decisions=(decision,), entry_id="tbmp_test", block_name="tbmp_test",
+        output_categories=output_categories, reparsed=reparsed_without_extra,
     )
+
+
+def test_output_verification_rejects_unplanned_entry_tag_and_wrong_block_name():  # R-CP2-03 residual
+    # The previous `_entry` check only ever confirmed row count and id -
+    # an extra, never-decided _entry tag passed unnoticed alongside a
+    # correct id, and ParsedCifDom021 carried no block name at all, so
+    # the generated block identity (tbmp_<plan_key>) was never verified
+    # against the real reparsed block, only _entry.id.
+    decision = CategoryDecision(category="_entry", action="generate", generated_tags=("id",))
+    output_categories = {"entry": {"id": ["tbmp_real"]}}
+    from molecular.receptor_parsing import ParsedCifDom021, RawCifCategory, _verify_output_reparse
+
+    reparsed_with_extra_tag = ParsedCifDom021(
+        category_names=("entry",),
+        categories={"entry": RawCifCategory(name="entry", row_count=1, columns={"id": ("tbmp_real",), "unplanned": ("x",)})},
+        parser_name="gemmi", parser_version="0.7.5", block_name="tbmp_real",
+    )
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        _verify_output_reparse(
+            category_decisions=(decision,), entry_id="tbmp_real", block_name="tbmp_real",
+            output_categories=output_categories, reparsed=reparsed_with_extra_tag,
+        )
+    assert excinfo.value.code == "INVALID_OUTPUT"
+    assert excinfo.value.phase == "verify"
+    assert "unplanned" in str(excinfo.value)
+
+    reparsed_correct = ParsedCifDom021(
+        category_names=("entry",),
+        categories={"entry": RawCifCategory(name="entry", row_count=1, columns={"id": ("tbmp_real",)})},
+        parser_name="gemmi", parser_version="0.7.5", block_name="tbmp_real",
+    )
+    # The same, correct reparse passes - the new tag-closure check is
+    # additive, never stricter than the single real "id" tag _entry ever
+    # declares.
+    _verify_output_reparse(
+        category_decisions=(decision,), entry_id="tbmp_real", block_name="tbmp_real",
+        output_categories=output_categories, reparsed=reparsed_correct,
+    )
+
+    reparsed_wrong_block = ParsedCifDom021(
+        category_names=("entry",),
+        categories={"entry": RawCifCategory(name="entry", row_count=1, columns={"id": ("tbmp_real",)})},
+        parser_name="gemmi", parser_version="0.7.5", block_name="tbmp_corrupted",
+    )
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        _verify_output_reparse(
+            category_decisions=(decision,), entry_id="tbmp_real", block_name="tbmp_real",
+            output_categories=output_categories, reparsed=reparsed_wrong_block,
+        )
+    assert excinfo.value.code == "INVALID_OUTPUT"
+    assert excinfo.value.phase == "verify"
+    assert "tbmp_corrupted" in str(excinfo.value)
 
 
 def test_real_fixture_provenance_manifests_match_actual_file_hashes():  # T021-162
