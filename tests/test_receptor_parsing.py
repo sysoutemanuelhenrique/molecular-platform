@@ -1146,6 +1146,64 @@ def test_raw_vs_quoted_null_marker_distinction_is_preserved():  # T021-041
     assert gemmi.cif.as_string(non_null) == "."  # decode only after the null check confirms a real token
 
 
+def test_decoded_view_cooks_quoted_identifiers_and_multiline_operator_expressions():  # governance addendum 2026-11-24 §3.4
+    # The Checkpoint 2 adapter boundary builds two views from one real
+    # Gemmi DOM: `raw_columns` (the literal source token, untouched - a
+    # quoted string keeps its quote marks, a multiline operator
+    # expression keeps its semicolon delimiters) and `columns` (the
+    # *decoded* view every lookup/identity computation reads - a real
+    # null collapses to None, a quoted non-null token is Gemmi-decoded to
+    # its cooked content, and a quoted null-look-alike like `'.'` decodes
+    # to the literal string "." rather than ever being treated as null).
+    # This must hold for ordinary identifiers (`_entity.type`) and for
+    # symmetry operator expressions, including a genuine multiline
+    # (semicolon-delimited) one - not merely the single quoted-dot case
+    # already proven above at the raw Gemmi primitive level.
+    text = (
+        "data_x\n"
+        "loop_\n"
+        "_entity.id\n"
+        "_entity.type\n"
+        "1 'polymer'\n"
+        "2 non-polymer\n"
+        "loop_\n"
+        "_symmetry_equiv.id\n"
+        "_symmetry_equiv.pos_as_xyz\n"
+        "1 'x,-y,-z'\n"
+        "2\n"
+        ";x,y,z\n"
+        ";\n"
+        "3 .\n"
+        "4 '.'\n"
+    )
+    dom = parse_receptor_cif_dom021(text.encode("utf-8"))
+
+    from molecular.receptor_parsing import _build_category_tables, _build_entity_type_lookup, _build_symmetry_operator_tables
+
+    entity_type_by_id = _build_entity_type_lookup(dom)
+    # A quoted entity type token is Gemmi-decoded (quotes stripped) before
+    # the lowercase/vocabulary check, exactly like an unquoted one.
+    assert entity_type_by_id == {"1": "polymer", "2": "non-polymer"}
+
+    operators = _build_symmetry_operator_tables(dom)
+    assert operators.symmetry_equiv == {
+        "1": "x,-y,-z",  # quoted single-line expression, decoded (quotes stripped)
+        "2": "x,y,z",    # genuine multiline (semicolon-delimited) expression, decoded
+        "3": None,       # real, unquoted CIF null
+        "4": ".",        # quoted null-look-alike - a genuine token, never None
+    }
+
+    tables = _build_category_tables(dom)
+    symmetry_table = tables["_symmetry_equiv"]
+    # The decoded view never retains quote marks or semicolon delimiters.
+    assert symmetry_table.columns["pos_as_xyz"] == ("x,-y,-z", "x,y,z", None, ".")
+    # The raw view preserves the exact literal source tokens, quote marks
+    # and semicolon delimiters intact - never collapsed or de-quoted.
+    assert symmetry_table.raw_columns["pos_as_xyz"] == (
+        "'x,-y,-z'", ";x,y,z\n;", ".", "'.'",
+    )
+
+
 def test_loss_audit_raw_bytes_unchanged_and_every_omission_hashed():  # T021-088
     raw_bytes = _MINIMAL_CIF.encode("utf-8")
     raw_bytes_copy = bytes(raw_bytes)
@@ -1194,6 +1252,47 @@ def test_real_fixture_provenance_manifests_match_actual_file_hashes():  # T021-1
             recorded = manifest["files"][filename]
             assert hashlib.sha256(real_bytes).hexdigest() == recorded["sha256"], (subdir, filename)
             assert len(real_bytes) == recorded["size_bytes"], (subdir, filename)
+
+
+def test_real_fixture_originals_carry_removed_categories_outside_the_catalogue():  # governance addendum 2026-11-24 §3.5
+    # Each trimmed fixture's documented `categories_removed` (PROVENANCE.json)
+    # is verified directly against the real, untouched original deposition's
+    # own bytes - never taken on the manifest's word alone: every removed
+    # category must genuinely be present in the original, genuinely absent
+    # from the trimmed derivative, genuinely fall outside the frozen
+    # 94-category catalogue (the actual, real reason the brief requires
+    # rejecting it), and every *other* category's row count must be
+    # identical between original and trimmed - proving the edit removed
+    # exactly the documented whole categories and touched nothing else.
+    import json
+    from molecular.receptor_materialization import _cat_def_for
+
+    for subdir, original, trimmed in [
+        ("5i55", "5I55.cif", "5I55_trimmed.cif"),
+        ("1pfe", "1PFE.cif", "1PFE_trimmed.cif"),
+        ("3dg1", "3DG1.cif", "3DG1_trimmed.cif"),
+        ("nmr_2jof", "2JOF.cif", "2JOF_trimmed.cif"),
+        ("em_7dwu", "7DWU.cif", "7DWU_trimmed.cif"),
+        ("ncs_1a2p", "1A2P.cif", "1A2P_trimmed.cif"),
+    ]:
+        manifest = json.loads((_FIXTURES_ROOT / subdir / "PROVENANCE.json").read_text(encoding="utf-8"))
+        removed = manifest["files"][trimmed]["categories_removed"]
+        original_dom = parse_receptor_cif_dom021(_real_fixture_bytes(subdir, original))
+        trimmed_dom = parse_receptor_cif_dom021(_real_fixture_bytes(subdir, trimmed))
+
+        removed_canonical = {category.lstrip("_") for category in removed}
+        for category in removed:
+            canonical = category.lstrip("_")
+            assert canonical in original_dom.category_names, (subdir, category, "missing from real original")
+            assert canonical not in trimmed_dom.category_names, (subdir, category, "still present after trim")
+            assert _cat_def_for(category) is None, (subdir, category, "unexpectedly inside the pinned catalogue")
+
+        assert set(original_dom.category_names) - set(trimmed_dom.category_names) == removed_canonical, subdir
+        assert set(trimmed_dom.category_names) <= set(original_dom.category_names), subdir
+        for category in trimmed_dom.category_names:
+            assert (
+                trimmed_dom.categories[category].row_count == original_dom.categories[category].row_count
+            ), (subdir, category, "an unremoved category's row count diverged between original and trimmed")
 
 
 def test_materialize_receptor_cif021_rejects_raw_over_16mib_before_gemmi_parses():  # Section 4: CP2's own 16 MiB ceiling
@@ -1245,6 +1344,32 @@ def test_materialize_receptor_cif021_engine_absent_raises_clean_configuration_er
     )
     result = subprocess.run([sys.executable, "-B", "-c", script], capture_output=True, text=True, timeout=30)
     assert result.stdout.strip() == "OK ENGINE_UNAVAILABLE", (result.stdout, result.stderr)
+
+
+def test_receptor_parsing_module_import_itself_never_touches_gemmi():  # Section 3 (addendum 2026-11-24 §3.3): genuine late import
+    # Merely importing `molecular.receptor_parsing` must never attempt
+    # `import gemmi` - only calling an actual entry point (020's
+    # `parse_receptor_raw` or a 021 entry point) does. A fresh subprocess
+    # (gemmi never already imported in this process) inspects the
+    # module's own lazy-import bookkeeping before and after the first
+    # real call, proving the ordering directly rather than merely that a
+    # blocked import is tolerated.
+    script = (
+        "import sys\n"
+        "sys.path.insert(0, r'" + str(Path(__file__).resolve().parents[1] / "src") + "')\n"
+        "import molecular.receptor_parsing as rp\n"
+        "assert rp._GEMMI_IMPORT_ATTEMPTED is False, 'module import itself must not trigger import gemmi'\n"
+        "assert rp.gemmi is None, 'gemmi must stay unbound until an entry point actually needs it'\n"
+        "try:\n"
+        "    rp.parse_receptor_cif_dom021(b'data_x')\n"
+        "except Exception:\n"
+        "    pass\n"
+        "assert rp._GEMMI_IMPORT_ATTEMPTED is True, 'entry point call must trigger the real import gemmi'\n"
+        "assert rp.gemmi is not None\n"
+        "print('OK')\n"
+    )
+    result = subprocess.run([sys.executable, "-B", "-c", script], capture_output=True, text=True, timeout=30)
+    assert result.stdout.strip() == "OK", (result.stdout, result.stderr)
 
 
 def test_materialize_receptor_cif021_engine_version_mismatch_raises(monkeypatch):  # Section 3: C-04

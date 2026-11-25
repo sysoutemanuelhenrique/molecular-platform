@@ -32,27 +32,51 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Dict, FrozenSet, List, NamedTuple, Optional, Tuple
 
-try:
-    import gemmi
-    _GEMMI_IMPORT_ERROR: Optional[ImportError] = None
-except ImportError as _gemmi_import_error:  # pragma: no cover - exercised via sys.modules sentinel in tests
-    gemmi = None  # type: ignore[assignment]
-    _GEMMI_IMPORT_ERROR = _gemmi_import_error
+gemmi = None  # type: ignore[assignment]  # populated lazily by `_ensure_gemmi_imported()`, never at module load
+_GEMMI_IMPORT_ERROR: Optional[ImportError] = None
+_GEMMI_IMPORT_ATTEMPTED = False
 
 from molecular.atomic import compute_sha256
 from molecular import receptor_materialization as rm
+
+
+def _ensure_gemmi_imported() -> None:
+    """Section 3's actual "late import": merely importing this module
+    never imports `gemmi` - the real `import gemmi` happens here, on
+    first genuine need, triggered only from inside an entry point
+    (020's `parse_receptor_raw` or any 021 entry point via
+    `_require_engine_available()` below), never at this module's own
+    import time. The attempt (success or failure) is made at most once
+    and cached in the module-level `gemmi`/`_GEMMI_IMPORT_ERROR` names,
+    so every subsequent call is a no-op."""
+
+    global gemmi, _GEMMI_IMPORT_ERROR, _GEMMI_IMPORT_ATTEMPTED
+    if _GEMMI_IMPORT_ATTEMPTED:
+        return
+    _GEMMI_IMPORT_ATTEMPTED = True
+    try:
+        import gemmi as _gemmi_module
+    except ImportError as _gemmi_import_error:  # pragma: no cover - exercised via sys.modules sentinel in tests
+        _GEMMI_IMPORT_ERROR = _gemmi_import_error
+    else:
+        gemmi = _gemmi_module
 
 
 def _require_engine_available() -> None:
     """Section 3: an absent Gemmi engine must surface as a clean
     `MaterializationConfigurationError(ENGINE_UNAVAILABLE)` from every
     Checkpoint 2 entry point - never a raw `ImportError`/`AttributeError`
-    from calling into a `None` `gemmi`. The 020 reader (`parse_receptor_raw`
-    and its own helpers) is untouched by this guard - its historical
-    behavior/API when Gemmi *is* present (the only case it has ever had to
-    handle) is preserved exactly; this function is called only from the
-    021 adapter's own public entry points."""
+    from calling into a `None` `gemmi`. Calls `_ensure_gemmi_imported()`
+    first, so the real `import gemmi` genuinely happens here, at call
+    time, not at this module's import time. The 020 reader
+    (`parse_receptor_raw` and its own helpers) triggers the same lazy
+    import itself and is otherwise untouched by this guard - its
+    historical behavior/API when Gemmi *is* present (the only case it
+    has ever had to handle) is preserved exactly; this function's own
+    `MaterializationConfigurationError` is raised only from the 021
+    adapter's own public entry points."""
 
+    _ensure_gemmi_imported()
     if _GEMMI_IMPORT_ERROR is not None:
         raise rm.MaterializationConfigurationError(
             "ENGINE_UNAVAILABLE", f"Gemmi is not installed/importable: {_GEMMI_IMPORT_ERROR}",
@@ -898,6 +922,7 @@ def parse_receptor_raw(raw_path: Path, *, expected_checksum: str) -> ParsedRecep
     believes the RAW artifact to be (Section 11.1).
     """
 
+    _ensure_gemmi_imported()
     raw_path = Path(raw_path)
 
     # Step 0
@@ -1152,15 +1177,15 @@ def _reject_cell_too_large(category_name: str, column: str, token: str) -> None:
 
 def parse_receptor_cif_dom021(raw_bytes: bytes) -> ParsedCifDom021:
     """Increment 021 Checkpoint 2's single Gemmi entry point for the
-    materialization domain (Section 3/19). `import gemmi` above is a
-    plain, eager module-level import - this file is the one dedicated
-    adapter module ARCH-01 permits to hold it - but Section 3's own
-    "late import, clean configuration error when the engine is absent"
-    requirement is satisfied here, not by that import statement:
-    `_require_engine_available()` is the explicit guard every 021 entry
-    point calls first, converting an absent/failed Gemmi import into
-    `MaterializationConfigurationError(ENGINE_UNAVAILABLE)` before this
-    function ever touches `gemmi.*`. Captures bytes already validated
+    materialization domain (Section 3/19). This file is the one
+    dedicated adapter module ARCH-01 permits to hold `gemmi` at all, but
+    the `import gemmi` itself is genuinely late (`_ensure_gemmi_imported()`,
+    first triggered here via `_require_engine_available()`) - never
+    module-level, so importing `molecular.receptor_parsing` on its own
+    never touches `gemmi`. `_require_engine_available()` is the explicit
+    guard every 021 entry point calls first, converting an absent/failed
+    Gemmi import into `MaterializationConfigurationError(ENGINE_UNAVAILABLE)`
+    before this function ever touches `gemmi.*`. Captures bytes already validated
     (checksum/size) by the 021 domain's own boundary; parses them exactly
     once into a native Gemmi DOM; extracts every present category's raw
     tokens; enforces Section 4's structural limits; and returns a plain,
@@ -1591,12 +1616,13 @@ def materialize_receptor_cif021(
     opens a file by path, never reparses the *source* RAW a second time
     - only the newly serialized bytes.
 
-    `import gemmi` above is a plain, eager module-level import - this
-    file (never `receptor_materialization.py`) is the one dedicated
-    adapter module ARCH-01 permits to hold it. Section 3's "late import,
-    clean configuration error when absent" requirement is satisfied by
-    `_require_engine_available()` below, called first, before the
-    version-pin check or anything else that would otherwise touch a
+    This file (never `receptor_materialization.py`) is the one dedicated
+    adapter module ARCH-01 permits to hold `gemmi` at all, and the real
+    `import gemmi` is genuinely late (`_ensure_gemmi_imported()`) - never
+    module-level. Section 3's "late import, clean configuration error
+    when absent" requirement is satisfied by `_require_engine_available()`
+    below, called first, before the version-pin check or anything else
+    that would otherwise touch a
     `None` `gemmi` with a raw `AttributeError`."""
 
     _require_engine_available()
