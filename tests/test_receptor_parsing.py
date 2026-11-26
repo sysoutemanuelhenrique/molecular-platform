@@ -548,6 +548,7 @@ ATOM 1 N N . ALA A 1 1 ? 1.0 1.0 1.0 1.00 10.0 1 A 1
 # ==========================================================================
 
 import hashlib
+import yaml
 from datetime import datetime, timezone
 
 import gemmi
@@ -556,6 +557,7 @@ from molecular.inputs import AcquisitionRecord, ProteinInput, RawArtifact
 from molecular.receptor_inspection import ModelDescriptor, ParserProvenance, ReceptorInspectionReport, compute_inspection_id
 from molecular.receptor_materialization import RecordSnapshot, build_source_context
 from molecular.receptor_materialization import CategoryDecision, MaterializationExecutionError
+from molecular.receptor_materialization import MaterializationConfigurationError
 from molecular.receptor_materialization import resolve_connection_decisions
 from molecular.receptor_resolution import ResolvedChainSelection, ResolvedComponentDisposition, ResolvedReceptorSelection
 from molecular.receptor_selection import ReceptorSelectionPolicy
@@ -564,6 +566,7 @@ from molecular.receptor_parsing import (
     CifStructuralLimitExceededError,
     InvalidCifEncodingError,
     MAX_CIF_RAW_ARTIFACT_SIZE_BYTES,
+    MaterializationAdapterError,
     MultipleDataBlocksError,
     materialize_receptor_cif021,
     parse_receptor_cif_dom021,
@@ -574,6 +577,11 @@ from molecular.receptor_parsing import (
 
 _CP2_PROTEIN_ID = "protein-cp2"
 _CP2_SELECTION_ID = "sel-cp2"
+# MINOR-2: a fixed, real timestamp - never `datetime.now()` - so the
+# real YAML-serialized document bytes `_real_record_snapshot` hashes
+# stay identical across repeated calls, preserving the determinism
+# tests that compare `plan_key` across two separately-built contexts.
+_CP2_FIXED_TIMESTAMP = datetime(2026, 1, 1, tzinfo=timezone.utc)
 # C-04: a real SHA-256/size of the actual fixture bytes below - never a
 # fictitious constant - since `materialize_receptor_cif021` now checks
 # the received RAW bytes against exactly these SourceContext fields
@@ -590,12 +598,28 @@ def _cp2_inspection_id() -> str:
     )
 
 
+def _real_record_snapshot(*, kind, id, model, schema_version):
+    # MINOR-2 (adversarial review 20261125): the real 020 persistence
+    # layer (receptor_registry.py/registry.py) always writes a record as
+    # `yaml.safe_dump(model.model_dump(mode="json"), sort_keys=False)`,
+    # UTF-8 encoded - the exact bytes a future CP3 storage reader would
+    # capture and hash. Hashing/sizing those real bytes here, instead of
+    # a fixed repeated-hex placeholder, means a genuinely changed
+    # document actually changes this snapshot (and the plan_key it feeds
+    # into), never a value the adapter could silently ignore either way.
+    serialized = yaml.safe_dump(model.model_dump(mode="json"), sort_keys=False).encode("utf-8")
+    return RecordSnapshot(
+        kind=kind, id=id, sha256=hashlib.sha256(serialized).hexdigest(),
+        size_bytes=len(serialized), schema_version=schema_version,
+    )
+
+
 def _cp2_source_context():
     inspection_id = _cp2_inspection_id()
     protein_input = ProteinInput(
         id=_CP2_PROTEIN_ID, name="P",
         acquisition=AcquisitionRecord(
-            method="uploaded", acquired_at=datetime.now(timezone.utc),
+            method="uploaded", acquired_at=_CP2_FIXED_TIMESTAMP,
             raw_artifact=RawArtifact(path="x", format="mmcif", checksum=_CP2_RAW_SHA),
         ),
     )
@@ -611,14 +635,18 @@ def _cp2_source_context():
     policy = ReceptorSelectionPolicy(
         schema_version="1.0", selection_id=_CP2_SELECTION_ID, protein_input_id=_CP2_PROTEIN_ID,
         inspection_id=inspection_id, raw_checksum_observed=_CP2_RAW_SHA, declared_by="s",
-        declared_at=datetime.now(timezone.utc),
+        declared_at=_CP2_FIXED_TIMESTAMP,
     )
     resolution = _cp2_resolution()
+    # MINOR-2 (adversarial review 20261125): real YAML-encoded UTF-8
+    # bytes of the exact four 020 documents just built above - never a
+    # fixed repeated-hex placeholder - hashed/sized the same way the
+    # real 020 persistence layer (receptor_registry.py) would.
     records = (
-        RecordSnapshot(kind="protein", id=_CP2_PROTEIN_ID, sha256="1" * 64, size_bytes=1, schema_version=None),
-        RecordSnapshot(kind="inspection", id=inspection_id, sha256="2" * 64, size_bytes=1, schema_version="1.0"),
-        RecordSnapshot(kind="selection", id=_CP2_SELECTION_ID, sha256="3" * 64, size_bytes=1, schema_version="1.0"),
-        RecordSnapshot(kind="resolution", id=_CP2_SELECTION_ID, sha256="4" * 64, size_bytes=1, schema_version="1.0"),
+        _real_record_snapshot(kind="protein", id=_CP2_PROTEIN_ID, model=protein_input, schema_version=None),
+        _real_record_snapshot(kind="inspection", id=inspection_id, model=report, schema_version="1.0"),
+        _real_record_snapshot(kind="selection", id=_CP2_SELECTION_ID, model=policy, schema_version="1.0"),
+        _real_record_snapshot(kind="resolution", id=_CP2_SELECTION_ID, model=resolution, schema_version="1.0"),
     )
     return build_source_context(
         protein_input=protein_input, inspection_report=report, policy=policy,
@@ -633,7 +661,7 @@ def _cp2_resolution() -> ResolvedReceptorSelection:
         structure_format="mmcif", parser=ParserProvenance(name="gemmi", version="0.7.5"), resolved_model=1,
         model_resolution_basis="only-model-present", resolved_assembly=None,
         resolved_chains=(ResolvedChainSelection(label_asym_id="A", label_entity_id="E1", model_number=1),),
-        resolved_component_dispositions=(), resolved_at=datetime.now(timezone.utc),
+        resolved_component_dispositions=(), resolved_at=_CP2_FIXED_TIMESTAMP,
     )
 
 
@@ -702,7 +730,7 @@ _atom_site.occupancy
 _atom_site.B_iso_or_equiv
 ATOM 1 C CA . ALA A E1 1 A 1 ? 1 1.000 2.000 3.000 1.00 10.00
 ATOM 2 S SG . CYS A E1 2 A 2 ? 1 1.500 2.500 3.500 1.00 11.00
-ATOM 3 C CA . ALA A E1 1 A 1 ? 1 1.100 2.100 3.100 1.00 10.10
+ATOM 3 C CB . ALA A E1 1 A 1 ? 1 1.100 2.100 3.100 1.00 10.10
 ATOM 4 N N  . ALA A E1 1 A 1 ? 1 1.200 2.200 3.200 1.00 10.20
 ATOM 5 S SD . MET B E2 1 B 1 ? 1 9.000 9.000 9.000 1.00 12.00
 #
@@ -778,6 +806,24 @@ def test_parse_cif_dom021_rejects_save_frames():
     text = _MINIMAL_CIF + "\nsave_frame_x\n_x.y 1\nsave_\n"
     with pytest.raises(CifSaveFrameRejectedError):
         parse_receptor_cif_dom021(text.encode("utf-8"))
+
+
+def test_parse_cif_dom021_rejects_save_frame_case_and_indentation_variants():  # MAJOR-1 (adversarial review 20261125)
+    # The real Gemmi 0.7.5 grammar recognizes the `save_` keyword
+    # case-insensitively and regardless of indentation (verified against
+    # the pinned grammar's own source) - the previous `^save_\S`,
+    # column-0-only, lowercase-only regex missed both variants entirely,
+    # and `get_mmcif_category_names()` never enumerates a frame's nested
+    # content at all (an unaudited loss, not a parse failure). Native
+    # Gemmi detection (`Item.frame`) must catch every variant it does.
+    for variant in (
+        "\nSAVE_frame_x\n_x.y 1\nsave_\n",            # uppercase keyword
+        "\n  save_frame_x\n_x.y 1\n  save_\n",         # indented, lowercase
+        "\n  SAVE_frame_x\n_x.y 1\n  SAVE_\n",          # indented, uppercase
+    ):
+        text = _MINIMAL_CIF + variant
+        with pytest.raises(CifSaveFrameRejectedError):
+            parse_receptor_cif_dom021(text.encode("utf-8"))
 
 
 def test_parse_cif_dom021_accepts_multiline_text_field_containing_save_substring():  # C-06, real Gemmi proof
@@ -877,6 +923,24 @@ def test_materialize_receptor_cif021_real_gemmi_end_to_end():  # T021-090 (bindi
     assert result.output_bytes.startswith(f"data_tbmp_{plan.plan_key}".encode("utf-8"))
 
 
+def test_materialize_receptor_cif021_output_tags_in_alphabetical_order():  # MINOR-1 (adversarial review 20261125)
+    # §11/brief §7 require alphabetical *tag* order within each output
+    # category, not merely alphabetical category order - the catalogue's
+    # own preserve_tags order (group_PDB, id, type_symbol, ...) was
+    # previously written through verbatim. Checked against the real
+    # Gemmi-decoded output bytes, never the pre-serialization dict.
+    raw_bytes = _MINIMAL_CIF.encode("utf-8")
+    result = materialize_receptor_cif021(
+        source_context=_cp2_source_context(), resolved_selection=_cp2_resolution(),
+        unaddressed_components="preserve", raw_bytes=raw_bytes,
+    )
+    doc = gemmi.cif.read_string(result.output_bytes.decode("utf-8"))
+    output_block = doc.sole_block()
+    for category_name in output_block.get_mmcif_category_names():
+        tags = tuple(output_block.get_mmcif_category(category_name, raw=True).keys())
+        assert tags == tuple(sorted(tags)), category_name
+
+
 def test_materialize_receptor_cif021_is_deterministic_across_runs():  # Section 13: same bytes -> same plan_key
     raw_bytes = _MINIMAL_CIF.encode("utf-8")
     result_a = materialize_receptor_cif021(
@@ -889,6 +953,98 @@ def test_materialize_receptor_cif021_is_deterministic_across_runs():  # Section 
     )
     assert result_a.plan.plan_key == result_b.plan.plan_key
     assert result_a.output_bytes == result_b.output_bytes
+
+
+def test_cp2_source_context_record_snapshots_are_real_document_bytes():  # MINOR-2 (adversarial review 20261125)
+    # The four RecordSnapshot hashes/sizes are the real YAML-encoded
+    # bytes of the actual ProteinInput/report/policy/resolution objects
+    # - never a fixed repeated-hex placeholder a changed document could
+    # not possibly affect. Proven two ways: the sizes/hashes are never
+    # the old 1-byte/"n"*64 placeholders, and a genuinely different
+    # document (here, a differently-named ProteinInput) changes the
+    # bound source_context_key/plan_key.
+    baseline = _cp2_source_context()
+    for record in baseline.records:
+        assert record.size_bytes > 1
+        assert record.sha256 not in {digit * 64 for digit in "1234"}
+
+    result_baseline = materialize_receptor_cif021(
+        source_context=baseline, resolved_selection=_cp2_resolution(),
+        unaddressed_components="preserve", raw_bytes=_MINIMAL_CIF.encode("utf-8"),
+    )
+
+    inspection_id = _cp2_inspection_id()
+    different_protein_input = ProteinInput(
+        id=_CP2_PROTEIN_ID, name="DIFFERENT_NAME",
+        acquisition=AcquisitionRecord(
+            method="uploaded", acquired_at=_CP2_FIXED_TIMESTAMP,
+            raw_artifact=RawArtifact(path="x", format="mmcif", checksum=_CP2_RAW_SHA),
+        ),
+    )
+    different_records = tuple(
+        _real_record_snapshot(kind=r.kind, id=r.id, model=different_protein_input, schema_version=r.schema_version)
+        if r.kind == "protein" else r
+        for r in baseline.records
+    )
+    mutated = baseline.model_copy(update={"records": different_records})
+    assert mutated.model_dump(mode="json") != baseline.model_dump(mode="json")
+
+    result_mutated = materialize_receptor_cif021(
+        source_context=mutated, resolved_selection=_cp2_resolution(),
+        unaddressed_components="preserve", raw_bytes=_MINIMAL_CIF.encode("utf-8"),
+    )
+    assert result_mutated.plan.plan_key != result_baseline.plan.plan_key
+
+
+def _materialize_mutated_minimal_cif(mutated_text: str):
+    raw_bytes = mutated_text.encode("utf-8")
+    source_context = _cp2_source_context().model_copy(update={
+        "raw_sha256": hashlib.sha256(raw_bytes).hexdigest(),
+        "raw_size_bytes": len(raw_bytes),
+    })
+    return materialize_receptor_cif021(
+        source_context=source_context, resolved_selection=_cp2_resolution(),
+        unaddressed_components="preserve", raw_bytes=raw_bytes,
+    )
+
+
+def test_materialize_receptor_cif021_rejects_quoted_coordinate():  # MAJOR-2, native Gemmi proof
+    # §6 requires an *unquoted* numeric token; the previous validators
+    # read the already Gemmi-decoded view, where a quoted '1.000'
+    # indistinguishably becomes the bare string 1.000. Real Gemmi 0.7.5
+    # decoding: raw token "'1.000'", decoded "1.000" - the fix must read
+    # the former.
+    assert "1 1.000 2.000 3.000 1.00 10.00" in _MINIMAL_CIF
+    mutated = _MINIMAL_CIF.replace(
+        "1 1.000 2.000 3.000 1.00 10.00", "1 '1.000' 2.000 3.000 1.00 10.00", 1,
+    )
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        _materialize_mutated_minimal_cif(mutated)
+    assert excinfo.value.code == "INVALID_CIF"
+    assert excinfo.value.phase == "plan"
+
+
+def test_materialize_receptor_cif021_model_num_integer_spellings():  # MAJOR-2/MINOR-5, native Gemmi proof
+    # "+1"/"01" are valid unquoted ASCII decimal integer spellings of
+    # model 1 (frozen §6 type [+-]?[0-9]+) - never rejected merely for
+    # their written form; a quoted or non-integer model token must
+    # still refuse.
+    assert "A 1 ? 1 1.000 2.000 3.000 1.00 10.00" in _MINIMAL_CIF
+    for spelling in ("+1", "01"):
+        mutated = _MINIMAL_CIF.replace(
+            "A 1 ? 1 1.000 2.000 3.000 1.00 10.00", f"A 1 ? {spelling} 1.000 2.000 3.000 1.00 10.00", 1,
+        )
+        result = _materialize_mutated_minimal_cif(mutated)
+        atom_by_id = {d.atom_id: d for d in result.plan.atom_decisions}
+        assert atom_by_id["1"].retained is True  # still recognized as model 1, never a different/no model
+
+    for bad_spelling in ("'1'", "1.0", "abc"):
+        mutated = _MINIMAL_CIF.replace(
+            "A 1 ? 1 1.000 2.000 3.000 1.00 10.00", f"A 1 ? {bad_spelling} 1.000 2.000 3.000 1.00 10.00", 1,
+        )
+        with pytest.raises(MaterializationExecutionError) as excinfo:
+            _materialize_mutated_minimal_cif(mutated)
+        assert excinfo.value.code == "INVALID_CIF"
 
 
 # ==========================================================================
@@ -922,7 +1078,7 @@ def _real_fixture_materialize(
     protein_input = ProteinInput(
         id=protein_id, name=pdbid,
         acquisition=AcquisitionRecord(
-            method="uploaded", acquired_at=datetime.now(timezone.utc),
+            method="uploaded", acquired_at=_CP2_FIXED_TIMESTAMP,
             raw_artifact=RawArtifact(path=pdbid, format="mmcif", checksum=raw_sha),
         ),
     )
@@ -939,7 +1095,7 @@ def _real_fixture_materialize(
     policy = ReceptorSelectionPolicy(
         schema_version="1.0", selection_id=selection_id, protein_input_id=protein_id,
         inspection_id=inspection_id, raw_checksum_observed=raw_sha, declared_by="s",
-        declared_at=datetime.now(timezone.utc),
+        declared_at=_CP2_FIXED_TIMESTAMP,
     )
     resolution = ResolvedReceptorSelection(
         schema_version="1.0", resolved_selection_id=selection_id, policy_selection_id=selection_id,
@@ -947,13 +1103,16 @@ def _real_fixture_materialize(
         structure_format="mmcif", parser=ParserProvenance(name="gemmi", version="0.7.5"),
         resolved_model=resolved_model, model_resolution_basis=model_basis, resolved_assembly=None,
         resolved_chains=resolved_chains, resolved_component_dispositions=dispositions,
-        resolved_at=datetime.now(timezone.utc),
+        resolved_at=_CP2_FIXED_TIMESTAMP,
     )
+    # MINOR-2 (adversarial review 20261125): real YAML-encoded UTF-8
+    # bytes of the exact four 020 documents just built above - never a
+    # fixed repeated-hex placeholder.
     records = (
-        RecordSnapshot(kind="protein", id=protein_id, sha256="1" * 64, size_bytes=1, schema_version=None),
-        RecordSnapshot(kind="inspection", id=inspection_id, sha256="2" * 64, size_bytes=1, schema_version="1.0"),
-        RecordSnapshot(kind="selection", id=selection_id, sha256="3" * 64, size_bytes=1, schema_version="1.0"),
-        RecordSnapshot(kind="resolution", id=selection_id, sha256="4" * 64, size_bytes=1, schema_version="1.0"),
+        _real_record_snapshot(kind="protein", id=protein_id, model=protein_input, schema_version=None),
+        _real_record_snapshot(kind="inspection", id=inspection_id, model=report, schema_version="1.0"),
+        _real_record_snapshot(kind="selection", id=selection_id, model=policy, schema_version="1.0"),
+        _real_record_snapshot(kind="resolution", id=selection_id, model=resolution, schema_version="1.0"),
     )
     source_context = build_source_context(
         protein_input=protein_input, inspection_report=report, policy=policy,
@@ -1223,6 +1382,39 @@ def test_real_fixture_1a2p_full_pipeline_blocked_by_unrelated_real_symmetry_oper
             dispositions=dispositions,
         )
     assert excinfo.value.code == "UNSUPPORTED_SYMMETRY"  # metalc2 (A-D, ptnr1_symmetry=3_675), not NCS-related
+
+
+def test_real_fixture_1a2p_ncs_isolated_full_pipeline_reaches_real_ncs_guard():  # MINOR-6 (adversarial review 20261125)
+    # §23 lineage allowance: 1A2P_ncs_isolated.cif removes exactly the
+    # one real struct_conn row (metalc2, A-D, ptnr1_symmetry='3_675')
+    # that blocks 1A2P_trimmed.cif's own full pipeline before it ever
+    # reaches _struct_ncs_oper (proven above, that negative is
+    # preserved and still tested against 1A2P_trimmed.cif itself,
+    # unchanged) - every other real row, including both genuine NCS
+    # operators, is untouched. This is the first real-source test that
+    # reaches the NCS guard through the full, real production pipeline,
+    # not only the isolated guard call.
+    raw_bytes = _real_fixture_bytes("ncs_1a2p", "1A2P_ncs_isolated.cif")
+    assert hashlib.sha256(raw_bytes).hexdigest() == "e470c25f8f002958955f2d97656b41e90609796d5836a8f7340a030b54d5774d"
+    dispositions = (
+        _remove_dispositions([("D", "ZN"), ("E", "ZN"), ("F", "ZN")], "metal-ion")
+        + _remove_dispositions([("G", "HOH"), ("H", "HOH"), ("I", "HOH")], "water")
+    )
+    result = _real_fixture_materialize(
+        pdbid="1A2P", raw_bytes=raw_bytes, resolved_model=1,
+        resolved_chains=(ResolvedChainSelection(label_asym_id="A", label_entity_id="1", model_number=1),),
+        dispositions=dispositions,
+    )
+    cat_by_name = {d.category: d for d in result.plan.category_decisions}
+    ncs_decision = cat_by_name["_struct_ncs_oper"]
+    assert ncs_decision.action == "guard_then_omit"
+    assert ncs_decision.kept_row_ordinals == ()
+    # Both real deposited operators (id 1/2, code='given') are
+    # omitted-audited, never rejected - the frozen rule that 'given'
+    # never requires an identity check, proven here against the real
+    # production pipeline rather than only the isolated guard function.
+    assert ncs_decision.omitted_row_ordinals == (0, 1)
+    assert ncs_decision.source_rows_key is not None
 
 
 def test_raw_vs_quoted_null_marker_distinction_is_preserved():  # T021-041
@@ -1503,11 +1695,16 @@ def test_real_fixture_originals_carry_removed_categories_outside_the_catalogue()
 def test_materialize_receptor_cif021_rejects_raw_over_16mib_before_gemmi_parses():  # Section 4: CP2's own 16 MiB ceiling
     oversized = b"data_x\n#\n" + b"#" * (MAX_CIF_RAW_ARTIFACT_SIZE_BYTES + 1)
     assert len(oversized) > MAX_CIF_RAW_ARTIFACT_SIZE_BYTES
-    with pytest.raises(CifStructuralLimitExceededError):
+    # MAJOR-7 (adversarial review 20261125): the public 021 boundary
+    # raises the typed taxonomy, never the raw receptor_parsing.py
+    # exception class directly.
+    with pytest.raises(MaterializationExecutionError) as excinfo:
         _real_fixture_materialize(
             pdbid="OVERSIZED", raw_bytes=oversized, resolved_model=1,
             resolved_chains=(ResolvedChainSelection(label_asym_id="A", label_entity_id="1", model_number=1),),
         )
+    assert excinfo.value.code == "LIMIT_EXCEEDED"
+    assert excinfo.value.phase == "raw"
 
 
 def test_materialize_receptor_cif021_accepts_raw_at_exactly_16mib_size_gate():  # boundary: == limit passes the size gate itself
@@ -1525,6 +1722,89 @@ def test_materialize_receptor_cif021_accepts_raw_at_exactly_16mib_size_gate():  
             resolved_chains=(ResolvedChainSelection(label_asym_id="A", label_entity_id="1", model_number=1),),
         )
     assert not isinstance(excinfo.value, CifStructuralLimitExceededError)  # never the size gate itself at exactly the limit
+
+
+def test_materialize_receptor_cif021_translates_raw_and_parse_failures_to_021_taxonomy():  # MAJOR-7, native proof
+    # §16/brief §5: every failure from this public 021 boundary must be
+    # the typed taxonomy (code/phase/cause) - never a raw
+    # receptor_parsing.py exception class (CompressedRawContentError,
+    # InvalidCifEncodingError, MultipleDataBlocksError,
+    # ReceptorParseFailureError, MaterializationAdapterError) leaking
+    # through untranslated.
+    chains = (ResolvedChainSelection(label_asym_id="A", label_entity_id="1", model_number=1),)
+
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        _real_fixture_materialize(pdbid="GZ", raw_bytes=b"\x1f\x8b" + b"junk", resolved_model=1, resolved_chains=chains)
+    assert (excinfo.value.code, excinfo.value.phase) == ("INVALID_CIF", "raw")
+
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        _real_fixture_materialize(
+            pdbid="BOM", raw_bytes=b"\xef\xbb\xbfdata_x\n", resolved_model=1, resolved_chains=chains,
+        )
+    assert (excinfo.value.code, excinfo.value.phase) == ("INVALID_CIF", "raw")
+    assert isinstance(excinfo.value.__cause__, InvalidCifEncodingError)
+
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        _real_fixture_materialize(
+            pdbid="TWOBLOCKS", raw_bytes=b"data_a\n_x.y 1\ndata_b\n_x.y 2\n", resolved_model=1, resolved_chains=chains,
+        )
+    assert (excinfo.value.code, excinfo.value.phase) == ("INVALID_CIF", "parse")
+    assert isinstance(excinfo.value.__cause__, MultipleDataBlocksError)
+
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        _real_fixture_materialize(
+            pdbid="BADSYNTAX", raw_bytes=b"data_x\nloop_\n_x.a\n_x.b\n1\n", resolved_model=1, resolved_chains=chains,
+        )
+    assert (excinfo.value.code, excinfo.value.phase) == ("INVALID_CIF", "parse")
+    assert isinstance(excinfo.value.__cause__, ReceptorParseFailureError)
+
+    atom_references_missing_entity = _MINIMAL_CIF.replace(
+        "ATOM 1 C CA . ALA A E1 1 A 1 ? 1 1.000 2.000 3.000 1.00 10.00",
+        "ATOM 1 C CA . ALA A E_MISSING 1 A 1 ? 1 1.000 2.000 3.000 1.00 10.00",
+        1,
+    )
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        _materialize_mutated_minimal_cif(atom_references_missing_entity)
+    assert (excinfo.value.code, excinfo.value.phase) == ("INVALID_CIF", "plan")
+    assert isinstance(excinfo.value.__cause__, MaterializationAdapterError)
+
+
+def test_materialize_receptor_cif021_quoted_null_look_alike_symmetry_not_real_null():  # MAJOR-3, native Gemmi proof
+    # conn1's real ptnr1_symmetry="1_555" (both-identity, preserved in
+    # the baseline end-to-end test above, K>0 since chain A is
+    # selected) is mutated to a *quoted* "'?'" - real Gemmi 0.7.5
+    # decodes this to the literal, non-null string "?", never collapsed
+    # back to a real null by the resolver (the previous bug would have
+    # read this as "one-null"/a merely absent operator). At K>0 any
+    # endpoint with insufficient proof refuses outright
+    # (UNSUPPORTED_SYMMETRY) - a quoted "?" must trigger exactly that
+    # refusal, never be silently tolerated as if ptnr1 were truly null.
+    assert "conn1 disulf A ALA 1 CA 1_555 A ALA 1 N 1_555" in _MINIMAL_CIF
+    mutated = _MINIMAL_CIF.replace(
+        "conn1 disulf A ALA 1 CA 1_555 A ALA 1 N 1_555", "conn1 disulf A ALA 1 CA '?' A ALA 1 N 1_555", 1,
+    )
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        _materialize_mutated_minimal_cif(mutated)
+    assert excinfo.value.code == "UNSUPPORTED_SYMMETRY"
+
+    # The pure-domain K=0 test above already proves the non-refusal
+    # (unsupported-discarded, not an exception) half of this same fix
+    # when both endpoints are genuinely unretained.
+
+
+def test_materialize_receptor_cif021_source_context_parser_mismatch_is_identity_mismatch():  # MAJOR-7, native proof
+    # The installed/running engine is present and pin-correct; a
+    # source_context.parser metadata disagreement is an identity
+    # problem, never "no engine available" (ENGINE_UNAVAILABLE).
+    source_context = _cp2_source_context().model_copy(
+        update={"parser": ParserProvenance(name="gemmi", version="9.9.9")}
+    )
+    with pytest.raises(MaterializationConfigurationError) as excinfo:
+        materialize_receptor_cif021(
+            source_context=source_context, resolved_selection=_cp2_resolution(),
+            unaddressed_components="preserve", raw_bytes=_MINIMAL_CIF.encode("utf-8"),
+        )
+    assert excinfo.value.code == "IDENTITY_MISMATCH"
 
 
 def test_materialize_receptor_cif021_engine_absent_raises_clean_configuration_error():  # Section 3: C-04
@@ -1586,3 +1866,58 @@ def test_materialize_receptor_cif021_engine_version_mismatch_raises(monkeypatch)
             resolved_chains=(ResolvedChainSelection(label_asym_id="A", label_entity_id="1", model_number=1),),
         )
     assert excinfo.value.code == "ENGINE_VERSION"
+
+
+_INTERRUPTION_BOUNDARIES = (
+    "gemmi.cif.read_string",
+    "build_materialization_plan",
+    "resolve_connection_decisions",
+    "compute_category_decisions",
+    "serialize_cif_document021",
+    "reparse_and_extract_cif_dom021",
+    "_verify_output_reparse",
+)
+
+
+def _patch_interruption_boundary(monkeypatch, boundary: str, raiser) -> None:
+    import molecular.receptor_materialization as rm
+    import molecular.receptor_parsing as rp
+    rp._ensure_gemmi_imported()  # real gemmi must already be bound before patching its submodule
+    if boundary == "gemmi.cif.read_string":
+        monkeypatch.setattr(rp.gemmi.cif, "read_string", raiser)
+    elif boundary in ("build_materialization_plan", "resolve_connection_decisions", "compute_category_decisions"):
+        monkeypatch.setattr(rm, boundary, raiser)
+    else:
+        monkeypatch.setattr(rp, boundary, raiser)
+
+
+@pytest.mark.parametrize("boundary", _INTERRUPTION_BOUNDARIES)
+@pytest.mark.parametrize("exception_cls", [KeyboardInterrupt, SystemExit])
+def test_materialize_receptor_cif021_preserves_interruption_instance_at_every_boundary(monkeypatch, boundary, exception_cls):  # MINOR-3 (adversarial review 20261125)
+    # §20/brief §9: KeyboardInterrupt/SystemExit must propagate as the
+    # exact same instance from every one of the 7 real boundaries this
+    # pipeline calls into - monkeypatching only the owning namespace to
+    # inject the failure, never to fabricate a success. The previous
+    # proof of this (narrow except clauses, never a broad
+    # except Exception/BaseException) was only ever demonstrated by the
+    # independent reviewer's own scripts; this is the permanent,
+    # repository-resident version, separately for each class and
+    # boundary (14 combinations total).
+    injected = exception_cls(7) if exception_cls is SystemExit else exception_cls()
+
+    def raiser(*args, **kwargs):
+        raise injected
+
+    _patch_interruption_boundary(monkeypatch, boundary, raiser)
+    raw_bytes = _MINIMAL_CIF.encode("utf-8")
+    try:
+        materialize_receptor_cif021(
+            source_context=_cp2_source_context(), resolved_selection=_cp2_resolution(),
+            unaddressed_components="preserve", raw_bytes=raw_bytes,
+        )
+    except BaseException as caught:  # noqa: B036 - deliberately asserting identity of KI/SystemExit itself
+        assert caught is injected, (boundary, exception_cls, caught)
+        if exception_cls is SystemExit:
+            assert caught.code == 7
+    else:
+        pytest.fail(f"expected {exception_cls.__name__} to propagate from {boundary!r}")

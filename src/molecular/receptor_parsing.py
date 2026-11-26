@@ -1030,8 +1030,6 @@ MAX_CIF_TOTAL_ROWS = 500_000
 MAX_CIF_TOTAL_CELLS = 4_000_000
 MAX_CIF_CELL_BYTES = 1024 * 1024
 
-_SAVE_FRAME_PATTERN = re.compile(r"^save_\S", re.MULTILINE)
-
 
 class InvalidCifEncodingError(ValueError):
     """The RAW bytes are not valid UTF-8, or begin with a UTF-8 BOM
@@ -1140,6 +1138,26 @@ def _decoded_token(raw_token: Optional[str]) -> Optional[str]:
     return value if value is None else gemmi.cif.as_string(value)
 
 
+_ASCII_SIGNED_INTEGER_PATTERN = re.compile(r"^[+-]?[0-9]+$")
+
+
+def _validate_ascii_integer_token(raw_token: Optional[str]) -> Optional[int]:
+    """MAJOR-2/MINOR-5 (adversarial review 20261125): Section 6's
+    `pdbx_PDB_model_num` requires a genuinely unquoted ASCII decimal
+    integer token - `[+-]?[0-9]+` - never a quoted string, a non-ASCII
+    digit, or Python's own lax `int()` grammar (which accepts
+    underscores/unicode digits/surrounding whitespace §6 never
+    permits). `raw_token` must be the still-quoted raw source token
+    (`RawCifCategory.get`, never `_decoded_token`'d first) - a quoted
+    `'1'` fails this pattern outright. `+1`/`01` are valid signed/
+    zero-padded spellings of this integer type, never rejected merely
+    for their written form."""
+
+    if raw_token is None or not _ASCII_SIGNED_INTEGER_PATTERN.fullmatch(raw_token):
+        return None
+    return int(raw_token)
+
+
 def _reject_invalid_cif_encoding(raw_bytes: bytes) -> str:
     if raw_bytes.startswith(b"\xef\xbb\xbf"):
         raise InvalidCifEncodingError(
@@ -1151,25 +1169,27 @@ def _reject_invalid_cif_encoding(raw_bytes: bytes) -> str:
         raise InvalidCifEncodingError("RAW content is not valid UTF-8") from error
 
 
-def _reject_save_frames(text: str) -> None:
-    """A real CIF save frame marker (`save_<name>`) is only syntax when it
-    starts a line *outside* a semicolon-delimited multi-line text field
-    (C-06): a value's literal text content may legitimately contain the
-    substring `save_literal_inside_text` on a line of its own without
-    that being save-frame syntax at all. A line is CIF text-field content
-    whenever it falls between two lines that each start with `;` (the
-    text-field delimiter) - never scanned for CIF tokens; only the lines
-    outside any such span are checked against `_SAVE_FRAME_PATTERN`."""
+def _reject_save_frames(block: "gemmi.cif.Block") -> None:
+    """MAJOR-1 (adversarial review 20261125): a real CIF save frame is
+    recognized here via Gemmi's own native DOM (`Item.frame`, exposed by
+    the pinned 0.7.5 Python binding), never a hand-rolled regex - the
+    previous `^save_\\S` column-0, lowercase-only pattern missed genuine
+    frames the real Gemmi grammar accepts case-insensitively and
+    indented (`SAVE_x`, `  save_x`), which `get_mmcif_category_names()`
+    then silently never enumerates (an unaudited content loss, not a
+    parse failure). Iterating `block` yields every top-level `Item`
+    (loops, pairs, and frames alike) in source order; any item whose
+    `.frame` is not `None` is a real save frame, refused regardless of
+    case/indentation. A multiline text field or a quoted token whose
+    *content* happens to look like `save_x` is never itself an `Item` -
+    Gemmi's own grammar already keeps both out of frame syntax, proven
+    by the existing real-Gemmi positive controls."""
 
-    in_text_field = False
-    for line in text.split("\n"):
-        if line.startswith(";"):
-            in_text_field = not in_text_field
-            continue
-        if in_text_field:
-            continue
-        if _SAVE_FRAME_PATTERN.match(line):
-            raise CifSaveFrameRejectedError("RAW content declares a CIF save frame")
+    for item in block:
+        if item.frame is not None:
+            raise CifSaveFrameRejectedError(
+                f"RAW content declares a CIF save frame {item.frame.name!r}"
+            )
 
 
 def _reject_cell_too_large(category_name: str, column: str, token: str) -> None:
@@ -1199,7 +1219,6 @@ def parse_receptor_cif_dom021(raw_bytes: bytes) -> ParsedCifDom021:
 
     _require_engine_available()
     text = _reject_invalid_cif_encoding(raw_bytes)
-    _reject_save_frames(text)
 
     try:
         document = gemmi.cif.read_string(text)
@@ -1221,6 +1240,7 @@ def parse_receptor_cif_dom021(raw_bytes: bytes) -> ParsedCifDom021:
         ) from error
 
     block = document.sole_block()
+    _reject_save_frames(block)
     category_names_raw = block.get_mmcif_category_names()
     if len(category_names_raw) > MAX_CIF_CATEGORIES:
         raise CifStructuralLimitExceededError(
@@ -1379,18 +1399,21 @@ def _build_atom_observations(
         atom_id = get("id")
         if atom_id is None:
             raise MaterializationAdapterError("INVALID_CIF", f"_atom_site row {row_index} has a null id")
-        model_token = get("pdbx_pdb_model_num")
-        if model_token is None:
-            raise MaterializationAdapterError(
-                "INVALID_CIF", f"_atom_site row {row_index} has a null pdbx_pdb_model_num"
-            )
-        try:
-            model = int(model_token)
-        except ValueError as error:
+        # MAJOR-2/MINOR-5 (adversarial review 20261125): a genuinely
+        # unquoted ASCII decimal integer ([+-]?[0-9]+) read from the
+        # *raw* token - never Python's own lax int() grammar (accepts
+        # underscores/unicode digits/whitespace §6 never permits), and
+        # never a quoted value decoded first. "+1"/"01" are valid signed/
+        # zero-padded spellings of this integer type, never rejected for
+        # their written form alone.
+        raw_model_token = table.get(row_index, "pdbx_pdb_model_num")
+        model = _validate_ascii_integer_token(raw_model_token)
+        if model is None:
             raise MaterializationAdapterError(
                 "INVALID_CIF",
-                f"_atom_site row {row_index} pdbx_pdb_model_num={model_token!r} is not an integer",
-            ) from error
+                f"_atom_site row {row_index} pdbx_pdb_model_num={raw_model_token!r} is not a real, "
+                "unquoted ASCII decimal integer",
+            )
         if model < 1:
             raise MaterializationAdapterError(
                 "INVALID_CIF", f"_atom_site row {row_index} pdbx_pdb_model_num={model} must be positive"
@@ -1522,8 +1545,17 @@ def _build_output_category_tokens(
         for column in decision.generated_tags:
             if column == "entry_id":
                 rows[column] = [entry_id for _ in decision.kept_row_ordinals]
+        # MINOR-1 (adversarial review 20261125): §11/brief §7 require
+        # alphabetical *tag* order within each category, not merely
+        # alphabetical category order - the catalogue's own
+        # `preserve_tags`/`generate_tags` order (never alphabetical) was
+        # written through verbatim. Sorting the dict's keys here changes
+        # only the write order Gemmi serializes the loop's tags in -
+        # never the survivor row order, the tokens themselves, or any
+        # scientific/canonical hash envelope, all of which key off
+        # `decision`/`source`, not this dict's iteration order.
         if rows:
-            output[canonical] = rows
+            output[canonical] = dict(sorted(rows.items()))
     return output
 
 
@@ -1693,16 +1725,27 @@ def materialize_receptor_cif021(
             f"installed Gemmi is {gemmi.__version__!r}; this checkpoint is pinned to {rm.ENGINE_VERSION!r}",
         )
     if source_context.parser.name != rm.ENGINE_NAME or source_context.parser.version != rm.ENGINE_VERSION:
+        # MAJOR-7 (adversarial review 20261125): the engine actually
+        # installed and running is present and pinned-version-correct
+        # (confirmed just above) - a `source_context.parser` metadata
+        # mismatch is an *identity* disagreement about which engine
+        # produced the source, never "no engine available".
         raise rm.MaterializationConfigurationError(
-            "ENGINE_UNAVAILABLE",
+            "IDENTITY_MISMATCH",
             f"source_context.parser {source_context.parser.name}/{source_context.parser.version} "
             f"does not match the pinned engine {rm.ENGINE_NAME}/{rm.ENGINE_VERSION}",
         )
     actual_size = len(raw_bytes)
     if actual_size > MAX_CIF_RAW_ARTIFACT_SIZE_BYTES:
-        raise CifStructuralLimitExceededError(
+        # MAJOR-7 (adversarial review 20261125): every failure from this
+        # public 021 boundary onward is the typed 021 taxonomy (§16/brief
+        # §5) - never a raw receptor_parsing.py exception class without
+        # `code`/`phase`.
+        raise rm.MaterializationExecutionError(
+            "LIMIT_EXCEEDED",
             f"RAW content is {actual_size} bytes, exceeding the {MAX_CIF_RAW_ARTIFACT_SIZE_BYTES} "
-            "(16 MiB, Section 4) limit - never the 020 reader's 1 GiB ceiling"
+            "(16 MiB, Section 4) limit - never the 020 reader's 1 GiB ceiling",
+            phase="raw",
         )
     if actual_size != source_context.raw_size_bytes:
         raise rm.MaterializationConfigurationError(
@@ -1719,14 +1762,29 @@ def materialize_receptor_cif021(
         )
     for format_name, signature in _MAGIC_BYTES_BY_FORMAT:
         if raw_bytes[: len(signature)] == signature:
-            raise CompressedRawContentError(
+            raise rm.MaterializationExecutionError(
+                "INVALID_CIF",
                 f"RAW content begins with the {format_name} magic bytes; "
-                "compressed content is never accepted, regardless of declared format"
+                "compressed content is never accepted, regardless of declared format",
+                phase="raw",
             )
 
-    dom = parse_receptor_cif_dom021(raw_bytes)
-    entity_type_by_id = _build_entity_type_lookup(dom)
-    atoms = _build_atom_observations(dom, entity_type_by_id)
+    try:
+        dom = parse_receptor_cif_dom021(raw_bytes)
+    except InvalidCifEncodingError as error:
+        raise rm.MaterializationExecutionError("INVALID_CIF", str(error), phase="raw") from error
+    except CifStructuralLimitExceededError as error:
+        raise rm.MaterializationExecutionError("LIMIT_EXCEEDED", str(error), phase="parse") from error
+    except (
+        MultipleDataBlocksError, DuplicateCanonicalTagError, CifSaveFrameRejectedError, ReceptorParseFailureError,
+    ) as error:
+        raise rm.MaterializationExecutionError("INVALID_CIF", str(error), phase="parse") from error
+
+    try:
+        entity_type_by_id = _build_entity_type_lookup(dom)
+        atoms = _build_atom_observations(dom, entity_type_by_id)
+    except MaterializationAdapterError as error:
+        raise rm.MaterializationExecutionError(error.code, str(error), phase="plan") from error
 
     plan_without_connections = rm.build_materialization_plan(
         source_context=source_context, resolved_selection=resolved_selection,

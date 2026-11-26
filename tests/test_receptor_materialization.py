@@ -1940,6 +1940,102 @@ def test_identity_basis_pairs_k0_reachable_pairs(symmetry1, symmetry2, tables, e
     assert plan_a.connection_decisions[0].identity_basis == expected_basis, scenario_id
 
 
+_IDENTITY_BASIS_HASH_SEED_ORACLES = {
+    # MINOR-4 (adversarial review 20261125): literal, independently
+    # pinned plan_key/connection_decisions_key for each of the 7
+    # reachable K=0 IdentityBasis pairs - computed once, never derived
+    # here by calling the function under test and comparing it to
+    # itself. The scenario inputs (atoms/tables/symmetry tokens) are the
+    # exact same ones `test_identity_basis_pairs_k0_reachable_pairs`
+    # already proves resolve to the right `identity_basis`; this test
+    # adds the piece that one, never checked against a repeated
+    # in-process construction (same PYTHONHASHSEED, same dict/set visit
+    # order both times - proving nothing about hash-seed independence).
+    "T021-164": (
+        "8b90399dfd7314a14e04e25e78cdbeb9310421f68868c84e01e268abd3db3cbc",
+        "cddb02770b4f65e7563dabaacc5ea48a5ca5562f56dc99c228ce56c401f097ad",
+    ),
+    "T021-166": (
+        "f0f2ffe095e89d79665302ab034750a98cc08df80c80a4310040ceb9adcdd5cd",
+        "336f7b930115e58c1019a0dce35ddd2fd9caa29b577b4c552cc58eff5d6ebce1",
+    ),
+    "T021-168": (
+        "85d884ce06c38f064aaa9ff1f102892dcd6f8c6eac34f9091648b0e2d95e500e",
+        "96c9cd3548aa4a9821cfbf1e418a9aef32bacb64d1c6b74e4355ced143c407e5",
+    ),
+    "T021-169": (
+        "d67189a9628daa11c34ddc549edc05eab942fb21f9142a90c7e59d26cd77dd2f",
+        "d6ee379d70dd3a5e9c68c878973a16c42447a1642099006d4918d15f9171f27b",
+    ),
+    "T021-170": (
+        "2b16a639d4c48d0ffc75482f3bfd26d26de4e690b1831199d9851ff88d6bcff5",
+        "3a72266eb9c97ee9e3a5404d3906c6bfdb3808e551203bae8eba2e1bb1ef8cc2",
+    ),
+    "T021-171": (
+        "51136c86f8705a47075a753f558c7462ef3a4800391da6c6e68cf7cf3dab3459",
+        "fba77384b9e6ac3f6aed09384f255996a071ca8cde281b4afe8eddeb2fa907a0",
+    ),
+    "T021-172": (
+        "fe5c52e551643323054b9659ea8f8ed74cc1fc3b0d682a434514d777ff75f433",
+        "9aea81fb65bf82a6a212e2e01a4cbec532ab52aa6ca24a37681b34fe765b5754",
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "symmetry1,symmetry2,tables_expr,scenario_id",
+    [
+        ("1_555", "1_555", "_no_tables()", "T021-164"),
+        ("1_555", None, "_no_tables()", "T021-166"),
+        ("2_555", "2_555", "_WITH_OPERATOR_2", "T021-168"),
+        ("2_555", None, "_WITH_OPERATOR_2", "T021-169"),
+        (None, "1_555", "_no_tables()", "T021-170"),
+        (None, "2_555", "_WITH_OPERATOR_2", "T021-171"),
+        (None, None, "_no_tables()", "T021-172"),
+    ],
+)
+def test_identity_basis_plan_key_stable_across_hash_seeds(symmetry1, symmetry2, tables_expr, scenario_id):  # MINOR-4
+    # Each of the 7 reachable pairs is rebuilt from scratch in a genuinely
+    # fresh subprocess, twice, under two different PYTHONHASHSEED values -
+    # a different in-memory dict/set visit order each time, not merely
+    # the same process constructing the same objects twice. Both runs
+    # must reproduce the exact literal, independently pinned
+    # plan_key/connection_decisions_key above.
+    import os
+    tests_dir = os.path.dirname(os.path.abspath(__file__))
+    src_dir = os.path.join(os.path.dirname(tests_dir), "src")
+    script = (
+        "import sys\n"
+        f"sys.path.insert(0, {src_dir!r})\n"
+        f"sys.path.insert(0, {tests_dir!r})\n"
+        "import test_receptor_materialization as t\n"
+        "atoms = (\n"
+        "    t._atom(ordinal=0, atom_id='a1', label_asym_id='A', label_atom_id='CA'),\n"
+        "    t._atom(ordinal=1, atom_id='a2', label_asym_id='B', entity_id='E2', label_atom_id='CA'),\n"
+        ")\n"
+        "source_context = t._source_context()\n"
+        "source_context_key = t.compute_source_context_key(source_context)\n"
+        f"decisions = t._connection_scenario(retained1=False, retained2=False, symmetry1={symmetry1!r}, "
+        f"symmetry2={symmetry2!r}, tables=t.{tables_expr}, source_context_key=source_context_key)\n"
+        "plan = t.build_materialization_plan(\n"
+        "    source_context=source_context, resolved_selection=t._resolution(), unaddressed_components='preserve',\n"
+        "    atoms=atoms, connection_decisions=decisions,\n"
+        ")\n"
+        "print(plan.plan_key)\n"
+        "print(plan.plan.connection_decisions_key)\n"
+    )
+    expected_plan_key, expected_connection_decisions_key = _IDENTITY_BASIS_HASH_SEED_ORACLES[scenario_id]
+    for seed in ("0", "12345"):
+        env = dict(os.environ, PYTHONHASHSEED=seed)
+        result = subprocess.run(
+            [sys.executable, "-B", "-c", script], capture_output=True, text=True, timeout=30, env=env,
+        )
+        assert result.returncode == 0, (seed, result.stdout, result.stderr)
+        plan_key, connection_decisions_key = result.stdout.strip().splitlines()
+        assert plan_key == expected_plan_key, (scenario_id, seed)
+        assert connection_decisions_key == expected_connection_decisions_key, (scenario_id, seed)
+
+
 @pytest.mark.parametrize(
     "identity_basis,scenario_id",
     [
@@ -1967,6 +2063,32 @@ def test_identity_basis_precedence_applies_10_1_without_k_shortcuts():  # T021-1
     decisions = _connection_scenario(retained1=False, retained2=False, symmetry1="not-a-code", symmetry2=None)
     assert decisions[0].identity_basis == ("not-applicable", "not-applicable")
     assert decisions[0].symmetry_class == "unsupported-discarded"
+
+
+def test_quoted_null_look_alike_symmetry_token_is_not_real_null():  # MAJOR-3 (adversarial review 20261125)
+    # RawConnectionEndpointTokens' own contract: the adapter boundary
+    # already null-collapses `.`/`?` before this resolver ever sees the
+    # value - so a quoted `'?'` in the real source decodes to the
+    # literal, non-null string "?" here, never `None`. The resolver must
+    # not re-collapse it: "?" fails the n_klm grammar exactly like any
+    # other malformed non-null token (§10.1/T021-173), so this is
+    # unsupported-discarded - never "one-null" (the previous bug, which
+    # re-ran a second null check on an already-decoded value and
+    # silently confused the two).
+    quoted_lookalike = _connection_scenario(retained1=False, retained2=False, symmetry1="?", symmetry2="1_555")
+    assert quoted_lookalike[0].identity_basis == ("not-applicable", "pdbx-1_555-convention")
+    assert quoted_lookalike[0].symmetry_class == "unsupported-discarded"
+
+    # A genuine real null (None - the only value a real adapter ever
+    # hands this resolver for an actual unquoted '.'/'?') is unaffected:
+    # still correctly "one-null", never promoted to unsupported-discarded.
+    real_null = _connection_scenario(retained1=False, retained2=False, symmetry1=None, symmetry2="1_555")
+    assert real_null[0].identity_basis == ("not-applicable", "pdbx-1_555-convention")
+    assert real_null[0].symmetry_class == "one-null"
+
+    # The same literal-"." case, independently.
+    quoted_dot = _connection_scenario(retained1=False, retained2=False, symmetry1=".", symmetry2="1_555")
+    assert quoted_dot[0].symmetry_class == "unsupported-discarded"
 
 
 # --- Section 11: the catalogue engine -------------------------------------
@@ -2094,6 +2216,85 @@ def test_catalogue_anisotrop_requires_complete_tensor_and_matching_atom_site_id(
         run({"id": ("a-ca",), "u[1][1]": ("0.1",), "u[1][2]": (None,), "u[1][3]": ("0.0",),
              "u[2][2]": ("0.1",), "u[2][3]": ("0.0",), "u[3][3]": ("0.1",)})
     assert excinfo.value.code == "INVALID_CIF"
+
+
+def test_catalogue_chem_comp_and_entry_receive_generic_guards_before_special_handling():  # MAJOR-4 (adversarial review 20261125)
+    # _chem_comp (REFERENCED_CCD_CLOSURE) and _entry (DERIVED_ENTRY) were
+    # both skipped out of the generic per-category loop entirely - never
+    # reaching unknown-tag/required-tag/key-integrity checks every other
+    # catalogue category already gets. A duplicate/null _chem_comp.id and
+    # an unrecognized/duplicated _entry both passed silently.
+    plan, atoms_by_ordinal, atom_decisions_by_ordinal, retained_entity_ids, retained_asym_ids = _minimal_catalogue_scenario()
+    base = {
+        "_atom_site": _full_atom_site_table(
+            ids=("a-ca", "a-sg", "b-sd"), type_symbols=("C", "S", "S"), label_atom_ids=("CA", "SG", "SD"),
+            comp_ids=("ALA", "CYS", "MET"), asym_ids=("A", "A", "B"), entity_ids=("E1", "E1", "E2"),
+            seq_ids=("1", "2", "1"), auth_asym_ids=("A", "A", "B"), auth_seq_ids=("1", "2", "1"),
+        ),
+        "_entity": _category_table(id=("E1", "E2"), type=("polymer", "polymer")),
+        "_struct_asym": _category_table(id=("A", "B"), entity_id=("E1", "E2")),
+        **_polymer_conditional_categories(),
+    }
+
+    def run(chem_comp=None, entry=None):
+        categories = dict(base)
+        categories["_chem_comp"] = chem_comp if chem_comp is not None else _category_table(
+            id=("ALA", "CYS", "MET"), type=("x", "x", "x"),
+        )
+        if entry is not None:
+            categories["_entry"] = entry
+        return compute_category_decisions(
+            source_context_key=plan.plan.source_context_key, categories=categories,
+            retained_entity_ids=retained_entity_ids, retained_asym_ids=retained_asym_ids, resolved_model=1,
+            atoms_by_ordinal=atoms_by_ordinal, atom_decisions_by_ordinal=atom_decisions_by_ordinal,
+            connection_decisions=(),
+        )
+
+    # Positive control: the base scenario (no source _entry at all)
+    # resolves fine - _entry is generated with no source to cover.
+    decisions = run()
+    by_cat = {d.category: d for d in decisions}
+    assert by_cat["_chem_comp"].kept_row_ordinals == (0, 1)
+    assert by_cat["_entry"].action == "generate"
+    assert by_cat["_entry"].source_rows_key is None
+    assert by_cat["_entry"].omitted_row_ordinals == ()
+
+    # MAJOR-4: a duplicated _chem_comp.id ("ALA" twice) must refuse, not
+    # survive into kept_row_ordinals (which would write ALA, CYS, ALA).
+    # ALA/CYS/MET all stay present as real values (every real source
+    # _atom_site row's label_comp_id must still resolve) - the
+    # duplication itself is the only thing under test.
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        run(chem_comp=_category_table(id=("ALA", "CYS", "MET", "ALA"), type=("x", "x", "x", "x")))
+    assert excinfo.value.code == "INVALID_CIF"
+
+    # MAJOR-4: a null _chem_comp.id must refuse (nonnull_key: true) -
+    # never silently filtered out as merely omitted. The extra null-id
+    # row sits alongside the three real, still-referenced CCDs.
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        run(chem_comp=_category_table(id=(None, "ALA", "CYS", "MET"), type=("x", "x", "x", "x")))
+    assert excinfo.value.code == "INVALID_CIF"
+
+    # MAJOR-4: an unrecognized _entry tag must refuse (unknown_tag_action:
+    # reject) - _entry's only ever-allowed tag is "id".
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        run(entry=_category_table(id=("5XYZ",), zz_unknown=("x",)))
+    assert excinfo.value.code == "UNSUPPORTED_TAG"
+
+    # MAJOR-4: _entry is a singleton category - two source rows must
+    # refuse, never be silently accepted.
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        run(entry=_category_table(id=("5XYZ", "6ABC")))
+    assert excinfo.value.code == "INVALID_CIF"
+
+    # MAJOR-4/SCHEMAS §4: a genuinely present source _entry row is
+    # covered (hashed, omitted) on the generated decision, never left
+    # with a null source_rows_key as if it had never existed.
+    decisions_with_entry = run(entry=_category_table(id=("5XYZ",)))
+    by_cat_with_entry = {d.category: d for d in decisions_with_entry}
+    assert by_cat_with_entry["_entry"].action == "generate"
+    assert by_cat_with_entry["_entry"].source_rows_key is not None
+    assert by_cat_with_entry["_entry"].omitted_row_ordinals == (0,)
 
 
 def test_catalogue_anisotrop_rejects_informed_field_disagreement_and_undeclared_partial_tensor():  # R-CP2-02
@@ -2600,6 +2801,46 @@ def test_struct_conn_endpoint_insertion_code_distinguishes_residues():  # T021-0
     assert resolved_52a == (a52a,)
 
 
+def test_struct_conn_endpoint_rejects_physically_indistinguishable_duplicate_atoms():  # MAJOR-6 (adversarial review 20261125)
+    # Two waters in chain C sharing the exact same occurrence
+    # (auth_seq=52, insertion=None), the same label_atom_id ("O"), and
+    # the same altloc (both genuinely null) are two distinct physical
+    # atoms the source happens to describe identically - never
+    # resolvable to a single endpoint, and never silently merged into a
+    # two-atom set the way the previous code did.
+    o1 = _atom(
+        ordinal=0, atom_id="o1", label_asym_id="C", ccd="HOH", label_seq_id=None, auth_asym_id="C",
+        auth_seq_id="52", insertion_token=None, label_atom_id="O",
+    )
+    o2 = AtomObservation(
+        ordinal=1, atom_id="o2", model=1, label_asym_id="C", entity_id="E1", entity_type="water", ccd="HOH",
+        label_seq_id=None, auth_asym_id="C", auth_seq_id="52", insertion_token=None, label_atom_id="O",
+    )
+    endpoint = RawConnectionEndpointTokens(
+        label_asym_id="C", label_comp_id="HOH", label_seq_id=None, label_atom_id="O",
+        auth_seq_id="52", insertion_token=None, altloc_aliases=(None, None, None), symmetry_token="1_555",
+    )
+    from molecular.receptor_materialization import _resolve_endpoint_atoms
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        _resolve_endpoint_atoms(endpoint, (o1, o2))
+    assert excinfo.value.code == "AMBIGUOUS_ENDPOINT"
+
+    # Positive control: the exact same pair, but genuinely distinguished
+    # by altloc (A/B), still resolves as the legitimate two-atom
+    # multi-valued endpoint Section 9 describes - this fix narrows
+    # nothing about that case.
+    o1_alt = AtomObservation(
+        ordinal=0, atom_id="o1", model=1, label_asym_id="C", entity_id="E1", entity_type="water", ccd="HOH",
+        label_seq_id=None, auth_asym_id="C", auth_seq_id="52", insertion_token=None, label_atom_id="O", altloc="A",
+    )
+    o2_alt = AtomObservation(
+        ordinal=1, atom_id="o2", model=1, label_asym_id="C", entity_id="E1", entity_type="water", ccd="HOH",
+        label_seq_id=None, auth_asym_id="C", auth_seq_id="52", insertion_token=None, label_atom_id="O", altloc="B",
+    )
+    resolved = _resolve_endpoint_atoms(endpoint, (o1_alt, o2_alt))
+    assert resolved == (o1_alt, o2_alt)
+
+
 def test_remaining_retained_categories_individually():  # T021-065/066/068/069/070/071/072/073/074
     atoms = (
         _atom(ordinal=0, atom_id="a-ca", label_asym_id="A", ccd="ALA", label_seq_id="1", label_atom_id="CA"),
@@ -2671,6 +2912,102 @@ def test_remaining_retained_categories_individually():  # T021-065/066/068/069/0
     assert by_cat["_pdbx_entity_branch_list"].kept_row_ordinals == (0,)  # T021-072
     assert by_cat["_pdbx_entity_branch_link"].kept_row_ordinals == (0,)  # T021-073
     assert by_cat["_pdbx_branch_scheme"].kept_row_ordinals == (0,)  # T021-074
+
+
+def test_branch_compound_references_reject_wrong_endpoint_and_swapped_scheme():  # MAJOR-5 (adversarial review 20261125)
+    # §11 requires every branch link endpoint and scheme row to reference
+    # a real, full (entity_id,num,comp_id) row of _pdbx_entity_branch_list
+    # - the previous code only ever filtered these categories by
+    # entity_id membership, never validating the compound key at all.
+    atoms = (
+        _atom(
+            ordinal=0, atom_id="b-man", label_asym_id="BR", ccd="MAN", label_seq_id="1", auth_asym_id="BR",
+            entity_id="E3", entity_type="branched", label_atom_id="C1",
+        ),
+    )
+    source_context = _source_context()
+    resolution = _resolution(
+        resolved_chains=(ResolvedChainSelection(label_asym_id="BR", label_entity_id="E3", model_number=1),),
+    )
+    plan = build_materialization_plan(
+        source_context=source_context, resolved_selection=resolution, unaddressed_components="preserve", atoms=atoms,
+    )
+    atom_decisions_by_ordinal = {d.ordinal: d for d in plan.atom_decisions}
+    atoms_by_ordinal = {a.ordinal: a for a in atoms}
+    retained_entity_ids = frozenset({"E3"})
+    retained_asym_ids = frozenset({"BR"})
+    base = {
+        "_atom_site": _full_atom_site_table(
+            ids=("b-man",), type_symbols=("C",), label_atom_ids=("C1",), comp_ids=("MAN",), asym_ids=("BR",),
+            entity_ids=("E3",), seq_ids=("1",), auth_asym_ids=("BR",), auth_seq_ids=("1",),
+        ),
+        "_entity": _category_table(id=("E3",), type=("branched",)),
+        "_struct_asym": _category_table(id=("BR",), entity_id=("E3",)),
+        "_chem_comp": _category_table(id=("MAN", "NAG", "BMA"), type=("x", "x", "x")),
+        "_pdbx_entity_branch": _category_table(entity_id=("E3",), type=("oligosaccharide",)),
+        "_pdbx_entity_branch_list": _category_table(
+            entity_id=("E3", "E3"), num=("1", "2"), comp_id=("MAN", "NAG"),
+        ),
+    }
+
+    def run(branch_link=None, branch_scheme=None):
+        categories = dict(base)
+        if branch_link is not None:
+            categories["_pdbx_entity_branch_link"] = branch_link
+        if branch_scheme is not None:
+            categories["_pdbx_branch_scheme"] = branch_scheme
+        return compute_category_decisions(
+            source_context_key=plan.plan.source_context_key, categories=categories,
+            retained_entity_ids=retained_entity_ids, retained_asym_ids=retained_asym_ids, resolved_model=1,
+            atoms_by_ordinal=atoms_by_ordinal, atom_decisions_by_ordinal=atom_decisions_by_ordinal,
+            connection_decisions=(),
+        )
+
+    # Positive control: a genuinely valid link (num_1=1/MAN, num_2=2/NAG)
+    # and scheme (num=1/MAN) both resolve.
+    decisions = run(
+        branch_link=_category_table(
+            link_id=("1",), entity_id=("E3",), entity_branch_list_num_1=("1",), comp_id_1=("MAN",), atom_id_1=("C1",),
+            entity_branch_list_num_2=("2",), comp_id_2=("NAG",), atom_id_2=("C2",),
+        ),
+        branch_scheme=_category_table(asym_id=("BR",), entity_id=("E3",), mon_id=("MAN",), num=("1",)),
+    )
+    by_cat = {d.category: d for d in decisions}
+    assert by_cat["_pdbx_entity_branch_link"].kept_row_ordinals == (0,)
+    assert by_cat["_pdbx_branch_scheme"].kept_row_ordinals == (0,)
+
+    # MAJOR-5: a link whose entity_branch_list_num_1=9 names no real
+    # _pdbx_entity_branch_list row at all must refuse.
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        run(branch_link=_category_table(
+            link_id=("1",), entity_id=("E3",), entity_branch_list_num_1=("9",), comp_id_1=("MAN",), atom_id_1=("C1",),
+            entity_branch_list_num_2=("2",), comp_id_2=("NAG",), atom_id_2=("C2",),
+        ))
+    assert excinfo.value.code == "INVALID_CIF"
+
+    # MAJOR-5: a link whose comp_id_1 disagrees with the real
+    # branch_list row at that same (entity_id,num) - wrong component,
+    # never merely wrong num - must also refuse.
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        run(branch_link=_category_table(
+            link_id=("1",), entity_id=("E3",), entity_branch_list_num_1=("1",), comp_id_1=("BMA",), atom_id_1=("C1",),
+            entity_branch_list_num_2=("2",), comp_id_2=("NAG",), atom_id_2=("C2",),
+        ))
+    assert excinfo.value.code == "INVALID_CIF"
+
+    # MAJOR-5: a scheme row naming mon_id="BMA" at num=1, while the real
+    # branch_list declares comp_id="MAN" at that same (entity_id,num) -
+    # a swapped list-vs-scheme - must refuse, never silently accepted as
+    # if the two categories simply described different things.
+    with pytest.raises(MaterializationExecutionError) as excinfo:
+        run(
+            branch_link=_category_table(
+                link_id=("1",), entity_id=("E3",), entity_branch_list_num_1=("1",), comp_id_1=("MAN",), atom_id_1=("C1",),
+                entity_branch_list_num_2=("2",), comp_id_2=("NAG",), atom_id_2=("C2",),
+            ),
+            branch_scheme=_category_table(asym_id=("BR",), entity_id=("E3",), mon_id=("BMA",), num=("1",)),
+        )
+    assert excinfo.value.code == "INVALID_CIF"
 
 
 def test_missing_conditional_branched_categories_rejects():  # T021-086

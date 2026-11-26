@@ -1868,21 +1868,6 @@ _SYMMETRY_CODE_PATTERN = re.compile(r"^([1-9][0-9]*)_([1-9])([1-9])([1-9])$")
 _IDENTITY_EXPRESSION = "x,y,z"
 
 
-def _raw_cif_token_to_optional(token: Optional[str]) -> Optional[str]:
-    """A bare, unquoted `.`/`?` is a real CIF null; a quoted `'.'`/`'?'`
-    string (already de-quoted-or-not by the caller's own raw-token
-    convention) is a genuine token (Section 5). Deliberately NOT imported
-    from `receptor_parsing.raw_cif_null_to_optional_str` - a module-level
-    import of that name would load `receptor_parsing` (and therefore
-    Gemmi) at this module's import time, which ARCH-01 forbids; this is
-    the same two-line rule, duplicated locally rather than cross-module
-    coupled for a trivial null check."""
-
-    if token is None or token in (".", "?"):
-        return None
-    return token
-
-
 def _normalize_operator_expression(expression: str) -> str:
     """Section 10: compare two operator expressions after removing ASCII
     whitespace and a single leading `+` on each of the three comma-
@@ -1971,13 +1956,26 @@ class _SymmetryEndpointResolution(NamedTuple):
 
 
 def _resolve_symmetry_endpoint(
-    raw_token: Optional[str], tables: SymmetryOperatorTables
+    token: Optional[str], tables: SymmetryOperatorTables
 ) -> _SymmetryEndpointResolution:
     """One endpoint's IdentityBasis and identity-proof status (Section
     10.1), independent of K - computed in a fixed order (ptnr1 then
-    ptnr2) by the caller, never by K or category-visit order."""
+    ptnr2) by the caller, never by K or category-visit order.
 
-    token = _raw_cif_token_to_optional(raw_token)
+    MAJOR-3 (adversarial review 20261125): `token` is the caller's
+    already null-collapsed value (`RawConnectionEndpointTokens`'s own
+    contract - `.`/`?` already mapped to `None` by the adapter boundary,
+    which alone can tell a real null apart from a quoted `'.'`/`'?'`
+    string before decoding). `None` here is unconditionally a real null;
+    re-running a second `.`/`?` string check on this *already-decoded*
+    value (the previous bug) would wrongly re-collapse a genuine,
+    quoted `'?'`/`'.'` literal - indistinguishable from real null once
+    decoded - back into one. A literal `"?"`/`"."` string therefore
+    falls through to `_parse_symmetry_code`, fails the `n_klm` grammar
+    exactly like any other malformed token, and correctly resolves as a
+    non-null but unparseable symmetry token (§10.1: `unsupported-
+    discarded`), never as a missing one."""
+
     if token is None:
         return _SymmetryEndpointResolution(True, "not-applicable", False, None, False)
 
@@ -2182,6 +2180,30 @@ def _resolve_endpoint_atoms(
             raise MaterializationExecutionError(
                 "AMBIGUOUS_ENDPOINT", "struct_conn endpoint names an altloc variant absent from its occurrence", phase="plan"
             )
+
+    # MAJOR-6 (adversarial review 20261125): §6/§9 - an endpoint may
+    # legitimately carry more than one atom only when they are genuine,
+    # *distinct* altloc variants of the same physical identity (Section
+    # 9: "um endpoint contém variantes de altloc da mesma identidade,
+    # nunca ocorrências distintas"). Two atoms sharing the same
+    # occurrence, the same `label_atom_id`, and the same altloc value
+    # (including both genuinely null) are physically indistinguishable -
+    # never silently merged into a two-atom endpoint set, which the
+    # previous code did whenever the source itself declared such a
+    # duplicate row (a real data problem, not a resolvable ambiguity).
+    altloc_counts: Dict[Optional[str], int] = {}
+    for candidate in name_matches:
+        altloc_counts[candidate.altloc] = altloc_counts.get(candidate.altloc, 0) + 1
+    indistinguishable_altlocs = sorted(
+        (value for value, count in altloc_counts.items() if count > 1), key=lambda v: (v is None, v),
+    )
+    if indistinguishable_altlocs:
+        raise MaterializationExecutionError(
+            "AMBIGUOUS_ENDPOINT",
+            f"struct_conn endpoint names {len(name_matches)} physically indistinguishable atom(s) "
+            f"sharing altloc {indistinguishable_altlocs!r} within the same occurrence",
+            phase="plan",
+        )
 
     return tuple(sorted(name_matches, key=lambda a: a.ordinal))
 
@@ -3666,7 +3688,17 @@ def _validate_numeric_token(token: Optional[str]) -> Optional[Decimal]:
     would). Returns the finite central `Decimal` with the su suffix
     stripped only for *validation/comparison* - never to rewrite the
     token that gets written back out - or `None` if the token is
-    absent/malformed/non-finite."""
+    absent/malformed/non-finite.
+
+    MAJOR-2 (adversarial review 20261125): `token` must be the *raw*,
+    still-quoted source token (`RawCategoryTable.raw_value`), never the
+    already Gemmi-decoded one (`RawCategoryTable.value`) - §6 requires
+    an *unquoted* numeric token; a quoted `'1.000'` decodes to the bare
+    string `1.000`, indistinguishable from a genuine unquoted one once
+    decoded, but its raw form still carries the quote marks, which this
+    pattern correctly refuses (quote characters are outside its
+    grammar). Every caller below passes the raw token for exactly this
+    reason."""
 
     if token is None or not _NUMERIC_TOKEN_PATTERN.fullmatch(token):
         return None
@@ -3734,13 +3766,24 @@ def _tensor_family_state(
     # numeric value in even one component is "partial" (and therefore
     # rejected below) regardless of whether its siblings are null because
     # the row says so or because the category never declared them.
-    values = [
+    decoded_values = [
         table.value(column, row_index) if column in present_columns else None
         for column in columns
     ]
-    if all(value is None for value in values):
+    if all(value is None for value in decoded_values):
         return "absent"
-    if all(value is not None and _finite_numeric_token(value) for value in values):
+    # MAJOR-2: null detection stays on the decoded view (a real null must
+    # never be confused with a quoted numeric string); the actual
+    # grammar/finiteness check runs on the matching *raw* token - a
+    # quoted '0.1' must never pass as a genuine unquoted component.
+    raw_values = [
+        table.raw_value(column, row_index) if column in present_columns else None
+        for column in columns
+    ]
+    if all(
+        decoded is not None and _finite_numeric_token(raw)
+        for decoded, raw in zip(decoded_values, raw_values)
+    ):
         return "complete"
     return "partial"
 
@@ -3791,16 +3834,41 @@ def _validate_anisotrop_field_agreement(
 _ATOM_SITE_COORDINATE_COLUMNS = ("cartn_x", "cartn_y", "cartn_z")
 
 
+_ASCII_SIGNED_INTEGER_PATTERN = re.compile(r"^[+-]?[0-9]+$")
+
+
+def _validate_ascii_integer_token(raw_token: Optional[str]) -> Optional[int]:
+    """Section 6: `pdbx_formal_charge` (and, in `receptor_parsing.py`,
+    `pdbx_PDB_model_num`) require a genuinely unquoted ASCII decimal
+    integer token - `[+-]?[0-9]+` - never a quoted string, a non-ASCII
+    digit, or Python's own lax `int()` grammar (which accepts
+    underscores/unicode digits/surrounding whitespace that §6 never
+    permits). `raw_token` must be the raw, still-quoted source token,
+    exactly like `_validate_numeric_token` above - a quoted `'1'` fails
+    this pattern outright, never silently decoded first. `+1`/`01` are
+    valid signed/zero-padded spellings of this integer type (MAJOR-2/
+    MINOR-5 interpretive ruling), never rejected merely for their
+    written form."""
+
+    if raw_token is None or not _ASCII_SIGNED_INTEGER_PATTERN.fullmatch(raw_token):
+        return None
+    return int(raw_token)
+
+
 def _validate_atom_site_numeric_row(
     table: "RawCategoryTable", row_index: int, present_columns: FrozenSet[str],
 ) -> None:
     # Section 6: "Coordenadas presentes e finitas... Coordenadas não
     # aceitam null." - applied to every source row, regardless of
     # retention (malformed source data is a structural problem
-    # independent of which atoms the plan keeps).
+    # independent of which atoms the plan keeps). MAJOR-2: the grammar
+    # check runs on the *raw* token (a quoted '1.000' must never pass as
+    # a genuine unquoted coordinate); null detection stays on the
+    # decoded view.
     for column in _ATOM_SITE_COORDINATE_COLUMNS:
-        token = table.value(column, row_index) if column in present_columns else None
-        if _validate_numeric_token(token) is None:
+        decoded = table.value(column, row_index) if column in present_columns else None
+        raw = table.raw_value(column, row_index) if column in present_columns else None
+        if decoded is None or _validate_numeric_token(raw) is None:
             raise MaterializationExecutionError(
                 "INVALID_CIF",
                 f"_atom_site row {row_index} has a null/non-finite/malformed {column!r}",
@@ -3808,22 +3876,40 @@ def _validate_atom_site_numeric_row(
             )
     # "occupancy/B_iso aceitam null real, ou esse número finito
     # (occupancy não negativa)."
-    occupancy_token = table.value("occupancy", row_index) if "occupancy" in present_columns else None
-    if occupancy_token is not None:
-        occupancy_value = _validate_numeric_token(occupancy_token)
+    occupancy_decoded = table.value("occupancy", row_index) if "occupancy" in present_columns else None
+    if occupancy_decoded is not None:
+        occupancy_value = _validate_numeric_token(table.raw_value("occupancy", row_index))
         if occupancy_value is None:
             raise MaterializationExecutionError(
                 "INVALID_CIF", f"_atom_site row {row_index} has a non-finite/malformed occupancy", phase="plan",
             )
         if occupancy_value < 0:
             raise MaterializationExecutionError(
-                "INVALID_CIF", f"_atom_site row {row_index} has a negative occupancy {occupancy_token!r}", phase="plan",
+                "INVALID_CIF",
+                f"_atom_site row {row_index} has a negative occupancy {occupancy_decoded!r}", phase="plan",
             )
-    b_iso_token = table.value("b_iso_or_equiv", row_index) if "b_iso_or_equiv" in present_columns else None
-    if b_iso_token is not None and _validate_numeric_token(b_iso_token) is None:
+    b_iso_decoded = table.value("b_iso_or_equiv", row_index) if "b_iso_or_equiv" in present_columns else None
+    if b_iso_decoded is not None and _validate_numeric_token(table.raw_value("b_iso_or_equiv", row_index)) is None:
         raise MaterializationExecutionError(
             "INVALID_CIF", f"_atom_site row {row_index} has a non-finite/malformed b_iso_or_equiv", phase="plan",
         )
+    # MAJOR-2: pdbx_formal_charge had no grammar validation at all -
+    # null is genuinely optional (§6: "null-real ou inteiro"), but a
+    # present value must be a real, unquoted signed ASCII decimal
+    # integer - never a float, a quoted string, or a chemically
+    # calculated/range-checked value (no charge dictionary is frozen for
+    # 021; this is integrity, never chemistry).
+    formal_charge_decoded = (
+        table.value("pdbx_formal_charge", row_index) if "pdbx_formal_charge" in present_columns else None
+    )
+    if formal_charge_decoded is not None:
+        if _validate_ascii_integer_token(table.raw_value("pdbx_formal_charge", row_index)) is None:
+            raise MaterializationExecutionError(
+                "INVALID_CIF",
+                f"_atom_site row {row_index} has a non-integer/malformed pdbx_formal_charge "
+                f"{formal_charge_decoded!r}",
+                phase="plan",
+            )
 
 
 def _guard_ncs_row(category: str, table: "RawCategoryTable", row_index: int) -> None:
@@ -3832,8 +3918,10 @@ def _guard_ncs_row(category: str, table: "RawCategoryTable", row_index: int) -> 
     # auditados... Código/matriz incompletos inválidos recusam INVALID_CIF."
     values: Dict[str, Decimal] = {}
     for column in _NCS_MATRIX_COLUMNS + _NCS_VECTOR_COLUMNS:
-        token = table.value(column, row_index) if column in table.columns else None
-        value = _validate_numeric_token(token)
+        # MAJOR-2: the grammar check runs on the raw token - a quoted
+        # '1' must never pass as a genuine unquoted NCS component.
+        raw = table.raw_value(column, row_index) if column in table.columns else None
+        value = _validate_numeric_token(raw)
         if value is None:
             raise MaterializationExecutionError(
                 "INVALID_CIF",
@@ -3976,13 +4064,45 @@ def _resolve_special_position_row_atoms(
             phase="plan",
         )
 
+    # MINOR-5 (adversarial review 20261125): compare the row's declared
+    # model by *numeric* value, not `str(atom.model) == model_token` -
+    # the frozen integer type (§6, [+-]?[0-9]+) makes "01"/"+1" valid
+    # spellings of model 1, which the previous textual comparison
+    # misclassified as a different (or no) model. A quoted/non-integer/
+    # non-positive model token is itself a genuinely invalid context,
+    # never silently treated as "no model filter".
     model_token = table.value("pdb_model_num", row_index) if "pdb_model_num" in present_columns else None
+    resolved_model_number: Optional[int] = None
+    if model_token is not None:
+        raw_model_token = table.raw_value("pdb_model_num", row_index)
+        resolved_model_number = _validate_ascii_integer_token(raw_model_token)
+        if resolved_model_number is None or resolved_model_number < 1:
+            raise MaterializationExecutionError(
+                "INVALID_CIF",
+                f"category {category!r} row {row_index} pdb_model_num={raw_model_token!r} is not a "
+                "positive, unquoted ASCII decimal integer",
+                phase="plan",
+            )
+
+    # MINOR-5: an informed altloc that matches no real altloc of the
+    # matched residue in any model is a genuinely unresolvable context -
+    # never silently a zero-overlap resolution like "different model" or
+    # "not retained" legitimately are.
     altloc = table.value("label_alt_id", row_index) if "label_alt_id" in present_columns else None
+    if altloc is not None and not any(
+        _same_residue(atom) and atom.altloc == altloc for atom in atoms_by_ordinal.values()
+    ):
+        raise MaterializationExecutionError(
+            "INVALID_CIF",
+            f"category {category!r} row {row_index} label_alt_id={altloc!r} does not correspond to any "
+            "altloc of the matched residue in any model",
+            phase="plan",
+        )
 
     return tuple(
         ordinal for ordinal, atom in atoms_by_ordinal.items()
         if _same_residue(atom)
-        and (model_token is None or str(atom.model) == model_token)
+        and (resolved_model_number is None or atom.model == resolved_model_number)
         and (altloc is None or atom.altloc == altloc)
     )
 
@@ -4123,14 +4243,130 @@ def compute_category_decisions(
                     phase="plan",
                 )
 
+    # MAJOR-5 (adversarial review 20261125): §11 requires every branch
+    # link endpoint and scheme row to reference a real, full
+    # (entity_id,num,comp_id) row of `_pdbx_entity_branch_list` - a
+    # compound key the generic single-column reference check cannot
+    # express, exactly like the polymer (entity_id,num,mon_id) check
+    # above. Checked unconditionally over every source row present
+    # (never only a retained subset - a corrupt link/scheme is a
+    # structural problem independent of which entity ends up kept),
+    # using only the columns the source itself declares - never
+    # inventing `num` from `auth_seq`, filling a null `label_seq_id`,
+    # choosing the first match, or comparing `num` alone without its
+    # companion `comp_id`/`mon_id`.
+    branch_list_table = categories.get("_pdbx_entity_branch_list")
+    branch_link_table = categories.get("_pdbx_entity_branch_link")
+    branch_scheme_table = categories.get("_pdbx_branch_scheme")
+    if branch_list_table is not None:
+        valid_branch_list_triples = frozenset(
+            (
+                branch_list_table.value("entity_id", row_index),
+                branch_list_table.value("num", row_index),
+                branch_list_table.value("comp_id", row_index),
+            )
+            for row_index in range(branch_list_table.row_count)
+        )
+        if branch_link_table is not None:
+            for row_index in range(branch_link_table.row_count):
+                entity_id = branch_link_table.value("entity_id", row_index)
+                for suffix in ("1", "2"):
+                    num = branch_link_table.value(f"entity_branch_list_num_{suffix}", row_index)
+                    comp_id = branch_link_table.value(f"comp_id_{suffix}", row_index)
+                    if (entity_id, num, comp_id) not in valid_branch_list_triples:
+                        raise MaterializationExecutionError(
+                            "INVALID_CIF",
+                            f"category '_pdbx_entity_branch_link' row {row_index} "
+                            f"(entity_id={entity_id!r}, entity_branch_list_num_{suffix}={num!r}, "
+                            f"comp_id_{suffix}={comp_id!r}) does not reference any "
+                            "_pdbx_entity_branch_list(entity_id,num,comp_id) row",
+                            phase="plan",
+                        )
+        if branch_scheme_table is not None:
+            for row_index in range(branch_scheme_table.row_count):
+                entity_id = branch_scheme_table.value("entity_id", row_index)
+                num = branch_scheme_table.value("num", row_index)
+                mon_id = branch_scheme_table.value("mon_id", row_index)
+                if (entity_id, num, mon_id) not in valid_branch_list_triples:
+                    raise MaterializationExecutionError(
+                        "INVALID_CIF",
+                        f"category '_pdbx_branch_scheme' row {row_index} "
+                        f"(entity_id={entity_id!r}, num={num!r}, mon_id={mon_id!r}) does not reference "
+                        "any _pdbx_entity_branch_list(entity_id,num,comp_id) row",
+                        phase="plan",
+                    )
+    elif branch_link_table is not None or branch_scheme_table is not None:
+        raise MaterializationExecutionError(
+            "INVALID_CIF",
+            "'_pdbx_entity_branch_link'/'_pdbx_branch_scheme' present without "
+            "'_pdbx_entity_branch_list' to validate their compound references against",
+            phase="plan",
+        )
+
     decisions: Dict[str, CategoryDecision] = {}
     ccd_closure_extra: "set[str]" = set()
+    source_entry_rows_key: Optional[str] = None
+    source_entry_omitted_ordinals: Tuple[int, ...] = ()
 
     for category in sorted(categories):
-        if category == "_chem_comp":
-            continue  # REFERENCED_CCD_CLOSURE - deferred until every contributor is known.
-        if category == "_entry":
-            continue  # DERIVED_ENTRY - always generated below, regardless of source presence.
+        # MAJOR-4 (adversarial review 20261125): `_chem_comp`/`_entry` are
+        # deferred to their own bespoke handling below (REFERENCED_CCD_
+        # CLOSURE needs every other category's kept rows first;
+        # DERIVED_ENTRY is always generated regardless of source
+        # presence) - but that deferral must never skip the *generic*
+        # catalogue guards every other category already gets here
+        # first: unknown-tag rejection, required-tag presence, and
+        # key non-null/uniqueness. Without this, a duplicated
+        # `_chem_comp.id`, a null one, or an `_entry` carrying an
+        # unrecognized tag or more than its one real row all passed
+        # silently.
+        if category in ("_chem_comp", "_entry"):
+            cat_def = cat_defs[category]
+            table = categories[category]
+            present_columns = frozenset(table.columns.keys())
+            allowed_tags = set(cat_def["preserve_tags"]) | set(cat_def["omit_tags"]) | set(cat_def["generate_tags"])
+            unknown_tags = present_columns - allowed_tags
+            if unknown_tags:
+                raise MaterializationExecutionError(
+                    "UNSUPPORTED_TAG",
+                    f"category {category!r} has unrecognized tag(s) {sorted(unknown_tags)!r} outside the pinned catalogue",
+                    phase="plan",
+                )
+            missing_required = [t for t in cat_def["required_tags"] if t not in present_columns]
+            if missing_required:
+                raise MaterializationExecutionError(
+                    "INVALID_CIF",
+                    f"category {category!r} is missing required tag(s) {missing_required!r}",
+                    phase="plan",
+                )
+            _validate_key_integrity(
+                category, table, tuple(column for column in cat_def["key"] if column in present_columns),
+            )
+            if category == "_entry":
+                # MAJOR-4: `_entry` is a singleton category by mmCIF
+                # convention (never a real multi-row loop) - the catalogue
+                # has no separate cardinality field for this, so it is
+                # enforced explicitly, never merely implied by key
+                # uniqueness (two distinct ids would otherwise pass the
+                # check above undetected).
+                if table.row_count > 1:
+                    raise MaterializationExecutionError(
+                        "INVALID_CIF",
+                        f"source CIF declares {table.row_count} _entry rows; exactly one is permitted",
+                        phase="plan",
+                    )
+                # MAJOR-4/SCHEMAS §4: `source_rows_key` is null only for
+                # a category genuinely absent from source or generated
+                # with no source at all - a *present* source `_entry`
+                # row (about to be replaced by the new tbmp_<plan_key>
+                # one) must still be hashed and covered as an omitted
+                # source row, never silently left unaudited just because
+                # the category's own action is "generate".
+                source_entry_rows_key = compute_source_rows_key(
+                    source_context_key=source_context_key, category=category, table=table,
+                )
+                source_entry_omitted_ordinals = tuple(range(table.row_count))
+            continue  # both deferred to their own bespoke handling below.
 
         cat_def = cat_defs[category]
         table = categories[category]
@@ -4469,7 +4705,10 @@ def compute_category_decisions(
         )
 
     # DERIVED_ENTRY: always generated, regardless of source `_entry` presence.
-    decisions["_entry"] = CategoryDecision(category="_entry", action="generate", generated_tags=("id",))
+    decisions["_entry"] = CategoryDecision(
+        category="_entry", action="generate", generated_tags=("id",),
+        omitted_row_ordinals=source_entry_omitted_ordinals, source_rows_key=source_entry_rows_key,
+    )
 
     # REFERENCED_CCD_CLOSURE (_chem_comp), deferred until every other
     # category's kept rows (and therefore every closure contributor) are
